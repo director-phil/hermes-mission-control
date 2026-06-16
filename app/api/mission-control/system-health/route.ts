@@ -12,6 +12,7 @@ export async function GET() {
   const now = new Date();
   const timestamp = now.toISOString();
 
+  // Run all checks in parallel with timeout handling
   const checks = await Promise.allSettled([
     checkGB10_1(),
     checkGB10_2(),
@@ -84,7 +85,18 @@ async function checkGB10_1() {
 
 async function checkGB10_2() {
   // Second GB10 machine — SSH check
-  const result = await runCommand("ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no phillip@gb10-2 'uptime' 2>&1", 5000);
+  // If SSH is not configured, return unreachable immediately to avoid hanging
+  const host = "phillip@gb10-2";
+  if (!process.env.SSH_GB10_2_HOST) {
+    return {
+      name: "GB10 #2",
+      status: "unreachable",
+      metric: "",
+      evidence: "SSH host not configured",
+    };
+  }
+  
+  const result = await runCommand(`ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no ${host} 'uptime' 2>&1`, 5000);
   if (result.success) {
     return {
       name: "GB10 #2",
@@ -103,6 +115,7 @@ async function checkGB10_2() {
 
 async function checkHermes() {
   // Check if Hermes agent is running
+  // If the process check hangs, we should fail fast
   const result = await runCommand("pgrep -f 'hermes' > /dev/null 2>&1 && echo running || echo stopped", 3000);
   if (result.success && result.output.trim() === "running") {
     return {
@@ -328,22 +341,22 @@ interface CmdResult {
   error?: string;
 }
 
-function runCommand(cmd: string, timeout: number): Promise<CmdResult> {
+async function runCommand(cmd: string, timeout: number): Promise<CmdResult> {
   return new Promise((resolve) => {
     const { spawn } = require("child_process");
     const proc = spawn(cmd, { shell: true, timeout });
-
+    
     let stdout = "";
     let stderr = "";
-
+    
     proc.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
-
+    
     proc.stderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString();
     });
-
+    
     proc.on("close", (code: number) => {
       if (code === 0) {
         resolve({ success: true, output: stdout });
@@ -351,16 +364,20 @@ function runCommand(cmd: string, timeout: number): Promise<CmdResult> {
         resolve({ success: false, output: stdout, error: stderr.trim() || `Exit code ${code}` });
       }
     });
-
+    
     proc.on("error", (err: Error) => {
       resolve({ success: false, output: "", error: err.message });
     });
-
-    if (timeout > 0) {
-      setTimeout(() => {
-        proc.kill();
-        resolve({ success: false, output: "", error: `Timeout after ${timeout}ms` });
-      }, timeout);
-    }
+    
+    // Set a timeout to kill the process if it takes too long
+    const timer = setTimeout(() => {
+      proc.kill();
+      resolve({ success: false, output: "", error: `Timeout after ${timeout}ms` });
+    }, timeout);
+    
+    // Clear the timer if the process completes before timeout
+    proc.on("close", () => {
+      clearTimeout(timer);
+    });
   });
 }

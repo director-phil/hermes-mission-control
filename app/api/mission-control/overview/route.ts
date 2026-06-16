@@ -1,8 +1,8 @@
 /**
- * S1 — First View Operating Shell (overview endpoint)
+ * S1+S3 — First View Operating Shell (overview endpoint)
  *
  * Aggregates all 8 first-view sections in parallel. S2 wired.
- * Other slices use placeholder data with explicit labels.
+ * S3 agent capacity wired. Other slices use placeholder data.
  */
 
 export const dynamic = "force-dynamic";
@@ -10,10 +10,16 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   const now = new Date().toISOString();
 
+  // Use a timeout to prevent hanging on system health check
+  const systemHealthPromise = fetchSystemHealth().catch(err => {
+    console.error('System health fetch failed:', err);
+    return { error: 'Failed to fetch system health' };
+  });
+
   const [systemHealth, agentCapacity, approvalsRequired, productionTrust,
           liveAgentOps, activeTasks, eventStream, researchIntelligence] =
     await Promise.allSettled([
-      fetchSystemHealth(),
+      systemHealthPromise,
       fetchAgentCapacity(),
       fetchApprovalsRequired(),
       fetchProductionTrust(),
@@ -41,9 +47,16 @@ export async function GET() {
 async function fetchSystemHealth() {
   // S2: real health checks — wired
   try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    
     const res = await fetch(`${process.env.VERCEL_URL || "http://localhost:3000"}/api/mission-control/system-health`, {
       cache: "no-store",
+      signal: controller.signal,
     });
+    
+    clearTimeout(timeoutId);
+    
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   } catch (err) {
@@ -89,20 +102,66 @@ async function fetchLocalHealth() {
 }
 
 async function fetchAgentCapacity() {
-  // S3: real Hermes session logs
-  // S1: placeholder
+  // S3: real agent capacity from agent-capacity endpoint
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+    
+    const res = await fetch(`${process.env.VERCEL_URL || "http://localhost:3000"}/api/mission-control/agent-capacity`, {
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    
+    // Transform to overview format
+    const activeSessions = data.active_agents ?? 0;
+    const breakdown = data.breakdown ?? { online: 0, busy: 0, idle: 0, offline: 0 };
+    
+    return {
+      status: data.global_status === "healthy" ? "info" : "warning",
+      label: data.global_status === "healthy" ? "All agents operational" : "Some agents offline",
+      evidence_timestamp: data.timestamp ?? null,
+      active_sessions: activeSessions,
+      agents: data.agents ?? [],
+      platform_health: data.platform_health ?? [],
+      sync_status: data.sync_status ?? { droplet: { reachable: false, evidence: "unreachable" }, msi: { reachable: false, evidence: "unreachable" } },
+      breakdown,
+    };
+  } catch (err) {
+    // Fallback: local-only agent detection
+    return fetchLocalAgentCapacity();
+  }
+}
+
+async function fetchLocalAgentCapacity() {
+  // Fallback: check processes locally
+  const now = new Date().toISOString();
+  const psResult = await runCommand("ps aux --no-headers 2>/dev/null || ps aux | grep -v grep", 3000);
+  const psOutput = psResult.success ? psResult.output : "";
+  
+  const agents = [
+    { id: "qwen-reviewer", name: "Qwen 3.6 Reviewer", role: "Reviewer", status: psOutput.includes("qwen") ? "online" : "offline", evidence: psOutput.includes("qwen") ? "Process detected" : "No process" },
+    { id: "claude-assistant", name: "Claude Code", role: "Assistant", status: psOutput.includes("claude") ? "online" : "offline", evidence: psOutput.includes("claude") ? "Process detected" : "No process" },
+    { id: "codex-coder", name: "Codex Coder", role: "Coder", status: psOutput.includes("codex") ? "online" : "offline", evidence: psOutput.includes("codex") ? "Process detected" : "No process" },
+    { id: "hermes-cto", name: "Hermes CTO", role: "Orchestrator", status: "online", evidence: "This session" },
+    { id: "gemini-researcher", name: "Gemini Researcher", role: "Research", status: "offline", evidence: "No process" },
+  ];
+  
+  const activeCount = agents.filter((a) => a.status === "online").length;
+  
   return {
-    status: "pending",
-    label: "Pending live wiring (S3)",
-    evidence_timestamp: null,
-    active_sessions: 0,
-    breakdown: {
-      running: 0,
-      waiting: 0,
-      blocked: 0,
-      review: 0,
-      completed: 0,
-    },
+    status: activeCount > 0 ? "info" : "neutral",
+    label: activeCount > 0 ? `${activeCount} agents active` : "No agents active",
+    evidence_timestamp: now,
+    active_sessions: activeCount,
+    agents,
+    platform_health: [],
+    sync_status: { droplet: { reachable: false, evidence: "unreachable" }, msi: { reachable: false, evidence: "unreachable" } },
+    breakdown: { online: activeCount, busy: 0, idle: 0, offline: 5 - activeCount },
   };
 }
 

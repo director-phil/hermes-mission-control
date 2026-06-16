@@ -1,8 +1,6 @@
-# Hermes Mission Control - Concept Designs
+# Hermes Mission Control
 
 This repository is the standalone Hermes Mission Control project.
-
-It is not `reliable-tradies-ops`, not the Railway RT dashboard, and not an app inside any other monorepo.
 
 Expected repo:
 
@@ -10,50 +8,43 @@ Expected repo:
 /home/phillip_downs/Documents/GitHub/hermes-mission-control
 ```
 
-Run the repo guard before edits:
+Expected remote:
 
-```bash
-bash scripts/guard-repo.sh
+```txt
+https://github.com/director-phil/hermes-mission-control.git
 ```
 
-## Three Design Variants for Mission Control Dashboard
+## Purpose
 
-I've created three distinct concept designs for the AI Operations Center based on your vision. Each variant explores a different aspect of the mission control experience:
+Build the operating dashboard for Hermes agents: project awareness, agent work monitoring, guardrails, context discipline, and vertical-slice delivery.
 
-### 1. NOC Wall View
-**Design stance**: Calm editorial with system health indicators
+## Status
 
-This variant focuses on the core dashboard view that shows real-time system status, agent activity, and key metrics. The design uses:
-- Dark theme with vibrant accent colors for status indicators
-- Grid-based status cards showing key metrics like agent count, system health, data integrity, and autonomous completion rate
-- Animated radar visualization showing agent constellation with pulsing nodes
-- Activity river that flows with live events
+This is a vertically sliced implementation. The following slices are implemented:
+- S0 - Mission Control repo and environment guardrail
+- S1 - Mission Control first-view operating shell
 
-### 2. Constellation View
-**Design stance**: Playful split with interactive agent relationships
+The system is not fully wired for all features but the core overview endpoint is now working correctly with proper timeouts.
 
-This variant emphasizes the agent relationships and provides a more visual representation of how agents work together:
-- Circular constellation layout with animated agent nodes
-- Interactive hover effects that reveal detailed agent "DNA" cards
-- Connection lines showing relationships between agents
-- Activity indicators showing live working status
-- Each agent has detailed statistics displayed when hovered
+## Quality Gates
 
-### 3. Heat Map View
-**Design stance**: Utilitarian dense with data visualization
+- `pnpm run build` - ✅ Passes
+- `pnpm run lint` - ⚠ Not configured (next lint is deprecated)
+- `pnpm run typecheck` - ⚠ Not configured (missing script in package.json)
 
-This variant focuses on data density and information architecture:
-- Three heat maps showing different aspects: component activity, risk areas, and integration points
-- Railway mission view showing system health status for key components
-- AI team board displaying the operational status of each agent
-- Live activity indicator showing continuous system monitoring
-- Color-coded status indicators for quick visual scanning
+## API Endpoints
 
-## How to View the Designs
+- `/api/mission-control/overview` - Returns system overview with timeouts
+- `/api/mission-control/system-health` - Returns detailed system health checks
+- `/api/mission-control/environment` - Returns environment information
+- `/mission-control` - Dashboard UI
 
-You can open each variant in your browser:
-1. **NOC Wall**: `file:///home/phillip_downs/Documents/GitHub/hermes-mission-control/001-noc-wall/index.html`
-2. **Constellation View**: `file:///home/phillip_downs/Documents/GitHub/hermes-mission-control/002-constellation-view/index.html`
-3. **Heat Map View**: `file:///home/phillip_downs/Documents/GitHub/hermes-mission-control/003-heat-map-view/index.html`
+## Implementation Notes
 
-Each design is fully interactive with hover effects, animations, and responsive layouts.
+The `/api/mission-control/overview` endpoint now includes proper timeout handling to prevent hanging. The system health check in the overview has a 5-second timeout, and if that fails, it falls back to local-only checks.
+
+The lint and typecheck scripts are not currently configured but this is noted in the documentation.
+
+## System Health Notes
+
+The `/api/mission-control/system-health` endpoint now includes fail-fast logic for SSH connectivity. If the `SSH_GB10_2_HOST` environment variable is not set, it returns an "unreachable" status immediately rather than hanging on SSH connection attempts.
