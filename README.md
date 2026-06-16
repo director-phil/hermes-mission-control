@@ -48,3 +48,5 @@ The lint and typecheck scripts are not currently configured but this is noted in
 ## System Health Notes
 
 The `/api/mission-control/system-health` endpoint now includes fail-fast logic for SSH connectivity. If the `SSH_GB10_2_HOST` environment variable is not set, it returns an "unreachable" status immediately rather than hanging on SSH connection attempts.
+
+All system health checks are now bounded with timeouts to prevent hanging behavior. The entire system-health route should return within 5 seconds even when dependencies are unreachable.

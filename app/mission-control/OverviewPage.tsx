@@ -13,12 +13,31 @@ interface OverviewData {
   timestamp: string;
   system_health: SystemHealthSection;
   agent_capacity: AgentCapacitySection;
+  alerts: AlertsSection;
   approvals_required: ApprovalsSection;
   production_trust: ProductionTrustSection;
   live_agent_ops: LiveAgentOpsSection;
   active_tasks: ActiveTasksSection;
   event_stream: EventStreamSection;
   research_intelligence: ResearchSection;
+}
+
+interface AlertsSection {
+  status: string;
+  label: string;
+  evidence_timestamp: string | null;
+  alerts: Array<{
+    id: string;
+    severity: string;
+    title: string;
+    message: string;
+    source: string;
+    timestamp: string;
+    actionable: boolean;
+    link?: string;
+  }>;
+  summary: { total: number; critical: number; warning: number; info: number };
+  slack_status: { name: string; status: string; recent_count: number; evidence: string };
 }
 
 interface SystemHealthSection {
@@ -87,7 +106,18 @@ interface ActiveTasksSection {
     status: string;
     owner: string;
     updated_at: string;
+    source?: string;
+    priority?: string;
   }>;
+  runbooks?: Array<{
+    id: string;
+    title: string;
+    severity: string;
+    description: string;
+    affected_system: string;
+    steps: string[];
+  }>;
+  sources?: Record<string, { status: string; count: number; evidence: string }>;
 }
 
 interface EventStreamSection {
@@ -167,6 +197,10 @@ export default function OverviewPage() {
             </span>
             <span className="text-slate-600">|</span>
             <span className="text-slate-400">
+              {data.alerts.summary?.critical ?? 0} critical
+            </span>
+            <span className="text-slate-600">|</span>
+            <span className="text-slate-400">
               {data.active_tasks.count} active
             </span>
             <span className="text-slate-600">|</span>
@@ -178,7 +212,7 @@ export default function OverviewPage() {
       </div>
 
       {/* 8-section grid */}
-      <div className="p-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="p-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
 
         {/* 1. System Health */}
         <Section
@@ -272,7 +306,64 @@ export default function OverviewPage() {
                 ))}
         </Section>
 
-        {/* 4. Production Trust */}
+        {/* 4. Alerts */}
+        <Section
+          title="ALERTS"
+          status={data.alerts.status === "critical" ? "critical" : data.alerts.status === "warning" ? "warning" : data.alerts.summary?.critical > 0 ? "info" : "neutral"}
+          pending={data.alerts.status === "pending"}
+          pendingLabel={data.alerts.label}
+        >
+          {data.alerts.status === "pending"
+            ? <PlaceholderRow label="Awaiting S4 live wiring" />
+            : (<div>
+                {/* Alert summary */}
+                <div className="flex items-center gap-2 mb-2 pb-2 border-b border-slate-800/50">
+                  <span className="text-[10px] text-slate-600 font-mono">
+                    {data.alerts.summary?.critical ?? 0} critical · {data.alerts.summary?.warning ?? 0} warning · {data.alerts.summary?.info ?? 0} info
+                  </span>
+                  <span className="text-[10px] text-slate-600 font-mono ml-auto">
+                    {timeAgo(data.alerts.evidence_timestamp ?? "")}
+                  </span>
+                </div>
+                {/* Slack status */}
+                {data.alerts.slack_status && (
+                  <div className="flex items-center gap-1.5 py-1 text-xs">
+                    <span className={`w-1.5 h-1.5 rounded-full ${data.alerts.slack_status.status === "healthy" ? "bg-emerald-400" : data.alerts.slack_status.status === "unreachable" ? "bg-slate-600" : "bg-amber-400"}`} />
+                    <span className="text-slate-400">#{data.alerts.slack_status.name}</span>
+                    <span className="text-[10px] text-slate-600 font-mono ml-auto">{data.alerts.slack_status.recent_count} recent</span>
+                  </div>
+                )}
+                {/* Alerts list */}
+                {data.alerts.alerts && data.alerts.alerts.length > 0
+                  ? data.alerts.alerts.slice(0, 5).map((a: any) => (
+                      <div key={a.id} className="py-1 border-b border-slate-800/20 last:border-0">
+                        <div className="flex items-center gap-1.5 text-xs">
+                          <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                            a.severity === "critical" ? "bg-red-400 animate-pulse" :
+                            a.severity === "warning" ? "bg-amber-400" :
+                            "bg-blue-400"
+                          }`} />
+                          <span className={`font-medium ${
+                            a.severity === "critical" ? "text-red-300" :
+                            a.severity === "warning" ? "text-amber-300" :
+                            "text-blue-300"
+                          }`}>{a.title}</span>
+                        </div>
+                        <div className="flex items-center gap-2 text-[10px] text-slate-600 font-mono mt-0.5">
+                          <span>{a.source}</span>
+                          <span>·</span>
+                          <span>{timeAgo(a.timestamp)}</span>
+                          {a.actionable && <span className="text-amber-400">ACTION</span>}
+                        </div>
+                      </div>
+                    ))
+                  : <div className="py-2 text-xs text-emerald-400 font-mono">✓ All systems nominal</div>
+                }
+              </div>)
+          }
+        </Section>
+
+        {/* 5. Production Trust */}
         <Section
           title="PRODUCTION TRUST"
           status={data.production_trust.trust_score !== null
@@ -335,7 +426,7 @@ export default function OverviewPage() {
         {/* 6. Active Tasks */}
         <Section
           title="ACTIVE TASKS"
-          status={data.active_tasks.count > 0 ? "info" : "neutral"}
+          status={data.active_tasks.count > 0 ? (data.active_tasks.status === "critical" ? "critical" : "info") : "neutral"}
           pending={data.active_tasks.status === "pending"}
           pendingLabel={data.active_tasks.label}
         >
@@ -343,7 +434,7 @@ export default function OverviewPage() {
             ? <PlaceholderRow label="Awaiting S5 live wiring" />
             : data.active_tasks.count === 0
               ? <div className="py-2 text-xs text-emerald-400 font-mono">✓ No active tasks</div>
-              : (data.active_tasks.items).slice(0, 5).map((t) => (
+              : (data.active_tasks.items as Array<{ id: string; title: string; status: string; owner: string; updated_at: string }>).slice(0, 5).map((t) => (
                   <div key={t.id} className="py-1 border-b border-slate-800/30 last:border-0">
                     <div className="flex items-center justify-between text-xs">
                       <span className="text-slate-300 truncate max-w-[140px]" title={t.title}>{t.title}</span>
@@ -354,6 +445,20 @@ export default function OverviewPage() {
                     </div>
                   </div>
                 ))}
+          {data.active_tasks.runbooks && data.active_tasks.runbooks.length > 0 && (
+            <>
+              <div className="text-[9px] text-slate-500 font-mono uppercase tracking-wider mt-2 mb-1">Auto-Generated Runbooks</div>
+              {data.active_tasks.runbooks.slice(0, 3).map((r) => (
+                <div key={r.id} className="py-1 border-b border-slate-800/20 last:border-0">
+                  <div className="flex items-center gap-1 text-xs">
+                    <span className="text-red-400">⚠</span>
+                    <span className="text-red-300 font-medium">{r.title}</span>
+                  </div>
+                  <div className="text-[10px] text-slate-500 font-mono mt-0.5 truncate">{r.description}</div>
+                </div>
+              ))}
+            </>
+          )}
         </Section>
 
         {/* 7. Event Stream */}

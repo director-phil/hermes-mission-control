@@ -96,7 +96,8 @@ async function checkGB10_2() {
     };
   }
   
-  const result = await runCommand(`ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no ${host} 'uptime' 2>&1`, 5000);
+  // Ensure the SSH command is bounded and doesn't hang
+  const result = await runCommand(`timeout 5 ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no ${host} 'uptime' 2>&1`, 5000);
   if (result.success) {
     return {
       name: "GB10 #2",
@@ -195,7 +196,8 @@ async function checkServiceTitan() {
       evidence: "No ServiceTitan credentials configured",
     };
   }
-  return httpHealthCheck("ServiceTitan", "https://api.service-titan.com/health", 5000);
+  // Add a timeout to the HTTP check
+  return httpHealthCheck("ServiceTitan", "https://api.service-titan.com/health", 3000);
 }
 
 async function checkXero() {
@@ -209,7 +211,8 @@ async function checkXero() {
       evidence: "No XERO_TENANT_ID configured",
     };
   }
-  return httpHealthCheck("Xero", "https://api.xero.com/api.xw", 5000);
+  // Add a timeout to the HTTP check
+  return httpHealthCheck("Xero", "https://api.xero.com/api.xw", 3000);
 }
 
 /* ── Helpers ──────────────────────────────────────────────────── */
@@ -344,7 +347,7 @@ interface CmdResult {
 async function runCommand(cmd: string, timeout: number): Promise<CmdResult> {
   return new Promise((resolve) => {
     const { spawn } = require("child_process");
-    const proc = spawn(cmd, { shell: true, timeout });
+    const proc = spawn(cmd, { shell: true });
     
     let stdout = "";
     let stderr = "";
@@ -357,7 +360,21 @@ async function runCommand(cmd: string, timeout: number): Promise<CmdResult> {
       stderr += chunk.toString();
     });
     
+    // Set a timeout to kill the process if it takes too long
+    const timer = setTimeout(() => {
+      proc.kill("SIGTERM"); // Try SIGTERM first
+      setTimeout(() => {
+        if (!proc.killed) {
+          proc.kill("SIGKILL"); // Force kill if still alive
+        }
+      }, 100);
+      resolve({ success: false, output: "", error: `Timeout after ${timeout}ms` });
+    }, timeout);
+    
     proc.on("close", (code: number) => {
+      // Clear the timeout timer when process completes
+      clearTimeout(timer);
+      
       if (code === 0) {
         resolve({ success: true, output: stdout });
       } else {
@@ -366,18 +383,9 @@ async function runCommand(cmd: string, timeout: number): Promise<CmdResult> {
     });
     
     proc.on("error", (err: Error) => {
-      resolve({ success: false, output: "", error: err.message });
-    });
-    
-    // Set a timeout to kill the process if it takes too long
-    const timer = setTimeout(() => {
-      proc.kill();
-      resolve({ success: false, output: "", error: `Timeout after ${timeout}ms` });
-    }, timeout);
-    
-    // Clear the timer if the process completes before timeout
-    proc.on("close", () => {
+      // Clear the timeout timer when process errors
       clearTimeout(timer);
+      resolve({ success: false, output: "", error: err.message });
     });
   });
 }
