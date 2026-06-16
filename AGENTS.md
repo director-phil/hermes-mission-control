@@ -51,7 +51,7 @@ The guard must pass before code changes.
 - Build in vertical slices from the Mission Control v2 issue pack.
 - Start with S0 repo/environment guardrail and S1 first-view operating shell.
 - Use the existing static concept files as design evidence.
-- Do not pull in Reliable Tradies dashboard architecture, database helpers, Railway deployment assumptions, or app-router patterns.
+- Do not pull in architecture, database helpers, Railway deployment assumptions, or app-router patterns from the forbidden dashboard repo.
 - If a future slice monitors Railway, ServiceTitan, Xero, or other business systems, treat them as external observed systems only, not as the implementation repo.
 
 ## Definition of Done

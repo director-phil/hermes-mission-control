@@ -2,7 +2,7 @@
 
 This repository is the standalone Hermes Mission Control project.
 
-It is not `reliable-tradies-ops`, not the Railway RT dashboard, and not an app inside the Reliable Tradies monorepo.
+It is not `reliable-tradies-ops`, not the Railway RT dashboard, and not an app inside any other monorepo.
 
 Expected repo:
 
