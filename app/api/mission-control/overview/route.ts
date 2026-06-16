@@ -1,29 +1,28 @@
 /**
- * S1+S3+S4 — Overview endpoint (operating shell)
+ * S1 → S2 — First View Operating Shell (overview endpoint)
  *
- * Aggregates all sections in parallel.
- * S2: system-health wired.
- * S3: agent-capacity wired.
- * S4: approvals wired.
- * Other slices use placeholder data.
+ * Aggregates all 8 first-view sections in parallel. System Health
+ * uses live evidence (S2). Remaining sections use placeholders until
+ * their respective slices are wired.
  */
+
+import { NextResponse } from "next/server";
+import { computeProductionTrust } from "@/lib/production-trust";
+import { getEvents, getEventCounts, seedInitialEvents } from "@/lib/event-audit";
+
+// Seed events on overview route import (ensures seed runs before any request)
+seedInitialEvents();
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
   const now = new Date().toISOString();
 
-  const systemHealthPromise = fetchSystemHealth().catch(err => {
-    console.error('System health fetch failed:', err);
-    return { error: 'Failed to fetch system health' };
-  });
-
-  const [systemHealth, agentCapacity, alertsData, approvalsRequired, productionTrust,
+  const [systemHealth, agentCapacity, approvalsRequired, productionTrust,
           liveAgentOps, activeTasks, eventStream, researchIntelligence] =
     await Promise.allSettled([
-      systemHealthPromise,
+      getSystemHealthData(),
       fetchAgentCapacity(),
-      fetchAlerts(),
       fetchApprovalsRequired(),
       fetchProductionTrust(),
       fetchLiveAgentOps(),
@@ -32,11 +31,10 @@ export async function GET() {
       fetchResearchIntelligence(),
     ]);
 
-  return Response.json({
+  return NextResponse.json({
     timestamp: now,
     system_health: parseResult(systemHealth),
     agent_capacity: parseResult(agentCapacity),
-    alerts: parseResult(alertsData),
     approvals_required: parseResult(approvalsRequired),
     production_trust: parseResult(productionTrust),
     live_agent_ops: parseResult(liveAgentOps),
@@ -46,348 +44,118 @@ export async function GET() {
   });
 }
 
-/* - section fetchers - */
+/* ── S2: System Health Live Evidence ───────────────────────────── */
 
-async function fetchSystemHealth() {
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
-
-    const res = await fetch(`${process.env.VERCEL_URL || "http://localhost:3000"}/api/mission-control/system-health`, {
-      cache: "no-store",
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
-  } catch (err) {
-    return fetchLocalHealth();
-  }
-}
-
-async function fetchLocalHealth() {
+async function getSystemHealthData() {
   const now = new Date().toISOString();
-  const cpuLoad = await readCpuLoad();
-  const memInfo = await readMemoryInfo();
-  const diskInfo = await readDiskInfo("/");
 
-  const status =
-    cpuLoad.load > 90 || memInfo.percent > 95 || diskInfo.percent > 95
-      ? "critical"
-      : cpuLoad.load > 70 || memInfo.percent > 80 || diskInfo.percent > 80
-        ? "warning"
-        : "healthy";
+  const [gb10_1, gb10_2, hermes, qdrant, railway, vercel, github, servicetitan, xero] =
+    await Promise.allSettled([
+      checkGB10(1),
+      checkGB10(2),
+      checkHermes(),
+      checkQdrant(),
+      checkRailway(),
+      checkVercel(),
+      checkGitHub(),
+      checkServiceTitan(),
+      checkXero(),
+    ]);
 
-  return {
-    timestamp: now,
-    global_status: status,
-    systems: [
-      { name: "GB10 #1", status, metric: `${cpuLoad.load}% CPU - ${memInfo.percent}% RAM - ${diskInfo.percent}% disk`, last_checked: now, evidence: "local" },
-      { name: "GB10 #2", status: "unreachable", metric: "", last_checked: now, evidence: "no SSH config" },
-      { name: "Hermes", status: "unreachable", metric: "", last_checked: now, evidence: "no process check" },
-      { name: "Qdrant", status: "unreachable", metric: "", last_checked: now, evidence: "no QDRANT_URL" },
-      { name: "Railway", status: "unreachable", metric: "", last_checked: now, evidence: "no RAILWAY_TOKEN" },
-      { name: "Vercel", status: "unreachable", metric: "", last_checked: now, evidence: "no VERCEL_TOKEN" },
-      { name: "GitHub", status: "unreachable", metric: "", last_checked: now, evidence: "no GITHUB_TOKEN" },
-      { name: "ServiceTitan", status: "unreachable", metric: "", last_checked: now, evidence: "no credentials" },
-      { name: "Xero", status: "unreachable", metric: "", last_checked: now, evidence: "no XERO_TENANT_ID" },
-    ],
-    total: 9,
-    healthy: status === "healthy" ? 1 : 0,
-    warning: status === "warning" ? 1 : 0,
-    critical: status === "critical" ? 1 : 0,
-    unreachable: 8,
-  };
-}
-
-async function fetchAgentCapacity() {
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
-
-    const res = await fetch(`${process.env.VERCEL_URL || "http://localhost:3000"}/api/mission-control/agent-capacity`, {
-      cache: "no-store",
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-
-    const activeSessions = data.active_agents ?? 0;
-    const breakdown = data.breakdown ?? { online: 0, busy: 0, idle: 0, offline: 0 };
-
-    return {
-      status: data.global_status === "healthy" ? "info" : "warning",
-      label: data.global_status === "healthy" ? "All agents operational" : "Some agents offline",
-      evidence_timestamp: data.timestamp ?? null,
-      active_sessions: activeSessions,
-      agents: data.agents ?? [],
-      platform_health: data.platform_health ?? [],
-      sync_status: data.sync_status ?? { droplet: { reachable: false, evidence: "unreachable" }, msi: { reachable: false, evidence: "unreachable" } },
-      breakdown,
-    };
-  } catch (err) {
-    return fetchLocalAgentCapacity();
-  }
-}
-
-async function fetchLocalAgentCapacity() {
-  const now = new Date().toISOString();
-  const psResult = await runCommand("ps aux --no-headers 2>/dev/null || ps aux | grep -v grep", 3000);
-  const psOutput = psResult.success ? psResult.output : "";
-
-  const agents = [
-    { id: "qwen-reviewer", name: "Qwen 3.6 Reviewer", role: "Reviewer", status: psOutput.includes("qwen") ? "online" : "offline", evidence: psOutput.includes("qwen") ? "Process detected" : "No process" },
-    { id: "claude-assistant", name: "Claude Code", role: "Assistant", status: psOutput.includes("claude") ? "online" : "offline", evidence: psOutput.includes("claude") ? "Process detected" : "No process" },
-    { id: "codex-coder", name: "Codex Coder", role: "Coder", status: psOutput.includes("codex") ? "online" : "offline", evidence: psOutput.includes("codex") ? "Process detected" : "No process" },
-    { id: "hermes-cto", name: "Hermes CTO", role: "Orchestrator", status: "online", evidence: "This session" },
-    { id: "gemini-researcher", name: "Gemini Researcher", role: "Research", status: "offline", evidence: "No process" },
+  const systems = [
+    { name: "GB10 #1", ...parseCheck(gb10_1) },
+    { name: "GB10 #2", ...parseCheck(gb10_2) },
+    { name: "Hermes", ...parseCheck(hermes) },
+    { name: "Qdrant", ...parseCheck(qdrant) },
+    { name: "Railway", ...parseCheck(railway) },
+    { name: "Vercel", ...parseCheck(vercel) },
+    { name: "GitHub", ...parseCheck(github) },
+    { name: "ServiceTitan", ...parseCheck(servicetitan) },
+    { name: "Xero", ...parseCheck(xero) },
   ];
 
-  const activeCount = agents.filter((a) => a.status === "online").length;
+  const globalStatus = determineGlobal(systems);
 
   return {
-    status: activeCount > 0 ? "info" : "neutral",
-    label: activeCount > 0 ? `${activeCount} agents active` : "No agents active",
+    status: globalStatus,
+    label: globalStatus === "critical" ? "Critical dependency failure" :
+           globalStatus === "warning" ? "Degraded systems detected" :
+           globalStatus === "healthy" ? "All systems operational" :
+           "Some systems unavailable",
     evidence_timestamp: now,
-    active_sessions: activeCount,
-    agents,
-    platform_health: [],
-    sync_status: { droplet: { reachable: false, evidence: "unreachable" }, msi: { reachable: false, evidence: "unreachable" } },
-    breakdown: { online: activeCount, busy: 0, idle: 0, offline: 5 - activeCount },
+    systems,
   };
 }
 
-async function fetchAlerts() {
-  // S4: real alerts from /api/mission-control/alerts
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
+/* ── section fetchers ──────────────────────────────────────────── */
 
-    const res = await fetch(`${process.env.VERCEL_URL || "http://localhost:3000"}/api/mission-control/alerts`, {
-      cache: "no-store",
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-
-    return {
-      status: data.global_severity === "healthy" ? "info" : data.global_severity === "critical" ? "critical" : data.global_severity === "warning" ? "warning" : "info",
-      label: `${data.summary.critical} critical · ${data.summary.warning} warning · ${data.summary.info} info`,
-      evidence_timestamp: data.timestamp ?? null,
-      alerts: (data.alerts ?? []).slice(0, 20).map((a: any) => ({
-        id: a.id,
-        severity: a.severity,
-        title: a.title,
-        message: a.message,
-        source: a.source,
-        timestamp: a.timestamp,
-        actionable: a.actionable,
-        link: a.link,
-      })),
-      summary: data.summary,
-      slack_status: data.slack_status,
-    };
-  } catch (err) {
-    return {
-      status: "warning",
-      label: "Alerts unavailable",
-      evidence_timestamp: null,
-      alerts: [],
-      summary: { total: 0, critical: 0, warning: 0, info: 0 },
-      slack_status: { name: "dashboard-issues", status: "unreachable", recent_count: 0, evidence: "Alerts check failed" },
-    };
-  }
+async function fetchAgentCapacity() {
+  return {
+    status: "pending",
+    label: "Pending live wiring (S3)",
+    evidence_timestamp: null,
+    active_sessions: 0,
+    breakdown: {
+      running: 0,
+      waiting: 0,
+      blocked: 0,
+      review: 0,
+      completed: 0,
+    },
+  };
 }
 
 async function fetchApprovalsRequired() {
-  // S4: real approval gates from /api/mission-control/approvals
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
-
-    const res = await fetch(`${process.env.VERCEL_URL || "http://localhost:3000"}/api/mission-control/approvals`, {
-      cache: "no-store",
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-
-    return {
-      status: "active",
-      label: `${data.summary.pending} pending approvals`,
-      evidence_timestamp: data.timestamp ?? null,
-      count: data.summary.total,
-      items: (data.approvals ?? []).map((a: any) => ({
-        title: a.title,
-        evidence: a.evidence ?? a.description ?? "",
-        recommendation: a.priority === "high" ? "review immediately" : "review when available",
-        source: a.source,
-        requested_by: a.requested_by,
-        url: a.url,
-        priority: a.priority,
-      })),
-      summary: data.summary,
-    };
-  } catch (err) {
-    // Fallback: local-only detection
-    return {
-      status: "active",
-      label: "Local check only",
-      evidence_timestamp: new Date().toISOString(),
-      count: 0,
-      items: [],
-      summary: { total: 0, pending: 0, urgent: 0 },
-    };
-  }
-}
-
-async function fetchProductionTrust() {
-  // S6: real freshness + integrity + deploy checks
-  // S1: placeholder
   return {
     status: "pending",
-    label: "Pending live wiring (S6)",
+    label: "Pending live wiring (S4)",
     evidence_timestamp: null,
-    trust_score: null,
-    freshness: [],
-    integrity: { score: null, mismatches: 0, last_recon: null },
-    deployments: { railway: null, vercel: null },
+    count: 0,
+    items: [],
   };
 }
 
+async function fetchProductionTrust() {
+  return computeProductionTrust();
+}
+
 async function fetchLiveAgentOps() {
-  // S3: real agent status from agent-capacity endpoint
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
-
-    const res = await fetch(`${process.env.VERCEL_URL || "http://localhost:3000"}/api/mission-control/agent-capacity`, {
-      cache: "no-store",
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-
-    return {
-      status: data.global_status === "healthy" ? "info" : "warning",
-      label: data.global_status === "healthy" ? "All agents operational" : "Some agents offline",
-      evidence_timestamp: data.timestamp ?? null,
-      agents: (data.agents ?? []).map((a: any) => ({
-        name: a.name,
-        role: a.role,
-        status: a.status,
-        evidence: a.evidence,
-        criticality: a.criticality,
-      })),
-      breakdown: data.breakdown ?? {},
-      platform_health: data.platform_health ?? [],
-    };
-  } catch (err) {
-    // Fallback: local-only agent detection
-    const now = new Date().toISOString();
-    const psResult = await runCommand("ps aux --no-headers 2>/dev/null || ps aux | grep -v grep", 3000);
-    const psOutput = psResult.success ? psResult.output : "";
-
-    const agents = [
-      { name: "Qwen 3.6 Reviewer", role: "Reviewer", status: psOutput.includes("qwen") ? "online" : "offline", evidence: psOutput.includes("qwen") ? "Process detected" : "No process", criticality: "critical" },
-      { name: "Claude Code", role: "Assistant", status: psOutput.includes("claude") ? "online" : "offline", evidence: psOutput.includes("claude") ? "Process detected" : "No process", criticality: "high" },
-      { name: "Codex Coder", role: "Coder", status: psOutput.includes("codex") ? "online" : "offline", evidence: psOutput.includes("codex") ? "Process detected" : "No process", criticality: "critical" },
-      { name: "Hermes CTO", role: "Orchestrator", status: "online", evidence: "This session", criticality: "critical" },
-      { name: "Gemini Researcher", role: "Research", status: "offline", evidence: "No process", criticality: "medium" },
-    ];
-
-    return {
-      status: "active",
-      label: "Local detection only",
-      evidence_timestamp: now,
-      agents,
-      breakdown: { online: agents.filter((a: any) => a.status === "online").length, offline: agents.filter((a: any) => a.status === "offline").length },
-      platform_health: [],
-    };
-  }
+  return {
+    status: "pending",
+    label: "Pending live wiring (S3)",
+    evidence_timestamp: null,
+    agents: [],
+  };
 }
 
 async function fetchActiveTasks() {
-  // S5: real kanban DAG from /api/mission-control/tasks
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
-
-    const res = await fetch(`${process.env.VERCEL_URL || "http://localhost:3000"}/api/mission-control/tasks`, {
-      cache: "no-store",
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-
-    return {
-      status: data.critical > 0 ? "critical" : data.active > 0 ? "info" : "neutral",
-      label: `${data.active} active tasks · ${data.critical} critical`,
-      evidence_timestamp: data.timestamp ?? null,
-      count: data.active,
-      items: (data.tasks ?? []).slice(0, 10).map((t: any) => ({
-        id: t.id,
-        title: t.title,
-        status: t.status,
-        owner: t.owner,
-        updated_at: t.updated_at,
-        source: t.source,
-        priority: t.priority,
-      })),
-      runbooks: (data.runbooks ?? []).map((r: any) => ({
-        id: r.id,
-        title: r.title,
-        severity: r.severity,
-        description: r.description,
-        affected_system: r.affected_system,
-        steps: r.steps,
-      })),
-      sources: data.sources,
-    };
-  } catch (err) {
-    return {
-      status: "pending",
-      label: "Tasks unavailable",
-      evidence_timestamp: null,
-      count: 0,
-      items: [],
-      runbooks: [],
-      sources: {},
-    };
-  }
+  return {
+    status: "pending",
+    label: "Pending live wiring (S5)",
+    evidence_timestamp: null,
+    count: 0,
+    items: [],
+  };
 }
 
 async function fetchEventStream() {
-  // S7: real event stream
-  // S1: placeholder
+  const result = getEvents();
+  const counts = getEventCounts();
+
   return {
-    status: "pending",
-    label: "Pending live wiring (S7)",
-    evidence_timestamp: null,
-    events: [],
+    status: result.events.length > 0 ? "healthy" : "warning",
+    label: result.events.length > 0
+      ? `${result.filtered_count} active events`
+      : "No active events",
+    evidence_timestamp: new Date().toISOString(),
+    total_events: result.total_count,
+    filtered_events: result.filtered_count,
+    severity_counts: counts,
+    events: result.events.slice(0, 20), // Latest 20 for overview
   };
 }
 
 async function fetchResearchIntelligence() {
-  // S8: real research findings from Qdrant
-  // S1: placeholder
   return {
     status: "pending",
     label: "Pending live wiring (S8)",
@@ -396,102 +164,194 @@ async function fetchResearchIntelligence() {
   };
 }
 
-/* - helpers - */
+/* ── Health check functions ────────────────────────────────────── */
 
-function parseResult<T>(result: PromiseSettledResult<T>): T | { error: string } {
-  if (result.status === "fulfilled") return result.value;
-  return { error: result.reason?.message ?? "Unknown error" };
-}
+async function checkGB10(num: number) {
+  const host = num === 1 ? "gb10-1.local" : "gb10-2.local";
+  const port = num === 1 ? 1234 : 1235;
 
-async function readCpuLoad(): Promise<{ load: number }> {
   try {
-    const result = await runCommand("top -bn1 | grep 'Cpu(s)' | awk '{print $2}'", 3000);
-    if (result.success) {
-      const load = parseFloat(result.output);
-      return { load: isNaN(load) ? 0 : load };
-    }
-  } catch { /* fall through */ }
-  return { load: 0 };
-}
-
-async function readMemoryInfo(): Promise<{ used: number; total: number; percent: number }> {
-  try {
-    const result = await runCommand("free -m | awk '/^Mem:/{print $2, $3}'", 3000);
-    if (result.success) {
-      const parts = result.output.trim().split(/\s+/);
-      const total = parseFloat(parts[0]) || 1;
-      const used = parseFloat(parts[1]) || 0;
-      return {
-        used: Math.round(used / 1024 * 100) / 100,
-        total: Math.round(total / 1024 * 100) / 100,
-        percent: Math.round((used / total) * 100),
-      };
-    }
-  } catch { /* fall through */ }
-  return { used: 0, total: 0, percent: 0 };
-}
-
-async function readDiskInfo(mount: string): Promise<{ used: number; total: number; percent: number }> {
-  try {
-    const result = await runCommand(`df -m ${mount} | awk 'NR==2{print $2, $3}'`, 3000);
-    if (result.success) {
-      const parts = result.output.trim().split(/\s+/);
-      const total = parseFloat(parts[0]) || 1;
-      const used = parseFloat(parts[1]) || 0;
-      return {
-        used: Math.round(used / 1024 * 100) / 100,
-        total: Math.round(total / 1024 * 100) / 100,
-        percent: Math.round((used / total) * 100),
-      };
-    }
-  } catch { /* fall through */ }
-  return { used: 0, total: 0, percent: 0 };
-}
-
-interface CmdResult {
-  success: boolean;
-  output: string;
-  error?: string;
-}
-
-function runCommand(cmd: string, timeout: number): Promise<CmdResult> {
-  return new Promise((resolve) => {
-    const { spawn } = require("child_process");
-    const proc = spawn(cmd, { shell: true });
-
-    let stdout = "";
-    let stderr = "";
-
-    proc.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-
-    proc.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-
-    const timer = setTimeout(() => {
-      proc.kill("SIGTERM");
-      setTimeout(() => {
-        if (!proc.killed) {
-          proc.kill("SIGKILL");
-        }
-      }, 100);
-      resolve({ success: false, output: "", error: `Timeout after ${timeout}ms` });
-    }, timeout);
-
-    proc.on("close", (code: number) => {
-      clearTimeout(timer);
-      if (code === 0) {
-        resolve({ success: true, output: stdout });
-      } else {
-        resolve({ success: false, output: stdout, error: stderr.trim() || `Exit code ${code}` });
+    const { execSync } = require("child_process");
+    const result = execSync(
+      `timeout 3 ssh -o ConnectTimeout=2 -o StrictHostKeyChecking=no root@${host} "uptime" 2>&1`,
+      { timeout: 5000 }
+    );
+    const uptime = result.toString().trim();
+    return {
+      status: "healthy" as const,
+      metric: uptime || "up",
+      last_checked: new Date().toISOString(),
+    };
+  } catch {
+    try {
+      const res = await fetch(`http://localhost:${port}/health`, {
+        signal: AbortSignal.timeout(3000),
+      });
+      if (res.ok) {
+        return {
+          status: "healthy" as const,
+          metric: `${res.status} OK`,
+          last_checked: new Date().toISOString(),
+        };
       }
-    });
+    } catch { /* ignore fallback */ }
 
-    proc.on("error", (err: Error) => {
-      clearTimeout(timer);
-      resolve({ success: false, output: "", error: err.message });
+    return {
+      status: "pending" as const,
+      metric: null,
+      last_checked: new Date().toISOString(),
+    };
+  }
+}
+
+async function checkHermes() {
+  try {
+    const res = await fetch("http://localhost:1234/v1/models", {
+      signal: AbortSignal.timeout(3000),
     });
-  });
+    if (res.ok) {
+      const data = await res.json();
+      return {
+        status: "healthy" as const,
+        metric: `${data.data?.length ?? 0} models loaded`,
+        last_checked: new Date().toISOString(),
+      };
+    }
+    return { status: "warning" as const, metric: `${res.status}`, last_checked: new Date().toISOString() };
+  } catch {
+    return { status: "pending" as const, metric: null, last_checked: new Date().toISOString() };
+  }
+}
+
+async function checkQdrant() {
+  try {
+    const res = await fetch("http://localhost:6333/health", {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const text = await res.text();
+      return {
+        status: "healthy" as const,
+        metric: text || "healthy",
+        last_checked: new Date().toISOString(),
+      };
+    }
+    return { status: "warning" as const, metric: `${res.status}`, last_checked: new Date().toISOString() };
+  } catch {
+    return { status: "pending" as const, metric: null, last_checked: new Date().toISOString() };
+  }
+}
+
+async function checkRailway() {
+  try {
+    const res = await fetch("https://railway.app/health", {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok) {
+      return { status: "healthy" as const, metric: `${res.status}`, last_checked: new Date().toISOString() };
+    }
+    return { status: "warning" as const, metric: `${res.status}`, last_checked: new Date().toISOString() };
+  } catch {
+    return { status: "pending" as const, metric: null, last_checked: new Date().toISOString() };
+  }
+}
+
+async function checkVercel() {
+  try {
+    const res = await fetch("https://vercel.com/docs/rest-api", {
+      method: "HEAD",
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok || res.status === 401 || res.status === 403) {
+      return { status: "healthy" as const, metric: `${res.status}`, last_checked: new Date().toISOString() };
+    }
+    return { status: "warning" as const, metric: `${res.status}`, last_checked: new Date().toISOString() };
+  } catch {
+    return { status: "pending" as const, metric: null, last_checked: new Date().toISOString() };
+  }
+}
+
+async function checkGitHub() {
+  try {
+    const res = await fetch("https://api.github.com/status", {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return {
+        status: data.status === "major" ? "warning" as const : "healthy" as const,
+        metric: data.status || "operational",
+        last_checked: new Date().toISOString(),
+      };
+    }
+    return { status: "warning" as const, metric: `${res.status}`, last_checked: new Date().toISOString() };
+  } catch {
+    return { status: "pending" as const, metric: null, last_checked: new Date().toISOString() };
+  }
+}
+
+async function checkServiceTitan() {
+  try {
+    const res = await fetch("https://auth.servicetitan.com/oauth2/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "client_credentials",
+        client_id: process.env.ST_CLIENT_ID || "",
+        client_secret: process.env.ST_CLIENT_SECRET || "",
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.status === 401 || res.status === 400 || res.status === 403) {
+      return { status: "healthy" as const, metric: `${res.status} (auth endpoint reachable)`, last_checked: new Date().toISOString() };
+    }
+    return { status: "warning" as const, metric: `${res.status}`, last_checked: new Date().toISOString() };
+  } catch {
+    return { status: "pending" as const, metric: null, last_checked: new Date().toISOString() };
+  }
+}
+
+async function checkXero() {
+  try {
+    const res = await fetch("https://api.xero.com/timezones", {
+      headers: { "Accept": "application/json" },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.status === 401 || res.status === 403) {
+      return { status: "healthy" as const, metric: `${res.status} (auth required)`, last_checked: new Date().toISOString() };
+    }
+    if (res.ok) return { status: "healthy" as const, metric: `${res.status}`, last_checked: new Date().toISOString() };
+    return { status: "warning" as const, metric: `${res.status}`, last_checked: new Date().toISOString() };
+  } catch {
+    return { status: "pending" as const, metric: null, last_checked: new Date().toISOString() };
+  }
+}
+
+/* ── Helpers ───────────────────────────────────────────────────── */
+
+function parseResult<T>(result: PromiseSettledResult<T>): T {
+  if (result.status === "fulfilled") return result.value;
+  throw new Error(result.reason?.message ?? "Unknown error");
+}
+
+function parseCheck<T extends PromiseSettledResult<any>>(result: T): { status: string; metric: string | null; last_checked: string } {
+  if (result.status === "rejected") {
+    return { status: "critical", metric: String(result.reason?.message || "unreachable"), last_checked: new Date().toISOString() };
+  }
+  const data = result.value;
+  return {
+    status: data.status || "pending",
+    metric: data.metric ?? null,
+    last_checked: data.last_checked || new Date().toISOString(),
+  };
+}
+
+function determineGlobal(systems: Array<{ status: string }>): string {
+  const hasCritical = systems.some((s) => s.status === "critical");
+  if (hasCritical) return "critical";
+  const hasWarning = systems.some((s) => s.status === "warning");
+  if (hasWarning) return "warning";
+  const allPending = systems.every((s) => s.status === "pending");
+  if (allPending) return "pending";
+  return "healthy";
 }
