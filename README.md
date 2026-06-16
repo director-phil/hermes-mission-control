@@ -1,4 +1,20 @@
-# AI Operations Center - Concept Designs
+# Hermes Mission Control - Concept Designs
+
+This repository is the standalone Hermes Mission Control project.
+
+It is not `reliable-tradies-ops`, not the Railway RT dashboard, and not an app inside the Reliable Tradies monorepo.
+
+Expected repo:
+
+```txt
+/home/phillip_downs/Documents/GitHub/hermes-mission-control
+```
+
+Run the repo guard before edits:
+
+```bash
+bash scripts/guard-repo.sh
+```
 
 ## Three Design Variants for Mission Control Dashboard
 
@@ -36,8 +52,8 @@ This variant focuses on data density and information architecture:
 ## How to View the Designs
 
 You can open each variant in your browser:
-1. **NOC Wall**: `file:///home/phillip_downs/Documents/GitHub/reliable-tradies-ops/sketches/mission-control-concept/001-noc-wall/index.html`
-2. **Constellation View**: `file:///home/phillip_downs/Documents/GitHub/reliable-tradies-ops/sketches/mission-control-concept/002-constellation-view/index.html` 
-3. **Heat Map View**: `file:///home/phillip_downs/Documents/GitHub/reliable-tradies-ops/sketches/mission-control-concept/003-heat-map-view/index.html`
+1. **NOC Wall**: `file:///home/phillip_downs/Documents/GitHub/hermes-mission-control/001-noc-wall/index.html`
+2. **Constellation View**: `file:///home/phillip_downs/Documents/GitHub/hermes-mission-control/002-constellation-view/index.html`
+3. **Heat Map View**: `file:///home/phillip_downs/Documents/GitHub/hermes-mission-control/003-heat-map-view/index.html`
 
 Each design is fully interactive with hover effects, animations, and responsive layouts.
