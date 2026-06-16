@@ -22,15 +22,20 @@ interface OverviewData {
 }
 
 interface SystemHealthSection {
-  status: string;
-  label: string;
-  evidence_timestamp: string | null;
+  timestamp: string;
+  global_status: string;
   systems: Array<{
     name: string;
     status: string;
-    metric: unknown;
-    last_checked: string | null;
+    metric: string;
+    last_checked: string;
+    evidence: string;
   }>;
+  total: number;
+  healthy: number;
+  warning: number;
+  critical: number;
+  unreachable: number;
 }
 
 interface AgentCapacitySection {
@@ -179,19 +184,43 @@ export default function OverviewPage() {
         <Section
           title="SYSTEM HEALTH"
           status={healthStripStatus(data.system_health)}
-          pending={data.system_health.status === "pending"}
-          pendingLabel={data.system_health.label}
+          pending={false}
         >
-          {data.system_health.status === "pending"
-            ? <PlaceholderRow label="Awaiting S2 live wiring" />
-            : data.system_health.systems.map((s) => (
-                <div key={s.name} className="flex items-center justify-between py-1">
-                  <span className="text-xs text-slate-400">{s.name}</span>
-                  <span className={`text-xs font-mono ${statusColor(s.status)}`}>
-                    {s.status}
-                  </span>
-                </div>
-              ))}
+          {/* Global status badge */}
+          <div className="flex items-center gap-2 mb-2 pb-2 border-b border-slate-800/50">
+            <span className={`text-xs font-mono font-bold ${
+              data.system_health.global_status === "healthy" ? "text-emerald-400" :
+              data.system_health.global_status === "warning" ? "text-amber-400" :
+              data.system_health.global_status === "critical" ? "text-red-400" :
+              "text-slate-400"
+            }`}>
+              {data.system_health.global_status.toUpperCase()}
+            </span>
+            <span className="text-[10px] text-slate-600 font-mono">
+              {data.system_health.healthy}/{data.system_health.total} healthy · {data.system_health.warning} warning · {data.system_health.critical} critical · {data.system_health.unreachable} unreachable
+            </span>
+            <span className="text-[10px] text-slate-600 font-mono ml-auto">
+              {timeAgo(data.system_health.timestamp)}
+            </span>
+          </div>
+          {data.system_health.systems.map((s) => (
+            <div key={s.name} className="flex items-center justify-between py-1 border-b border-slate-800/20 last:border-0">
+              <div className="flex flex-col">
+                <span className="text-xs text-slate-400">{s.name}</span>
+                {s.evidence && (
+                  <span className="text-[10px] text-slate-600 font-mono truncate max-w-[200px]">{s.evidence}</span>
+                )}
+              </div>
+              <div className="flex flex-col items-end">
+                <span className={`text-xs font-mono ${statusColor(s.status)}`}>
+                  {s.status}
+                </span>
+                {s.metric && (
+                  <span className="text-[10px] text-slate-500 font-mono">{s.metric}</span>
+                )}
+              </div>
+            </div>
+          ))}
         </Section>
 
         {/* 2. Agent Capacity */}
@@ -389,7 +418,7 @@ function Section({
   title: string;
   status: string;
   pending: boolean;
-  pendingLabel: string;
+  pendingLabel?: string;
   children: React.ReactNode;
 }) {
   const borderColors: Record<string, string> = {
@@ -447,24 +476,17 @@ function PlaceholderRow({ label }: { label: string }) {
 
 function globalStatus(data: OverviewData): string {
   const health = data.system_health;
-  if (health.status === "pending") return "warning";
-
-  const hasCritical = health.systems.some((s) => s.status === "critical");
-  if (hasCritical) return "critical";
-
-  const hasWarning = health.systems.some((s) => s.status === "warning");
-  if (hasWarning) return "warning";
-
-  return "info";
+  if (health.global_status === "healthy") return "info";
+  if (health.global_status === "warning") return "warning";
+  if (health.global_status === "critical") return "critical";
+  return "warning";
 }
 
 function healthStripStatus(health: SystemHealthSection): string {
-  if (health.status === "pending") return "neutral";
-  const hasCritical = health.systems.some((s) => s.status === "critical");
-  if (hasCritical) return "critical";
-  const hasWarning = health.systems.some((s) => s.status === "warning");
-  if (hasWarning) return "warning";
-  return "info";
+  if (health.global_status === "healthy") return "info";
+  if (health.global_status === "warning") return "warning";
+  if (health.global_status === "critical") return "critical";
+  return "neutral";
 }
 
 function statusColor(status: string): string {
