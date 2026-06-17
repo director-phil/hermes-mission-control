@@ -229,66 +229,148 @@ async function safeCheck<T extends Promise<any>>(promise: T, name: string, timeo
   }
 }
 
-/* ── Section fetchers (placeholders — no fetch, S2 only wires system_health) ───── */
+/* ── Section fetchers (live wiring via relative paths) ───────────── */
 
 async function fetchAgentCapacity() {
-  return {
-    status: "pending",
-    label: "Pending live wiring (S3)",
-    evidence_timestamp: null,
-    active_sessions: 0,
-    breakdown: { running: 0, waiting: 0, blocked: 0, review: 0, completed: 0 },
-  };
+  try {
+    const res = await fetch("/api/mission-control/agent-capacity", {
+      cache: "no-store",
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return { status: "error", label: res.statusText, evidence_timestamp: null, active_sessions: 0, breakdown: {} };
+    const data = await res.json();
+    return {
+      status: data.global_status || "pending",
+      label: data.global_status === "healthy" ? "All agents online" : "Agent pool active",
+      evidence_timestamp: new Date().toISOString(),
+      active_sessions: data.active_agents ?? data.total_agents ?? 0,
+      breakdown: data.breakdown ?? {},
+    };
+  } catch {
+    return { status: "pending", label: "Agent capacity check timed out", evidence_timestamp: null, active_sessions: 0, breakdown: {} };
+  }
 }
 
 async function fetchApprovalsRequired() {
-  return {
-    status: "pending",
-    label: "Pending live wiring (S4)",
-    evidence_timestamp: null,
-    count: 0,
-    items: [],
-  };
+  try {
+    const res = await fetch("/api/mission-control/approvals", {
+      cache: "no-store",
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return { status: "error", label: res.statusText, evidence_timestamp: null, count: 0, items: [] };
+    const data = await res.json();
+    return {
+      status: data.summary?.urgent > 0 ? "warning" : "healthy",
+      label: data.summary?.urgent > 0 ? "Urgent approvals pending" : "Approval queue healthy",
+      evidence_timestamp: data.timestamp ?? new Date().toISOString(),
+      count: data.summary?.total ?? 0,
+      items: (data.approvals ?? []).map((a: any) => ({
+        title: a.title,
+        evidence: a.evidence,
+        recommendation: a.description,
+      })),
+    };
+  } catch {
+    return { status: "pending", label: "Approvals check timed out", evidence_timestamp: null, count: 0, items: [] };
+  }
 }
 
 async function fetchProductionTrust() {
-  return {
-    status: "pending",
-    label: "Pending live wiring (S6)",
-    evidence_timestamp: null,
-    trust_score: null,
-    freshness: [],
-    integrity: { score: null, mismatches: 0, last_recon: null },
-    deployments: { railway: null, vercel: null },
-  };
+  try {
+    const res = await fetch("/api/mission-control/production-trust", {
+      cache: "no-store",
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return { status: "error", label: res.statusText, evidence_timestamp: null, trust_score: null, freshness: [], integrity: { score: null, mismatches: 0, last_recon: null }, deployments: { railway: null, vercel: null } };
+    const data = await res.json();
+    return {
+      status: data.trust_score !== null && data.trust_score >= 80 ? "healthy" : data.trust_score !== null && data.trust_score >= 50 ? "warning" : "pending",
+      label: data.trust_score !== null ? `${data.trust_score}% trust score` : "Score not yet computed",
+      evidence_timestamp: data.timestamp ?? new Date().toISOString(),
+      trust_score: data.trust_score ?? null,
+      freshness: data.freshness ?? [],
+      integrity: data.integrity ?? { score: null, mismatches: 0, last_recon: null },
+      deployments: data.deployments ?? { railway: null, vercel: null },
+    };
+  } catch {
+    return { status: "pending", label: "Production trust check timed out", evidence_timestamp: null, trust_score: null, freshness: [], integrity: { score: null, mismatches: 0, last_recon: null }, deployments: { railway: null, vercel: null } };
+  }
 }
 
 async function fetchLiveAgentOps() {
-  return {
-    status: "pending",
-    label: "Pending live wiring (S3)",
-    evidence_timestamp: null,
-    agents: [],
-  };
+  try {
+    const res = await fetch("/api/mission-control/agent-capacity", {
+      cache: "no-store",
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return { status: "error", label: res.statusText, evidence_timestamp: null, agents: [] };
+    const data = await res.json();
+    return {
+      status: data.global_status || "pending",
+      label: data.global_status === "healthy" ? "All agents operational" : "Agent ops active",
+      evidence_timestamp: new Date().toISOString(),
+      agents: (data.agents ?? []).map((a: any) => ({
+        name: a.name,
+        task: `${a.role} — ${a.evidence}`,
+        status: a.status,
+      })),
+    };
+  } catch {
+    return { status: "pending", label: "Live agent ops check timed out", evidence_timestamp: null, agents: [] };
+  }
 }
 
 async function fetchActiveTasks() {
-  return {
-    status: "pending",
-    label: "Pending live wiring (S5)",
-    evidence_timestamp: null,
-    count: 0,
-    items: [],
-  };
+  try {
+    const res = await fetch("/api/mission-control/tasks", {
+      cache: "no-store",
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return { status: "error", label: res.statusText, evidence_timestamp: null, count: 0, items: [], runbooks: [], sources: {} };
+    const data = await res.json();
+    return {
+      status: data.critical > 0 ? "warning" : "healthy",
+      label: data.critical > 0 ? `${data.critical} critical tasks` : "Task queue healthy",
+      evidence_timestamp: data.timestamp ?? new Date().toISOString(),
+      count: data.total ?? 0,
+      items: (data.tasks ?? []).map((t: any) => ({
+        id: t.id,
+        title: t.title,
+        status: t.status,
+        owner: t.owner,
+        updated_at: t.updated_at,
+        source: t.source,
+        priority: t.priority,
+      })),
+      runbooks: data.runbooks ?? [],
+      sources: data.sources ?? {},
+    };
+  } catch {
+    return { status: "pending", label: "Active tasks check timed out", evidence_timestamp: null, count: 0, items: [], runbooks: [], sources: {} };
+  }
 }
 
 async function fetchEventStream() {
-  return {
-    status: "pending",
-    label: "Pending live wiring (S7)",
-    evidence_timestamp: null,
-    events: [],
-  };
+  try {
+    const res = await fetch("/api/mission-control/events", {
+      cache: "no-store",
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return { status: "error", label: res.statusText, evidence_timestamp: null, events: [] };
+    const data = await res.json();
+    return {
+      status: data.events?.some((e: any) => e.severity === "critical") ? "warning" : "healthy",
+      label: data.events?.length ? `${data.events.length} events` : "No events",
+      evidence_timestamp: data.timestamp ?? new Date().toISOString(),
+      events: (data.events ?? []).map((e: any) => ({
+        type: e.type,
+        message: e.message,
+        timestamp: e.timestamp,
+      })),
+    };
+  } catch {
+    return { status: "pending", label: "Event stream check timed out", evidence_timestamp: null, events: [] };
+  }
 }
 
 async function fetchResearchIntelligence() {
