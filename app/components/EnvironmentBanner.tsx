@@ -62,14 +62,14 @@ export default function EnvironmentBanner() {
   return (
     <div
       className={`
-        border-b px-4 py-2 flex items-center justify-between text-xs font-mono
+        border-b px-4 py-2 flex flex-col items-stretch gap-2 text-xs font-mono sm:flex-row sm:items-center sm:justify-between
         ${isBlocked
           ? "bg-red-950/60 border-red-800/40 text-red-300"
           : "bg-slate-900/80 border-slate-800/40 text-slate-400"
         }
       `}
     >
-      <div className="flex items-center gap-4">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1">
         {/* Status indicator */}
         <div className="flex items-center gap-2">
           <span
@@ -83,18 +83,18 @@ export default function EnvironmentBanner() {
         </div>
 
         {/* Repo path */}
-        <div className="flex items-center gap-1.5">
+        <div className="flex min-w-0 max-w-full items-center gap-1.5">
           <span className="text-slate-600">repo:</span>
-          <span className="truncate max-w-[300px] text-slate-300">
+          <span className="min-w-0 max-w-full truncate text-slate-300 sm:max-w-[300px]">
             {env?.repo_path ?? "unknown"}
           </span>
         </div>
 
         {/* Branch */}
         {env?.branch && (
-          <div className="flex items-center gap-1.5">
+          <div className="flex min-w-0 items-center gap-1.5">
             <span className="text-slate-600">branch:</span>
-            <span className="text-blue-400">{env.branch}</span>
+            <span className="min-w-0 break-all text-blue-400 sm:break-normal">{env.branch}</span>
           </div>
         )}
 
@@ -114,7 +114,7 @@ export default function EnvironmentBanner() {
       </div>
 
       {/* Deployment target */}
-      <div className="text-slate-600">
+      <div className="shrink-0 text-slate-600">
         → {env?.deployment_target ?? "unknown"}
       </div>
     </div>

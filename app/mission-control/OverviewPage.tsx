@@ -1,644 +1,339 @@
-/**
- * S1 — Overview Page (First View Operating Shell)
- *
- * Displays all 8 operational signals in the first viewport.
- * Dark ops-centre theme. No generic KPI cards — operations centre layout.
- */
-
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+
+interface Evidence {
+  source: string;
+  timestamp: string | null;
+  status?: string;
+  note?: string;
+}
+
+interface ProcessRecord {
+  pid: number;
+  ppid: number;
+  name: string;
+  argv_redacted: string[];
+  command_identity: string;
+  role: string;
+  rss_bytes: number | null;
+  owner_goal_id: string | null;
+  service_unit: string | null;
+  orphan: boolean;
+  evidence: Evidence;
+}
+
+interface GoalRecord {
+  goal_id: string;
+  title: string | null;
+  status: string;
+  queue_state: string;
+  stage: string | null;
+  controller_pid: number | null;
+  last_event_timestamp: string | null;
+  stall_age_ms: number | null;
+  blocker_ids: string[];
+  dependency_ids: string[];
+  worktree: { path: string; branch: string | null; head: string | null; dirty: boolean | null; source: string; timestamp: string | null } | null;
+  sources: Evidence[];
+}
+
+interface RuntimeEvent {
+  id: string;
+  goal_id: string;
+  type: string;
+  timestamp: string;
+  summary: string;
+  source: string;
+  source_timestamp: string | null;
+  severity: string;
+}
+
+interface RuntimeAlert {
+  id: string;
+  goal_id: string | null;
+  severity: string;
+  title: string;
+  message: string;
+  evidence: string;
+  source_timestamp: string | null;
+  action: string;
+}
 
 interface OverviewData {
   timestamp: string;
-  system_health: SystemHealthSection;
-  agent_capacity: AgentCapacitySection;
-  alerts: AlertsSection;
-  approvals_required: ApprovalsSection;
-  production_trust: ProductionTrustSection;
-  live_agent_ops: LiveAgentOpsSection;
-  active_tasks: ActiveTasksSection;
-  event_stream: EventStreamSection;
-  research_intelligence: ResearchSection;
-}
-
-interface AlertsSection {
-  status: string;
-  label: string;
-  evidence_timestamp: string | null;
-  alerts: Array<{
-    id: string;
-    severity: string;
-    title: string;
-    message: string;
-    source: string;
+  fleet: {
     timestamp: string;
-    actionable: boolean;
-    link?: string;
-  }>;
-  summary: { total: number; critical: number; warning: number; info: number };
-  slack_status: { name: string; status: string; recent_count: number; evidence: string };
-}
-
-interface SystemHealthSection {
-  timestamp: string;
-  global_status: string;
-  systems: Array<{
-    name: string;
-    status: string;
-    metric: string;
-    last_checked: string;
-    evidence: string;
-  }>;
-  total: number;
-  healthy: number;
-  warning: number;
-  critical: number;
-  unreachable: number;
-}
-
-interface AgentCapacitySection {
-  status: string;
-  label: string;
-  evidence_timestamp: string | null;
-  active_sessions: number;
-  breakdown: Record<string, number>;
-}
-
-interface ApprovalsSection {
-  status: string;
-  label: string;
-  evidence_timestamp: string | null;
-  count: number;
-  items: unknown[];
-}
-
-interface ProductionTrustSection {
-  status: string;
-  label: string;
-  evidence_timestamp: string | null;
-  trust_score: number | null;
-  freshness: Array<{
-    source: string;
-    last_refresh: string;
-    age_minutes: number;
-    status: string;
-  }>;
-  integrity: { score: number | null; mismatches: number; last_recon: string | null };
-  deployments: { railway: unknown; vercel: unknown };
-}
-
-interface LiveAgentOpsSection {
-  status: string;
-  label: string;
-  evidence_timestamp: string | null;
-  agents: unknown[];
-}
-
-interface ActiveTasksSection {
-  status: string;
-  label: string;
-  evidence_timestamp: string | null;
-  count: number;
-  items: Array<{
-    id: string;
-    title: string;
-    status: string;
-    owner: string;
-    updated_at: string;
-    source?: string;
-    priority?: string;
-  }>;
-  runbooks?: Array<{
-    id: string;
-    title: string;
-    severity: string;
-    description: string;
-    affected_system: string;
-    steps: string[];
-  }>;
-  sources?: Record<string, { status: string; count: number; evidence: string }>;
-}
-
-interface EventStreamSection {
-  status: string;
-  label: string;
-  evidence_timestamp: string | null;
-  events: unknown[];
-}
-
-interface ResearchSection {
-  status: string;
-  label: string;
-  evidence_timestamp: string | null;
-  findings: unknown[];
+    processes: ProcessRecord[];
+    services: Array<{ unit: string; active_state: string; sub_state: string; main_pid: number | null; source: string; timestamp: string | null }>;
+    worktrees: Array<{ path: string; branch: string | null; head: string | null; dirty: boolean | null; source: string; timestamp: string | null }>;
+    source_warnings: Array<{ source: string; message: string }>;
+    summary: { processes: number; controllers: number; wrappers: number; orphaned: number; services: number };
+  };
+  work: { timestamp: string; goals: GoalRecord[]; summary: { total: number; running: number; ready: number; terminal: number; unknown: number } };
+  trace: { timestamp: string; events: RuntimeEvent[]; warnings: Array<{ source: string; message: string }>; summary: { events: number; warnings: number; latest: string | null } };
+  alerts: { alerts: RuntimeAlert[]; summary: { total: number; critical: number; warning: number; info: number } };
 }
 
 export default function OverviewPage() {
   const [data, setData] = useState<OverviewData | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [selectedGoalId, setSelectedGoalId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const inFlight = useRef(false);
 
   useEffect(() => {
-    fetch("/api/mission-control/overview")
-      .then((r) => r.json())
-      .then((d) => {
-        setData(d);
-        setLoading(false);
-      })
-      .catch((e) => {
-        setError(e.message ?? "Failed to fetch overview");
-        setLoading(false);
-      });
+    let cancelled = false;
+    async function load() {
+      if (inFlight.current) return;
+      inFlight.current = true;
+      try {
+        const response = await fetch("/api/mission-control/runtime", { cache: "no-store" });
+        if (!response.ok) throw new Error(`Runtime API ${response.status}`);
+        const overview = await fetch("/api/mission-control/overview", { cache: "no-store" });
+        if (!overview.ok) throw new Error(`Overview API ${overview.status}`);
+        const nextData = await overview.json() as OverviewData;
+        if (!cancelled) {
+          setData(nextData);
+          setSelectedGoalId((current) => current ?? nextData.work.goals[0]?.goal_id ?? null);
+          setError(null);
+        }
+      } catch (loadError) {
+        if (!cancelled) setError(loadError instanceof Error ? loadError.message : "Failed to load runtime APIs");
+      } finally {
+        inFlight.current = false;
+      }
+    }
+    load();
+    const timer = window.setInterval(load, 10_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, []);
 
-  if (loading) {
-    return (
-      <div className="min-h-screen bg-slate-950 flex items-center justify-center">
-        <div className="text-center">
-          <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4" />
-          <p className="text-slate-500 text-sm font-mono">Initializing Mission Control…</p>
-        </div>
-      </div>
-    );
-  }
+  const selectedGoal = useMemo(
+    () => data?.work.goals.find((goal) => goal.goal_id === selectedGoalId) ?? data?.work.goals[0] ?? null,
+    [data, selectedGoalId],
+  );
+  const selectedEvents = useMemo(
+    () => data?.trace.events.filter((event) => selectedGoal && event.goal_id === selectedGoal.goal_id).slice(-12).reverse() ?? [],
+    [data, selectedGoal],
+  );
 
-  if (error || !data) {
-    return (
-      <div className="min-h-screen bg-slate-950 flex items-center justify-center">
-        <div className="text-center max-w-md">
-          <div className="w-12 h-12 bg-red-950/50 border border-red-800/40 rounded-full flex items-center justify-center mx-auto mb-4">
-            <span className="text-red-400 text-xl">⚠</span>
-          </div>
-          <p className="text-red-400 font-mono text-sm">{error ?? "Failed to load overview"}</p>
-        </div>
-      </div>
-    );
+  if (error) {
+    return <Shell><div className="rounded border border-red-800 bg-red-950/30 p-4 text-sm text-red-200">{error}</div></Shell>;
+  }
+  if (!data) {
+    return <Shell><div className="text-sm font-mono text-slate-500">Loading runtime evidence...</div></Shell>;
   }
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200">
-      {/* Header */}
-      <div className="px-6 py-4 border-b border-slate-800/40">
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-lg font-bold tracking-wide text-white">
-              MISSION CONTROL
-            </h1>
-            <p className="text-xs text-slate-500 font-mono mt-0.5">
-              Last updated: {new Date(data.timestamp).toLocaleTimeString()} AEST
-            </p>
-          </div>
-          {/* 5-second questions */}
-          <div className="flex items-center gap-4 text-xs font-mono">
-            <span className="flex items-center gap-1.5">
-              <span className={`w-2 h-2 rounded-full ${globalStatus(data) === "critical" ? "bg-red-500 animate-pulse" : globalStatus(data) === "warning" ? "bg-amber-500" : "bg-emerald-500"}`} />
-              {globalStatus(data).toUpperCase()}
-            </span>
-            <span className="text-slate-600">|</span>
-            <span className="text-slate-400">
-              {data.alerts.summary?.critical ?? 0} critical
-            </span>
-            <span className="text-slate-600">|</span>
-            <span className="text-slate-400">
-              {data.active_tasks.count} active
-            </span>
-            <span className="text-slate-600">|</span>
-            <span className="text-slate-400">
-              {data.approvals_required.count} pending
-            </span>
-          </div>
-        </div>
-      </div>
-
-      {/* 8-section grid */}
-      <div className="p-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-
-        {/* 1. System Health */}
-        <Section
-          title="SYSTEM HEALTH"
-          status={healthStripStatus(data.system_health)}
-          pending={false}
-        >
-          {/* Global status badge */}
-          <div className="flex items-center gap-2 mb-2 pb-2 border-b border-slate-800/50">
-            <span className={`text-xs font-mono font-bold ${
-              data.system_health.global_status === "healthy" ? "text-emerald-400" :
-              data.system_health.global_status === "warning" ? "text-amber-400" :
-              data.system_health.global_status === "critical" ? "text-red-400" :
-              "text-slate-400"
-            }`}>
-              {data.system_health.global_status.toUpperCase()}
-            </span>
-            <span className="text-[10px] text-slate-600 font-mono">
-              {data.system_health.healthy}/{data.system_health.total} healthy · {data.system_health.warning} warning · {data.system_health.critical} critical · {data.system_health.unreachable} unreachable
-            </span>
-            <span className="text-[10px] text-slate-600 font-mono ml-auto">
-              {timeAgo(data.system_health.timestamp)}
-            </span>
-          </div>
-          {data.system_health.systems.map((s) => (
-            <div key={s.name} className="flex items-center justify-between py-1 border-b border-slate-800/20 last:border-0">
-              <div className="flex flex-col">
-                <span className="text-xs text-slate-400">{s.name}</span>
-                {s.evidence && (
-                  <span className="text-[10px] text-slate-600 font-mono truncate max-w-[200px]">{s.evidence}</span>
-                )}
+    <Shell timestamp={data.timestamp} severity={data.alerts.summary.critical > 0 ? "critical" : data.alerts.summary.warning > 0 ? "warning" : "observed"}>
+      <div className="grid min-w-0 grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1.2fr)_minmax(0,1fr)]">
+        <Panel title="FLEET" meta={`${data.fleet.summary.processes} proc / ${data.fleet.summary.services} svc`} tone={data.fleet.summary.orphaned > 0 ? "critical" : "observed"}>
+          <MetricRow label="controllers" value={data.fleet.summary.controllers} />
+          <MetricRow label="wrappers" value={data.fleet.summary.wrappers} />
+          <MetricRow label="orphaned" value={data.fleet.summary.orphaned} tone={data.fleet.summary.orphaned > 0 ? "critical" : "muted"} />
+          <div className="mt-3 space-y-2">
+            {data.fleet.processes.filter((process) => process.role !== "unrelated").slice(0, 8).map((process) => (
+              <div key={process.pid} className="border-t border-slate-800 pt-2">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="truncate text-sm text-slate-100">{process.name} <span className="font-mono text-xs text-slate-500">pid {process.pid}</span></div>
+                    <div className="min-w-0 break-words font-mono text-[11px] text-slate-500">{process.command_identity}</div>
+                  </div>
+                  <Status label={process.orphan ? "orphan" : process.role} tone={process.orphan ? "critical" : "observed"} />
+                </div>
+                <EvidenceLink evidence={process.evidence} />
               </div>
-              <div className="flex flex-col items-end">
-                <span className={`text-xs font-mono ${statusColor(s.status)}`}>
-                  {s.status}
-                </span>
-                {s.metric && (
-                  <span className="text-[10px] text-slate-500 font-mono">{s.metric}</span>
-                )}
-              </div>
-            </div>
-          ))}
-        </Section>
+            ))}
+            {data.fleet.processes.filter((process) => process.role !== "unrelated").length === 0 && <Empty text="No owned runtime processes found" />}
+          </div>
+        </Panel>
 
-        {/* 2. Agent Capacity */}
-        <Section
-          title="AGENT CAPACITY"
-          status={data.agent_capacity.active_sessions > 0 ? "info" : "neutral"}
-          pending={data.agent_capacity.status === "pending"}
-          pendingLabel={data.agent_capacity.label}
-        >
-          {data.agent_capacity.status === "pending"
-            ? <PlaceholderRow label="Awaiting S3 live wiring" />
-            : (<>
-                <div className="py-2">
-                  <span className="text-2xl font-bold text-white font-mono">
-                    {data.agent_capacity.active_sessions}
-                  </span>
-                  <span className="text-xs text-slate-500 ml-1">active</span>
-                </div>
-                <div className="grid grid-cols-2 gap-1 text-xs font-mono">
-                  {Object.entries(data.agent_capacity.breakdown).map(([k, v]) => (
-                    <div key={k} className="flex justify-between">
-                      <span className="text-slate-500">{k}</span>
-                      <span className="text-slate-300">{v}</span>
-                    </div>
-                  ))}
-                </div>
-              </>)
-          }
-        </Section>
-
-        {/* 3. Approvals Required */}
-        <Section
-          title="APPROVALS REQUIRED"
-          status={data.approvals_required.count > 0 ? "warning" : "neutral"}
-          pending={data.approvals_required.status === "pending"}
-          pendingLabel={data.approvals_required.label}
-        >
-          {data.approvals_required.status === "pending"
-            ? <PlaceholderRow label="Awaiting S4 live wiring" />
-            : data.approvals_required.count === 0
-              ? <div className="py-2 text-xs text-emerald-400 font-mono">✓ No pending approvals</div>
-              : (data.approvals_required.items as Array<{ title: string; evidence?: string; recommendation?: string }>).map((item, i) => (
-                  <div key={i} className="py-1 border-b border-slate-800/30 last:border-0">
-                    <div className="text-xs text-amber-300 font-medium">{item.title}</div>
-                    {item.evidence && (
-                      <div className="text-[10px] text-slate-500 font-mono mt-0.5">{item.evidence}</div>
-                    )}
+        <Panel title="WORK" meta={`${data.work.summary.total} goals`} tone={data.work.summary.unknown > 0 ? "warning" : "observed"}>
+          <div className="grid grid-cols-4 gap-2">
+            <MetricTile label="running" value={data.work.summary.running} />
+            <MetricTile label="ready" value={data.work.summary.ready} />
+            <MetricTile label="terminal" value={data.work.summary.terminal} />
+            <MetricTile label="unknown" value={data.work.summary.unknown} />
+          </div>
+          <div className="mt-3 grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+            <div className="max-h-[520px] overflow-auto pr-1">
+              {data.work.goals.map((goal) => (
+                <button
+                  key={goal.goal_id}
+                  type="button"
+                  onClick={() => setSelectedGoalId(goal.goal_id)}
+                  className={`mb-2 block min-w-0 w-full border p-2 text-left ${selectedGoal?.goal_id === goal.goal_id ? "border-cyan-500 bg-cyan-950/20" : "border-slate-800 bg-slate-950/50 hover:border-slate-700"}`}
+                >
+                  <div className="flex min-w-0 items-center justify-between gap-2">
+                    <span className="min-w-0 truncate text-sm text-slate-100">{goal.title ?? goal.goal_id}</span>
+                    <Status label={goal.status} tone={goal.status === "failed" ? "critical" : goal.status === "unknown" ? "warning" : "observed"} />
                   </div>
-                ))}
-        </Section>
-
-        {/* 4. Alerts */}
-        <Section
-          title="ALERTS"
-          status={data.alerts.status === "critical" ? "critical" : data.alerts.status === "warning" ? "warning" : data.alerts.summary?.critical > 0 ? "info" : "neutral"}
-          pending={data.alerts.status === "pending"}
-          pendingLabel={data.alerts.label}
-        >
-          {data.alerts.status === "pending"
-            ? <PlaceholderRow label="Awaiting S4 live wiring" />
-            : (<div>
-                {/* Alert summary */}
-                <div className="flex items-center gap-2 mb-2 pb-2 border-b border-slate-800/50">
-                  <span className="text-[10px] text-slate-600 font-mono">
-                    {data.alerts.summary?.critical ?? 0} critical · {data.alerts.summary?.warning ?? 0} warning · {data.alerts.summary?.info ?? 0} info
-                  </span>
-                  <span className="text-[10px] text-slate-600 font-mono ml-auto">
-                    {timeAgo(data.alerts.evidence_timestamp ?? "")}
-                  </span>
-                </div>
-                {/* Slack status */}
-                {data.alerts.slack_status && (
-                  <div className="flex items-center gap-1.5 py-1 text-xs">
-                    <span className={`w-1.5 h-1.5 rounded-full ${data.alerts.slack_status.status === "healthy" ? "bg-emerald-400" : data.alerts.slack_status.status === "unreachable" ? "bg-slate-600" : "bg-amber-400"}`} />
-                    <span className="text-slate-400">#{data.alerts.slack_status.name}</span>
-                    <span className="text-[10px] text-slate-600 font-mono ml-auto">{data.alerts.slack_status.recent_count} recent</span>
-                  </div>
-                )}
-                {/* Alerts list */}
-                {data.alerts.alerts && data.alerts.alerts.length > 0
-                  ? data.alerts.alerts.slice(0, 5).map((a: any) => (
-                      <div key={a.id} className="py-1 border-b border-slate-800/20 last:border-0">
-                        <div className="flex items-center gap-1.5 text-xs">
-                          <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
-                            a.severity === "critical" ? "bg-red-400 animate-pulse" :
-                            a.severity === "warning" ? "bg-amber-400" :
-                            "bg-blue-400"
-                          }`} />
-                          <span className={`font-medium ${
-                            a.severity === "critical" ? "text-red-300" :
-                            a.severity === "warning" ? "text-amber-300" :
-                            "text-blue-300"
-                          }`}>{a.title}</span>
-                        </div>
-                        <div className="flex items-center gap-2 text-[10px] text-slate-600 font-mono mt-0.5">
-                          <span>{a.source}</span>
-                          <span>·</span>
-                          <span>{timeAgo(a.timestamp)}</span>
-                          {a.actionable && <span className="text-amber-400">ACTION</span>}
-                        </div>
-                      </div>
-                    ))
-                  : <div className="py-2 text-xs text-emerald-400 font-mono">✓ All systems nominal</div>
-                }
-              </div>)
-          }
-        </Section>
-
-        {/* 5. Production Trust */}
-        <Section
-          title="PRODUCTION TRUST"
-          status={data.production_trust.trust_score !== null
-            ? data.production_trust.trust_score >= 80 ? "info"
-              : data.production_trust.trust_score >= 50 ? "warning" : "critical"
-            : "neutral"}
-          pending={data.production_trust.status === "pending"}
-          pendingLabel={data.production_trust.label}
-        >
-          {data.production_trust.status === "pending"
-            ? <PlaceholderRow label="Awaiting S6 live wiring" />
-            : (<>
-                <div className="py-2">
-                  {data.production_trust.trust_score !== null ? (
-                    <div className="flex items-center gap-2">
-                      <span className="text-2xl font-bold text-white font-mono">
-                        {data.production_trust.trust_score}%
-                      </span>
-                      <span className="text-xs text-slate-500">trust score</span>
-                    </div>
-                  ) : (
-                    <div className="text-xs text-slate-500 font-mono">Score not yet computed</div>
-                  )}
-                </div>
-                {data.production_trust.freshness.length > 0 && (
-                  <div className="space-y-1">
-                    {data.production_trust.freshness.slice(0, 3).map((f) => (
-                      <div key={f.source} className="flex items-center justify-between text-xs">
-                        <span className="text-slate-400">{f.source}</span>
-                        <span className={`font-mono ${f.status === "fresh" ? "text-emerald-400" : "text-amber-400"}`}>
-                          {f.age_minutes < 0 ? "—" : `${f.age_minutes}m`}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </>)
-          }
-        </Section>
-
-        {/* 5. Live Agent Operations */}
-        <Section
-          title="LIVE AGENT OPS"
-          status={data.live_agent_ops.status === "pending" ? "neutral" : "info"}
-          pending={data.live_agent_ops.status === "pending"}
-          pendingLabel={data.live_agent_ops.label}
-        >
-          {data.live_agent_ops.status === "pending"
-            ? <PlaceholderRow label="Awaiting S3 live wiring" />
-            : data.live_agent_ops.agents.length === 0
-              ? <div className="py-2 text-xs text-slate-500 font-mono">No active agents</div>
-              : (data.live_agent_ops.agents as Array<{ name: string; task: string; status: string }>).slice(0, 5).map((a, i) => (
-                  <div key={i} className="flex items-center justify-between py-1 text-xs">
-                    <span className="text-slate-300">{a.name}</span>
-                    <span className={`font-mono text-[10px] ${statusColor(a.status)}`}>{a.status}</span>
-                  </div>
-                ))}
-        </Section>
-
-        {/* 6. Active Tasks */}
-        <Section
-          title="ACTIVE TASKS"
-          status={data.active_tasks.count > 0 ? (data.active_tasks.status === "critical" ? "critical" : "info") : "neutral"}
-          pending={data.active_tasks.status === "pending"}
-          pendingLabel={data.active_tasks.label}
-        >
-          {data.active_tasks.status === "pending"
-            ? <PlaceholderRow label="Awaiting S5 live wiring" />
-            : data.active_tasks.count === 0
-              ? <div className="py-2 text-xs text-emerald-400 font-mono">✓ No active tasks</div>
-              : (data.active_tasks.items as Array<{ id: string; title: string; status: string; owner: string; updated_at: string }>).slice(0, 5).map((t) => (
-                  <div key={t.id} className="py-1 border-b border-slate-800/30 last:border-0">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="text-slate-300 truncate max-w-[140px]" title={t.title}>{t.title}</span>
-                      <span className={`font-mono text-[10px] ml-2 ${statusColor(t.status)}`}>{t.status}</span>
-                    </div>
-                    <div className="text-[10px] text-slate-600 font-mono mt-0.5">
-                      {t.owner} · {timeAgo(t.updated_at)}
-                    </div>
-                  </div>
-                ))}
-          {data.active_tasks.runbooks && data.active_tasks.runbooks.length > 0 && (
-            <>
-              <div className="text-[9px] text-slate-500 font-mono uppercase tracking-wider mt-2 mb-1">Auto-Generated Runbooks</div>
-              {data.active_tasks.runbooks.slice(0, 3).map((r) => (
-                <div key={r.id} className="py-1 border-b border-slate-800/20 last:border-0">
-                  <div className="flex items-center gap-1 text-xs">
-                    <span className="text-red-400">⚠</span>
-                    <span className="text-red-300 font-medium">{r.title}</span>
-                  </div>
-                  <div className="text-[10px] text-slate-500 font-mono mt-0.5 truncate">{r.description}</div>
-                </div>
+                  <div className="mt-1 truncate font-mono text-[11px] text-slate-500">{goal.goal_id}</div>
+                  <div className="mt-1 text-[11px] text-slate-400">stage {goal.stage ?? "unknown"} / queue {goal.queue_state}</div>
+                </button>
               ))}
-            </>
-          )}
-        </Section>
-
-        {/* 7. Event Stream */}
-        <Section
-          title="EVENT STREAM"
-          status="neutral"
-          pending={data.event_stream.status === "pending"}
-          pendingLabel={data.event_stream.label}
-        >
-          {data.event_stream.status === "pending"
-            ? <PlaceholderRow label="Awaiting S7 live wiring" />
-            : data.event_stream.events.length === 0
-              ? <div className="py-2 text-xs text-slate-500 font-mono">No events</div>
-              : (data.event_stream.events as Array<{ type: string; message: string; timestamp: string }>).slice(0, 5).map((e, i) => (
-                  <div key={i} className="py-1 border-b border-slate-800/30 last:border-0">
-                    <div className="flex items-center gap-2 text-xs">
-                      <span className={`font-mono text-[10px] px-1 rounded ${eventBadgeColor(e.type)}`}>
-                        {e.type}
-                      </span>
-                      <span className="text-slate-400 truncate">{e.message}</span>
-                    </div>
-                    <div className="text-[10px] text-slate-600 font-mono mt-0.5">{timeAgo(e.timestamp)}</div>
-                  </div>
-                ))}
-        </Section>
-
-        {/* 8. Research Intelligence */}
-        <Section
-          title="RESEARCH INTELLIGENCE"
-          status="neutral"
-          pending={data.research_intelligence.status === "pending"}
-          pendingLabel={data.research_intelligence.label}
-        >
-          {data.research_intelligence.status === "pending"
-            ? <PlaceholderRow label="Awaiting S8 live wiring" />
-            : data.research_intelligence.findings.length === 0
-              ? <div className="py-2 text-xs text-slate-500 font-mono">No findings</div>
-              : (data.research_intelligence.findings as Array<{ title: string; roi?: string; urgency?: string }>).slice(0, 5).map((f, i) => (
-                  <div key={i} className="py-1 border-b border-slate-800/30 last:border-0">
-                    <div className="text-xs text-slate-300">{f.title}</div>
-                    <div className="flex gap-2 text-[10px] font-mono mt-0.5">
-                      {f.roi && <span className="text-blue-400">ROI: {f.roi}</span>}
-                      {f.urgency && <span className={`font-bold ${urgencyColor(f.urgency)}`}>{f.urgency}</span>}
-                    </div>
-                  </div>
-                ))}
-        </Section>
-      </div>
-    </div>
-  );
-}
-
-/* ── Sub-components ─────────────────────────────────────────────── */
-
-function Section({
-  title,
-  status,
-  pending,
-  pendingLabel,
-  children,
-}: {
-  title: string;
-  status: string;
-  pending: boolean;
-  pendingLabel?: string;
-  children: React.ReactNode;
-}) {
-  const borderColors: Record<string, string> = {
-    neutral: "border-slate-800/30",
-    info: "border-blue-800/30",
-    warning: "border-amber-800/30",
-    critical: "border-red-800/30",
-  };
-
-  const headerColors: Record<string, string> = {
-    neutral: "text-slate-500",
-    info: "text-blue-400",
-    warning: "text-amber-400",
-    critical: "text-red-400",
-  };
-
-  return (
-    <div className={`bg-slate-900/50 border ${borderColors[status] || borderColors.neutral} rounded-lg overflow-hidden`}>
-      <div className="px-3 py-2 border-b border-slate-800/20 flex items-center justify-between">
-        <span className={`text-[10px] font-bold tracking-widest uppercase ${headerColors[status] || headerColors.neutral}`}>
-          {title}
-        </span>
-        {pending && (
-          <span className="text-[9px] text-slate-600 font-mono bg-slate-800/50 px-1.5 py-0.5 rounded">
-            PENDING
-          </span>
-        )}
-      </div>
-      <div className="p-3">
-        {pending ? (
-          <div className="space-y-1">
-            {children}
-            <div className="text-[10px] text-slate-600 font-mono italic pt-1">
-              {pendingLabel}
+              {data.work.goals.length === 0 && <Empty text="No goal state files found" />}
             </div>
+            <GoalDetail goal={selectedGoal} events={selectedEvents} />
           </div>
-        ) : (
-          children
-        )}
+        </Panel>
+
+        <Panel title="TRACE" meta={`${data.trace.summary.events} events`} tone={data.alerts.summary.critical > 0 ? "critical" : data.alerts.summary.warning > 0 ? "warning" : "observed"}>
+          <div className="space-y-2">
+            {data.alerts.alerts.slice(0, 6).map((alert) => (
+              <div key={alert.id} className="border border-slate-800 bg-slate-950/50 p-2">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="text-sm text-slate-100">{alert.title}</div>
+                  <Status label={alert.severity} tone={alert.severity === "critical" ? "critical" : "warning"} />
+                </div>
+                <p className="mt-1 min-w-0 break-words text-xs text-slate-400">{alert.message}</p>
+                <div className="mt-2 min-w-0 break-words font-mono text-[11px] text-slate-500">{alert.action}</div>
+                <EvidenceLink evidence={{ source: alert.evidence, timestamp: alert.source_timestamp }} />
+              </div>
+            ))}
+            {data.alerts.alerts.length === 0 && <Empty text="No source-backed alerts" />}
+          </div>
+          <div className="mt-4 border-t border-slate-800 pt-3">
+            {data.trace.events.slice(-10).reverse().map((event) => (
+              <div key={event.id} className="mb-2 grid min-w-0 grid-cols-[92px_minmax(0,1fr)] gap-2 text-xs">
+                <span className="font-mono text-slate-500">{formatTime(event.timestamp)}</span>
+                <div className="min-w-0">
+                  <div className="truncate text-slate-200">{event.type}</div>
+                  <div className="truncate text-slate-500">{event.summary}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Panel>
+      </div>
+    </Shell>
+  );
+}
+
+function Shell({ children, timestamp, severity = "observed" }: { children: React.ReactNode; timestamp?: string; severity?: string }) {
+  return (
+    <main className="min-h-screen bg-[#070b10] px-3 py-3 text-slate-200 sm:px-5">
+      <header className="mb-3 flex flex-col gap-2 border-b border-slate-800 pb-3 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h1 className="text-base font-semibold tracking-wide text-white sm:text-lg">Hermes Mission Control</h1>
+          <p className="font-mono text-[11px] text-slate-500">read-only local runtime observability</p>
+        </div>
+        <div className="flex items-center gap-3 font-mono text-[11px] text-slate-400">
+          <Status label={severity} tone={severity === "critical" ? "critical" : severity === "warning" ? "warning" : "observed"} />
+          <span>{timestamp ? formatTime(timestamp) : "unknown timestamp"}</span>
+        </div>
+      </header>
+      {children}
+    </main>
+  );
+}
+
+function Panel({ title, meta, tone, children }: { title: string; meta: string; tone: string; children: React.ReactNode }) {
+  return (
+    <section className={`min-w-0 border bg-[#0b1118] ${tone === "critical" ? "border-red-900/70" : tone === "warning" ? "border-amber-900/70" : "border-slate-800"}`}>
+      <div className="flex items-center justify-between border-b border-slate-800 px-3 py-2">
+        <h2 className="text-xs font-bold tracking-[0.18em] text-cyan-300">{title}</h2>
+        <span className="font-mono text-[11px] text-slate-500">{meta}</span>
+      </div>
+      <div className="min-w-0 p-3">{children}</div>
+    </section>
+  );
+}
+
+function GoalDetail({ goal, events }: { goal: GoalRecord | null; events: RuntimeEvent[] }) {
+  if (!goal) return <Empty text="Select a goal for evidence" />;
+  return (
+    <div className="border border-slate-800 bg-slate-950/40 p-3">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="truncate text-sm font-semibold text-white">{goal.title ?? goal.goal_id}</h3>
+          <p className="truncate font-mono text-[11px] text-slate-500">{goal.goal_id}</p>
+        </div>
+        <Status label={goal.status} tone={goal.status === "failed" ? "critical" : goal.status === "unknown" ? "warning" : "observed"} />
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+        <Fact label="controller" value={goal.controller_pid ? String(goal.controller_pid) : "unknown"} />
+        <Fact label="stage" value={goal.stage ?? "unknown"} />
+        <Fact label="queue" value={goal.queue_state} />
+        <Fact label="last event" value={goal.last_event_timestamp ? formatTime(goal.last_event_timestamp) : "unknown"} />
+      </div>
+      {goal.worktree && (
+        <div className="mt-3 border-t border-slate-800 pt-2">
+          <div className="min-w-0 break-words text-xs text-slate-300">{goal.worktree.branch ?? "unknown branch"} / {goal.worktree.head?.slice(0, 10) ?? "unknown HEAD"}</div>
+          <div className="font-mono text-[11px] text-slate-500">{goal.worktree.dirty === null ? "dirty unknown" : goal.worktree.dirty ? "dirty" : "clean"}</div>
+          <EvidenceLink evidence={{ source: goal.worktree.source, timestamp: goal.worktree.timestamp }} />
+        </div>
+      )}
+      <div className="mt-3 border-t border-slate-800 pt-2">
+        {events.map((event) => (
+          <div key={event.id} className="mb-2 text-xs">
+            <div className="flex min-w-0 flex-wrap justify-between gap-2">
+              <span className="min-w-0 break-words text-slate-200">{event.type}</span>
+              <span className="font-mono text-slate-500">{formatTime(event.timestamp)}</span>
+            </div>
+            <div className="min-w-0 break-words text-slate-500">{event.summary}</div>
+          </div>
+        ))}
+        {events.length === 0 && <Empty text="No run JSONL events for this goal" />}
+      </div>
+      <div className="mt-3 space-y-1 border-t border-slate-800 pt-2">
+        {goal.sources.map((source) => <EvidenceLink key={`${source.source}:${source.note ?? ""}`} evidence={source} />)}
       </div>
     </div>
   );
 }
 
-function PlaceholderRow({ label }: { label: string }) {
+function MetricRow({ label, value, tone = "observed" }: { label: string; value: number; tone?: string }) {
   return (
-    <div className="flex items-center gap-2 py-2">
-      <div className="w-2 h-2 bg-amber-500/50 rounded-full animate-pulse" />
-      <span className="text-[11px] text-slate-500 font-mono italic">{label}</span>
+    <div className="flex items-center justify-between border-b border-slate-900 py-1 text-sm">
+      <span className="text-slate-500">{label}</span>
+      <span className={tone === "critical" ? "font-mono text-red-300" : tone === "muted" ? "font-mono text-slate-500" : "font-mono text-slate-100"}>{value}</span>
     </div>
   );
 }
 
-/* ── Helpers ───────────────────────────────────────────────────── */
-
-function globalStatus(data: OverviewData): string {
-  const health = data.system_health;
-  if (health.global_status === "healthy") return "info";
-  if (health.global_status === "warning") return "warning";
-  if (health.global_status === "critical") return "critical";
-  return "warning";
+function MetricTile({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="border border-slate-800 bg-slate-950/40 p-2">
+      <div className="font-mono text-lg text-white">{value}</div>
+      <div className="text-[11px] text-slate-500">{label}</div>
+    </div>
+  );
 }
 
-function healthStripStatus(health: SystemHealthSection): string {
-  if (health.global_status === "healthy") return "info";
-  if (health.global_status === "warning") return "warning";
-  if (health.global_status === "critical") return "critical";
-  return "neutral";
+function Fact({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-[10px] uppercase tracking-wide text-slate-600">{label}</div>
+      <div className="break-words font-mono text-slate-300">{value}</div>
+    </div>
+  );
 }
 
-function statusColor(status: string): string {
-  const colors: Record<string, string> = {
-    healthy: "text-emerald-400",
-    warning: "text-amber-400",
-    critical: "text-red-400",
-    running: "text-emerald-400",
-    blocked: "text-red-400",
-    completed: "text-slate-500",
-    failed: "text-red-400",
-    pending: "text-amber-400",
-    neutral: "text-slate-400",
-    info: "text-blue-400",
-  };
-  return colors[status] ?? "text-slate-400";
+function Status({ label, tone }: { label: string; tone: string }) {
+  const color = tone === "critical" ? "border-red-800 text-red-300" : tone === "warning" ? "border-amber-800 text-amber-300" : "border-cyan-800 text-cyan-300";
+  return <span className={`shrink-0 border px-1.5 py-0.5 font-mono text-[10px] uppercase ${color}`}>{label}</span>;
 }
 
-function eventBadgeColor(type: string): string {
-  const colors: Record<string, string> = {
-    deploy: "bg-blue-900/50 text-blue-400",
-    health: "bg-emerald-900/50 text-emerald-400",
-    approval: "bg-amber-900/50 text-amber-400",
-    security: "bg-red-900/50 text-red-400",
-    data: "bg-purple-900/50 text-purple-400",
-    agent: "bg-cyan-900/50 text-cyan-400",
-  };
-  return colors[type] ?? "bg-slate-800/50 text-slate-400";
+function EvidenceLink({ evidence }: { evidence: Evidence }) {
+  return (
+    <div className="mt-1 min-w-0 break-words font-mono text-[11px] text-slate-600">
+      <span className="break-all">{evidence.source}</span>
+      <span className="ml-2 text-slate-700">{evidence.timestamp ? formatTime(evidence.timestamp) : "unknown time"}</span>
+      {evidence.note && <span className="ml-2 break-words text-amber-400">{evidence.note}</span>}
+    </div>
+  );
 }
 
-function urgencyColor(level: string): string {
-  const colors: Record<string, string> = {
-    high: "text-red-400",
-    medium: "text-amber-400",
-    low: "text-emerald-400",
-  };
-  return colors[level] ?? "text-slate-400";
+function Empty({ text }: { text: string }) {
+  return <div className="border border-dashed border-slate-800 p-3 text-center text-xs text-slate-600">{text}</div>;
 }
 
-function timeAgo(dateStr: string): string {
-  if (!dateStr) return "—";
-  const diff = Date.now() - new Date(dateStr).getTime();
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  return `${days}d ago`;
+function formatTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "unknown";
+  return date.toLocaleString(undefined, { hour: "2-digit", minute: "2-digit", month: "short", day: "2-digit" });
 }
