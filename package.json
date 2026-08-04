@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test:runtime-truth": "tsx --test apps/web/lib/__tests__/runtime-truth.fixture.ts",
+    "test:event-timeline": "tsx --test apps/web/lib/__tests__/runtime-events.fixture.ts"
   },
   "dependencies": {
     "next": "^15.1.0",
@@ -20,6 +22,7 @@
     "autoprefixer": "^10.4.0",
     "postcss": "^8.4.0",
     "tailwindcss": "^3.4.0",
+    "tsx": "^4.20.3",
     "typescript": "^5"
   }
 }
