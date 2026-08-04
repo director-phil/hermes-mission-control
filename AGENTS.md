@@ -18,6 +18,26 @@ Expected remote:
 https://github.com/director-phil/hermes-mission-control.git
 ```
 
+### Canonical Checkout OR Linked Worktree
+
+The guard accepts either:
+
+1. **Canonical checkout** at the exact expected root path, with `.git` directory present.
+2. **Linked worktree** whose resolved `git rev-parse --path-format=absolute --git-common-dir`
+   points exactly to the canonical repo's `.git` (or a subdirectory of it), has the correct
+   remote URL, and is outside forbidden paths.
+
+The guard resolves paths robustly with `cd "$PWD" && pwd` for PWD and
+`git rev-parse --path-format=absolute --git-common-dir` for the common directory,
+then validates:
+
+- The common dir must be exactly the canonical `.git` or inside it.
+- The origin remote must match the expected URL precisely.
+- The path must not be in any forbidden repository tree.
+
+Worktrees outside `hermes-mission-control/.git` that point to a different
+repository's common dir are rejected as wrong repo.
+
 ## Hard Stop
 
 This project is not `reliable-tradies-ops`.
@@ -30,7 +50,8 @@ Do not inspect, modify, build, deploy, import from, or use:
 
 unless Phil explicitly changes the assignment and names that repo.
 
-If your current working directory is not the expected Mission Control repo, stop and report:
+If your current working directory is not the expected Mission Control repo,
+stop and report:
 
 ```txt
 blocked: wrong repo
@@ -51,12 +72,16 @@ The guard must pass before code changes.
 - Build in vertical slices from the Mission Control v2 issue pack.
 - Start with S0 repo/environment guardrail and S1 first-view operating shell.
 - Use the existing static concept files as design evidence.
-- Do not pull in architecture, database helpers, Railway deployment assumptions, or app-router patterns from the forbidden dashboard repo.
-- If a future slice monitors Railway, ServiceTitan, Xero, or other business systems, treat them as external observed systems only, not as the implementation repo.
+- Do not pull in architecture, database helpers, Railway deployment assumptions,
+  or app-router patterns from the forbidden dashboard repo.
+- If a future slice monitors Railway, ServiceTitan, Xero, or other business
+  systems, treat them as external observed systems only, not as the
+  implementation repo.
 
 ## Definition of Done
 
-- Correct repo guard passes.
-- Files changed are inside `hermes-mission-control` unless the user explicitly asks for vault documentation updates.
+- Correct repo guard passes (canonical or verified linked worktree).
+- Files changed are inside `hermes-mission-control` unless Phil explicitly
+  asks for vault documentation updates.
 - Any vault docs updated are committed separately from app code.
 - Verification result is reported honestly.
