@@ -5,18 +5,40 @@ import { DEFAULT_ROOTS, buildRuntimeSnapshot, createNodeRuntimeAdapters } from "
 export type RuntimeEventType =
   | "goal.created"
   | "goal.ready"
+  | "goal.blocked"
   | "goal.claimed"
   | "workspace.created"
   | "agent.started"
   | "model.requested"
   | "tool.started"
   | "tool.completed"
+  | "planner.failed"
+  | "implementation.failed"
+  | "coder.failed"
+  | "scope.failed"
+  | "worktree.failed"
+  | "contract.failed"
+  | "runner.failed"
+  | "quarantine.failed"
+  | "terminal_move.failed"
+  | "controller.lock_recovered"
+  | "controller.warning"
+  | "integrity.recovered"
+  | "integrity.quarantined"
+  | "integrity.failed"
+  | "promotion.skipped"
+  | "promotion.blocked"
+  | "promotion.failed"
+  | "migration.historical_done"
+  | "control_plane.failed"
   | "acceptance.started"
   | "acceptance.failed"
   | "acceptance.passed"
   | "review.started"
   | "review.failed"
   | "review.passed"
+  | "shipping.started"
+  | "shipping.failed"
   | "pr.opened"
   | "ci.started"
   | "ci.failed"
@@ -25,6 +47,8 @@ export type RuntimeEventType =
   | "deploy.ready"
   | "browser.verified"
   | "process.orphaned"
+  | "goal.shipped"
+  | "goal.changed_pending_surface_verification"
   | "goal.completed"
   | "goal.failed";
 
@@ -66,18 +90,40 @@ export interface AlertResponse {
 const EVENT_MAP: Record<string, RuntimeEventType> = {
   "goal.created": "goal.created",
   "goal.ready": "goal.ready",
+  "goal.blocked": "goal.blocked",
   "goal.claimed": "goal.claimed",
   "workspace.created": "workspace.created",
   "agent.started": "agent.started",
   "model.requested": "model.requested",
   "tool.started": "tool.started",
   "tool.completed": "tool.completed",
+  "planner.failed": "planner.failed",
+  "implementation.failed": "implementation.failed",
+  "coder.failed": "coder.failed",
+  "scope.failed": "scope.failed",
+  "worktree.failed": "worktree.failed",
+  "contract.failed": "contract.failed",
+  "runner.failed": "runner.failed",
+  "quarantine.failed": "quarantine.failed",
+  "terminal_move.failed": "terminal_move.failed",
+  "controller.lock_recovered": "controller.lock_recovered",
+  "controller.warning": "controller.warning",
+  "integrity.recovered": "integrity.recovered",
+  "integrity.quarantined": "integrity.quarantined",
+  "integrity.failed": "integrity.failed",
+  "promotion.skipped": "promotion.skipped",
+  "promotion.blocked": "promotion.blocked",
+  "promotion.failed": "promotion.failed",
+  "migration.historical_done": "migration.historical_done",
+  "control_plane.failed": "control_plane.failed",
   "acceptance.started": "acceptance.started",
   "acceptance.failed": "acceptance.failed",
   "acceptance.passed": "acceptance.passed",
   "review.started": "review.started",
   "review.failed": "review.failed",
   "review.passed": "review.passed",
+  "shipping.started": "shipping.started",
+  "shipping.failed": "shipping.failed",
   "pr.opened": "pr.opened",
   "ci.started": "ci.started",
   "ci.failed": "ci.failed",
@@ -86,6 +132,8 @@ const EVENT_MAP: Record<string, RuntimeEventType> = {
   "deploy.ready": "deploy.ready",
   "browser.verified": "browser.verified",
   "process.orphaned": "process.orphaned",
+  "goal.shipped": "goal.shipped",
+  "goal.changed_pending_surface_verification": "goal.changed_pending_surface_verification",
   "goal.completed": "goal.completed",
   "goal.failed": "goal.failed",
   created: "goal.created",
@@ -106,14 +154,23 @@ export async function buildRuntimeTimeline(
   const events: RuntimeEvent[] = [];
 
   for (const goal of runtime.goals) {
-    events.push(...await readGoalRunEvents(roots, adapters.fs, goal, warnings));
+    const nativeOwned = goal.sources.some((source) => source.note === "native-runner");
+    if (roots.nativeRuntimeRoot && nativeOwned) {
+      events.push(...await readNativeRunEvents(roots.nativeRuntimeRoot, adapters.fs, goal, warnings));
+    } else {
+      events.push(...await readGoalRunEvents(roots, adapters.fs, goal, warnings));
+    }
     const source = goal.sources[0];
-    if (goal.status === "completed" && source) {
+    if (!nativeOwned && goal.status === "completed" && source) {
       events.push(goalStateEvent(goal, "goal.completed", source.source, source.timestamp));
     }
-    if (goal.status === "failed" && source) {
+    if (!nativeOwned && goal.status === "failed" && source) {
       events.push(goalStateEvent(goal, "goal.failed", source.source, source.timestamp));
     }
+  }
+
+  if (roots.nativeRuntimeRoot) {
+    events.push(...await readNativeControllerEvents(roots.nativeRuntimeRoot, adapters.fs, warnings));
   }
 
   for (const process of runtime.processes.filter((item) => item.orphan)) {
@@ -142,11 +199,12 @@ export function buildRuntimeAlerts(snapshot: RuntimeSnapshot, timeline: Timeline
   const livePids = new Set(snapshot.processes.map((process) => process.pid));
 
   for (const warning of snapshot.source_warnings) {
+    const severity = warning.status === "critical" ? "critical" : "warning";
     alerts.push({
       id: `source:${sanitizeEventText(warning.source)}`,
       goal_id: null,
-      severity: "warning",
-      title: "Runtime source unknown",
+      severity,
+      title: severity === "critical" ? "Runtime integrity failure" : "Runtime source unknown",
       message: sanitizeEventText(warning.message),
       evidence: sanitizeEventText(warning.source),
       source_timestamp: null,
@@ -160,11 +218,16 @@ export function buildRuntimeAlerts(snapshot: RuntimeSnapshot, timeline: Timeline
     } else if (goal.status === "running" && goal.controller_pid && !livePids.has(goal.controller_pid)) {
       alerts.push(goalAlert(goal, "critical", "Running goal controller missing", `PID ${goal.controller_pid} is not live in /proc.`, "Stop or requeue the cited goal after confirming no live controller exists."));
     }
-    if (goal.controller_lock?.stale) {
+    if (goal.controller_lock?.invalid) {
+      alerts.push(goalAlert(goal, "critical", "Invalid controller lock", "controller.lock is malformed or unreadable; claims are blocked fail-closed.", "Inspect the lock metadata and runner events before removing it."));
+    } else if (goal.controller_lock?.stale) {
       alerts.push(goalAlert(goal, "warning", "Stale controller lock", `controller.lock references PID ${goal.controller_lock.pid ?? "unknown"} that is not live.`, "Remove only after verifying the goal is not running."));
     }
     if (goal.controller_lock?.pid && goal.controller_pid && goal.controller_lock.pid !== goal.controller_pid) {
       alerts.push(goalAlert(goal, "critical", "Controller source disagreement", `goal state PID ${goal.controller_pid} disagrees with lock PID ${goal.controller_lock.pid}.`, "Inspect both cited sources before changing queue state."));
+    }
+    if (goal.status === "conflicted") {
+      alerts.push(goalAlert(goal, "critical", "Duplicate native goal ID", "Native state contains the same goal ID in multiple state directories.", "Quarantine duplicate native state before trusting counts or dispatching work."));
     }
     if ((goal.status === "completed" || goal.status === "failed") && goal.worktree?.dirty) {
       alerts.push(goalAlert(goal, "warning", "Terminal goal has dirty worktree", `${goal.worktree.path} has uncommitted Git changes.`, "Inspect git status for the cited worktree."));
@@ -214,6 +277,112 @@ export function buildRuntimeAlerts(snapshot: RuntimeSnapshot, timeline: Timeline
   };
 }
 
+async function readNativeRunEvents(
+  nativeRoot: string,
+  fsAdapter: FsAdapter,
+  goal: GoalRecord,
+  warnings: TimelineResponse["warnings"],
+): Promise<RuntimeEvent[]> {
+  const runDir = path.join(nativeRoot, "runs", goal.goal_id);
+  let entries: string[];
+  try {
+    entries = await fsAdapter.readdir(runDir);
+  } catch {
+    return []; // No native events directory — normal during migration
+  }
+  const eventFiles = entries.filter((entry) => entry.endsWith(".jsonl")).sort();
+  const events: RuntimeEvent[] = [];
+  for (const file of eventFiles) {
+    const source = path.join(runDir, file);
+    let body: string;
+    let sourceTimestamp: string | null = null;
+    try {
+      const [content, stat] = await Promise.all([fsAdapter.readFile(source), fsAdapter.stat(source).catch(() => null)]);
+      body = content;
+      sourceTimestamp = stat ? new Date(stat.mtimeMs).toISOString() : null;
+    } catch {
+      warnings.push({ source, message: "native run event source unreadable" });
+      continue;
+    }
+    body.split("\n").forEach((line, index) => {
+      if (!line.trim()) return;
+      try {
+        const raw = JSON.parse(line) as Record<string, unknown>;
+        const type = normalizeEventType(raw.type ?? raw.event ?? raw.name);
+        if (!type) return;
+        const timestamp = stringValue(raw.timestamp) ?? stringValue(raw.ts) ?? sourceTimestamp;
+        if (!timestamp) {
+          warnings.push({ source, message: `native event line ${index + 1} has no timestamp` });
+          return;
+        }
+        events.push({
+          id: `native:${goal.goal_id}:${file}:${index + 1}`,
+          goal_id: goal.goal_id,
+          type,
+          timestamp,
+          summary: eventSummary(type, raw),
+          source,
+          source_timestamp: sourceTimestamp,
+          severity: eventSeverity(type),
+          metadata: pickMetadata(raw),
+        });
+      } catch {
+        warnings.push({ source, message: `native event line ${index + 1} is malformed JSON` });
+      }
+    });
+  }
+  return events;
+}
+
+async function readNativeControllerEvents(
+  nativeRoot: string,
+  fsAdapter: FsAdapter,
+  warnings: TimelineResponse["warnings"],
+): Promise<RuntimeEvent[]> {
+  const source = path.join(nativeRoot, "controller-events.jsonl");
+  let body: string;
+  let sourceTimestamp: string | null = null;
+  try {
+    const [content, stat] = await Promise.all([fsAdapter.readFile(source), fsAdapter.stat(source).catch(() => null)]);
+    body = content;
+    sourceTimestamp = stat ? new Date(stat.mtimeMs).toISOString() : null;
+  } catch {
+    return [];
+  }
+  const events: RuntimeEvent[] = [];
+  body.split("\n").forEach((line, index) => {
+    if (!line.trim()) return;
+    try {
+      const raw = JSON.parse(line) as Record<string, unknown>;
+      const type = normalizeEventType(raw.type ?? raw.event ?? raw.name);
+      if (!type) {
+        warnings.push({ source, message: `controller event line ${index + 1} has unmapped type` });
+        return;
+      }
+      const timestamp = stringValue(raw.timestamp) ?? stringValue(raw.ts) ?? sourceTimestamp;
+      if (!timestamp) {
+        warnings.push({ source, message: `controller event line ${index + 1} has no timestamp` });
+        return;
+      }
+      const metadata = pickMetadata(raw);
+      events.push({
+        id: `native-controller:${index + 1}`,
+        goal_id: typeof metadata.goal_id === "string" ? metadata.goal_id : "controller",
+        type,
+        timestamp,
+        summary: eventSummary(type, raw),
+        source,
+        source_timestamp: sourceTimestamp,
+        severity: eventSeverity(type),
+        metadata,
+      });
+    } catch {
+      warnings.push({ source, message: `controller event line ${index + 1} is malformed JSON` });
+    }
+  });
+  return events;
+}
+
 async function readGoalRunEvents(
   roots: RuntimeRoots,
   fsAdapter: FsAdapter,
@@ -261,7 +430,7 @@ async function readGoalRunEvents(
           summary: eventSummary(type, raw),
           source,
           source_timestamp: sourceTimestamp,
-          severity: type.endsWith(".failed") || type === "process.orphaned" ? "warning" : "info",
+          severity: eventSeverity(type),
           metadata: pickMetadata(raw),
         });
       } catch {
@@ -310,25 +479,124 @@ function eventSummary(type: RuntimeEventType, raw: Record<string, unknown>): str
   return sanitizeEventText(summary ?? type);
 }
 
+function eventSeverity(type: RuntimeEventType): RuntimeEvent["severity"] {
+  if (type === "integrity.failed" || type === "control_plane.failed") return "critical";
+  if (
+    type.endsWith(".failed")
+    || type === "process.orphaned"
+    || type === "controller.warning"
+    || type === "integrity.quarantined"
+    || type === "promotion.blocked"
+  ) {
+    return "warning";
+  }
+  return "info";
+}
+
 function pickMetadata(raw: Record<string, unknown>): RuntimeEvent["metadata"] {
   const metadata: RuntimeEvent["metadata"] = {};
-  for (const key of ["stage", "model", "provider", "pid", "status", "exit_code", "pr", "url"]) {
-    const value = raw[key];
-    if (typeof value === "string") metadata[key] = sanitizeEventText(value);
-    if (typeof value === "number" || typeof value === "boolean" || value === null) metadata[key] = value;
+  const nested = isRecord(raw.metadata) ? raw.metadata : {};
+  for (const source of [raw, nested]) {
+    for (const key of METADATA_KEYS) {
+      if (Object.keys(metadata).length >= MAX_METADATA_KEYS) return metadata;
+      if (!(key in source) || key in metadata) continue;
+      const value = sanitizeMetadataValue(key, source[key]);
+      if (value !== undefined) metadata[key] = value;
+    }
   }
   return metadata;
 }
 
+const MAX_METADATA_KEYS = 40;
+const MAX_METADATA_STRING_LENGTH = 96;
+const MAX_METADATA_LIST_LENGTH = 12;
+const METADATA_KEYS = [
+  "stage",
+  "model",
+  "provider",
+  "pid",
+  "status",
+  "exit_code",
+  "pr",
+  "pr_id",
+  "pr_number",
+  "pull_request",
+  "deployment_id",
+  "deployment",
+  "url",
+  "reason",
+  "terminal",
+  "state",
+  "states",
+  "goal_id",
+  "branch",
+  "base_ref",
+  "base_sha",
+  "commit_sha",
+  "sha256",
+  "fingerprint",
+  "dependency_id",
+  "dependency_ids",
+  "dependency_count",
+  "blocker_id",
+  "blocker_ids",
+  "blocker_count",
+  "changed_count",
+  "terminal_state",
+  "success",
+  "evidence_sha256",
+  "evidence_bytes",
+  "worktree_path_hash",
+  "dedupe_key",
+] as const;
+
+const SAFE_LIST_METADATA_KEYS = new Set<string>(["states", "dependency_ids", "blocker_ids"]);
+
+function sanitizeMetadataValue(key: string, value: unknown): RuntimeEvent["metadata"][string] | undefined {
+  if (value === null || typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value === "string") return sanitizeMetadataString(key, value);
+  if (Array.isArray(value) && SAFE_LIST_METADATA_KEYS.has(key)) {
+    const items = value
+      .filter((item): item is string | number | boolean => ["string", "number", "boolean"].includes(typeof item))
+      .slice(0, MAX_METADATA_LIST_LENGTH)
+      .map((item) => sanitizeMetadataString(key, String(item)))
+      .filter((item) => item !== "[redacted]");
+    return items.length > 0 ? items.join(",") : undefined;
+  }
+  return undefined;
+}
+
+function sanitizeMetadataString(key: string, value: string): string {
+  if (isUnsafeMetadataKey(key) || isUnsafeMetadataValue(value)) return "[redacted]";
+  return truncateText(sanitizeEventText(value), MAX_METADATA_STRING_LENGTH);
+}
+
+function isUnsafeMetadataKey(key: string): boolean {
+  if (/(_sha256|_sha|_hash)$/.test(key)) return false;
+  return /(path|prompt|response|output|stdout|stderr|argv|args|command|cmd|token|secret|password|credential|customer|client|private|email|phone|address)/i.test(key);
+}
+
+function isUnsafeMetadataValue(value: string): boolean {
+  if (/(prompt|response|tool[_ -]?body|file[_ -]?body|private[_ -]?output|stdout|stderr|env|environment|secret|password|token|api[_ -]?key|credential|customer|client|email|phone|address)/i.test(value)) return true;
+  if (/(?:\/[\w.-]+){2,}/.test(value) || /[A-Za-z]:\\(?:[^\\\s]+\\?){2,}/.test(value)) return true;
+  return false;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export function sanitizeEventText(value: string): string {
   const lowered = value.toLowerCase();
-  if (/(prompt|tool[_ -]?body|file[_ -]?body|private[_ -]?output|stdout|stderr|env|environment|secret|password|token|api[_ -]?key|credential)/i.test(lowered)) {
+  if (/(prompt|response|tool[_ -]?body|file[_ -]?body|private[_ -]?output|output|stdout|stderr|env|environment|secret|password|token|api[_ -]?key|credential)/i.test(lowered)) {
     return "[redacted]";
   }
   return truncateText(value
     .replace(/(token|secret|password|api[_-]?key|credential)=([^&\s]+)/gi, "$1=[REDACTED]")
     .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{10,})?/g, "[REDACTED]")
-    .replace(/sk-[A-Za-z0-9_-]{12,}/g, "[REDACTED]"), 180);
+    .replace(/sk-[A-Za-z0-9_-]{12,}/g, "[REDACTED]")
+    .replace(/(?:\/[\w.-]+){2,}/g, "[path]")
+    .replace(/[A-Za-z]:\\(?:[^\\\s]+\\?){2,}/g, "[path]"), 180);
 }
 
 function truncateText(value: string, max: number): string {

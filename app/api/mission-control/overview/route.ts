@@ -31,10 +31,13 @@ export async function GET() {
       goals: runtimeSnapshot.goals,
       summary: {
         total: runtimeSnapshot.goals.length,
+        staged: runtimeSnapshot.goals.filter((goal) => goal.status === "staged").length,
         running: runtimeSnapshot.goals.filter((goal) => goal.status === "running").length,
         ready: runtimeSnapshot.goals.filter((goal) => goal.status === "ready").length,
+        pending_surface_verification: runtimeSnapshot.goals.filter((goal) => goal.status === "changed_pending_surface_verification").length,
         terminal: runtimeSnapshot.goals.filter((goal) => goal.status === "completed" || goal.status === "failed").length,
         unknown: runtimeSnapshot.goals.filter((goal) => goal.status === "unknown").length,
+        conflicted: runtimeSnapshot.goals.filter((goal) => goal.status === "conflicted").length,
       },
     },
     trace: {

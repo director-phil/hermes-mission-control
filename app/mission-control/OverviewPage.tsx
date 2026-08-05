@@ -70,7 +70,7 @@ interface OverviewData {
     source_warnings: Array<{ source: string; message: string }>;
     summary: { processes: number; controllers: number; wrappers: number; orphaned: number; services: number };
   };
-  work: { timestamp: string; goals: GoalRecord[]; summary: { total: number; running: number; ready: number; terminal: number; unknown: number } };
+  work: { timestamp: string; goals: GoalRecord[]; summary: { total: number; staged: number; running: number; ready: number; pending_surface_verification: number; terminal: number; unknown: number; conflicted: number } };
   trace: { timestamp: string; events: RuntimeEvent[]; warnings: Array<{ source: string; message: string }>; summary: { events: number; warnings: number; latest: string | null } };
   alerts: { alerts: RuntimeAlert[]; summary: { total: number; critical: number; warning: number; info: number } };
 }
@@ -151,12 +151,15 @@ export default function OverviewPage() {
           </div>
         </Panel>
 
-        <Panel title="WORK" meta={`${data.work.summary.total} goals`} tone={data.work.summary.unknown > 0 ? "warning" : "observed"}>
-          <div className="grid grid-cols-4 gap-2">
+        <Panel title="WORK" meta={`${data.work.summary.total} goals`} tone={data.work.summary.conflicted > 0 ? "critical" : data.work.summary.unknown > 0 ? "warning" : "observed"}>
+          <div className="grid grid-cols-7 gap-2">
+            <MetricTile label="staged" value={data.work.summary.staged} />
             <MetricTile label="running" value={data.work.summary.running} />
             <MetricTile label="ready" value={data.work.summary.ready} />
+            <MetricTile label="surface" value={data.work.summary.pending_surface_verification} />
             <MetricTile label="terminal" value={data.work.summary.terminal} />
             <MetricTile label="unknown" value={data.work.summary.unknown} />
+            <MetricTile label="conflict" value={data.work.summary.conflicted} />
           </div>
           <div className="mt-3 grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
             <div className="max-h-[520px] overflow-auto pr-1">
@@ -169,7 +172,7 @@ export default function OverviewPage() {
                 >
                   <div className="flex min-w-0 items-center justify-between gap-2">
                     <span className="min-w-0 truncate text-sm text-slate-100">{goal.title ?? goal.goal_id}</span>
-                    <Status label={goal.status} tone={goal.status === "failed" ? "critical" : goal.status === "unknown" ? "warning" : "observed"} />
+                    <Status label={goal.status} tone={goal.status === "failed" || goal.status === "conflicted" ? "critical" : goal.status === "unknown" ? "warning" : "observed"} />
                   </div>
                   <div className="mt-1 truncate font-mono text-[11px] text-slate-500">{goal.goal_id}</div>
                   <div className="mt-1 text-[11px] text-slate-400">stage {goal.stage ?? "unknown"} / queue {goal.queue_state}</div>
@@ -252,7 +255,7 @@ function GoalDetail({ goal, events }: { goal: GoalRecord | null; events: Runtime
           <h3 className="truncate text-sm font-semibold text-white">{goal.title ?? goal.goal_id}</h3>
           <p className="truncate font-mono text-[11px] text-slate-500">{goal.goal_id}</p>
         </div>
-        <Status label={goal.status} tone={goal.status === "failed" ? "critical" : goal.status === "unknown" ? "warning" : "observed"} />
+        <Status label={goal.status} tone={goal.status === "failed" || goal.status === "conflicted" ? "critical" : goal.status === "unknown" ? "warning" : "observed"} />
       </div>
       <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
         <Fact label="controller" value={goal.controller_pid ? String(goal.controller_pid) : "unknown"} />

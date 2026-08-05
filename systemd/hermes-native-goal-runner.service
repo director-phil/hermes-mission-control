@@ -1,0 +1,29 @@
+[Unit]
+Description=Hermes Native Goal Runner - Autonomous goal execution controller
+Documentation=https://github.com/director-phil/hermes-mission-control
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/Documents/GitHub/hermes-mission-control/scripts/hermes_native_goal_runner.py --canonical-repo %h/.hermes/mission-control-source/rt-ops-v2 --expected-origin https://github.com/director-phil/rt-ops-v2.git
+Restart=on-failure
+RestartSec=5
+Environment=PATH=/usr/bin:/bin:/usr/local/bin
+Environment=HERMES_LANGFUSE_CAPTURE_CONTENT=false
+Environment=HERMES_LANGFUSE_CAPTURE_TOOL_IO=false
+Environment=HERMES_NATIVE_ALLOWED_WORKTREE_ROOTS=%h/.hermes/mission-control-worktrees
+Environment=HERMES_NATIVE_PLAN_PROFILE=architect
+Environment=HERMES_NATIVE_CODE_PROFILE=default
+Environment=HERMES_NATIVE_REVIEW_PROFILE=default
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=%h/Documents/GitHub
+ReadOnlyPaths=%h/.hermes/mission-control-source/rt-ops-v2
+ReadWritePaths=%h/.hermes/mission-control/runtime
+ReadWritePaths=%h/.hermes/mission-control-worktrees
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

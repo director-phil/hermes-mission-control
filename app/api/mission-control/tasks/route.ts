@@ -26,7 +26,7 @@ export async function GET() {
       goals: {
         status: snapshot.source_warnings.some((warning) => warning.source.includes("goals")) ? "unknown" : "ok",
         count: tasks.length,
-        evidence: "ChatDev goal state and run evidence",
+        evidence: "Hermes native runtime goal state and run evidence",
       },
     },
     tasks,
