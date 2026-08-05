@@ -2835,7 +2835,80 @@ def valid_git_sha(value: Any) -> bool:
 
 
 def github_deployments_api_path(merge_sha: str) -> str:
-    return f"repos/director-phil/rt-ops-v2/deployments?sha={merge_sha}&environment=Production"
+    return f"repos/director-phil/hermes-mission-control/deployments?sha={merge_sha}&environment=Production"
+
+
+def github_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def latest_deployment_status(statuses: list[Any]) -> dict[str, Any] | None:
+    valid_statuses = [status for status in statuses if isinstance(status, dict)]
+    if not valid_statuses:
+        return None
+    with_timestamps: list[tuple[datetime, int, dict[str, Any]]] = []
+    for index, status in enumerate(valid_statuses):
+        stamp = github_timestamp(status.get("created_at")) or github_timestamp(status.get("updated_at"))
+        if stamp is not None:
+            with_timestamps.append((stamp, index, status))
+    if with_timestamps:
+        return max(with_timestamps, key=lambda item: (item[0], item[1]))[2]
+    # GitHub deployment statuses are returned newest-first; without timestamps,
+    # keep that API-order fallback deterministic.
+    return valid_statuses[0]
+
+
+def parse_pr_number_from_url(pr_url: str) -> int | None:
+    match = re.search(r"/pull/([0-9]+)(?:$|[/?#])", pr_url)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def view_pr_head(
+    worktree: Path,
+    pr_number: int,
+    subprocess_adapter: SubprocessAdapter,
+) -> tuple[CmdResult, dict[str, Any]]:
+    result = subprocess_adapter.run_command(
+        ["gh", "pr", "view", str(pr_number), "--json", "number,url,state,headRefOid,reviewDecision"],
+        str(worktree),
+        60,
+        _controller_git_env("0"),
+        True,
+    )
+    try:
+        meta = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        meta = {}
+    return result, meta if isinstance(meta, dict) else {}
+
+
+def validate_pr_head(
+    meta: dict[str, Any],
+    pr_number: int,
+    commit_sha: str,
+    require_open: bool,
+) -> str:
+    if meta.get("number") != pr_number:
+        return "pr_number_mismatch"
+    if meta.get("headRefOid") != commit_sha:
+        return "pr_head_mismatch"
+    if meta.get("reviewDecision") == "CHANGES_REQUESTED":
+        return "pr_review_blocked"
+    if require_open and meta.get("state") != "OPEN":
+        return "pr_state_not_open"
+    return ""
 
 
 def verify_exact_production_deployment(
@@ -2895,28 +2968,33 @@ def verify_exact_production_deployment(
         if not isinstance(statuses, list):
             result["reason"] = "deployment_status_invalid_json"
             return result
-        for status_item in statuses:
-            if not isinstance(status_item, dict):
-                continue
-            if status_item.get("state") != "success":
-                continue
-            environment_url = status_item.get("environment_url") or status_item.get("target_url")
-            if not isinstance(environment_url, str) or not environment_url.startswith("https://"):
-                continue
-            inspect = subprocess_adapter.run_command(["vercel", "inspect", environment_url, "--logs"], str(worktree), 180, None, True)
-            result["inspect"] = {
-                "exit_code": inspect.returncode,
-                "stdout_bytes": inspect.stdout_bytes,
-                "stderr_bytes": inspect.stderr_bytes,
-                "url_hash": hashlib.sha256(environment_url.encode()).hexdigest(),
-            }
-            if inspect.returncode != 0 or output_has_forbidden_deployment_marker(inspect.stdout, inspect.stderr):
-                result["reason"] = "deployment_log_verification_failed"
-                return result
-            result["passed"] = True
-            result["environment_url_hash"] = hashlib.sha256(environment_url.encode()).hexdigest()
-            result["deployment_id"] = deployment.get("id") if isinstance(deployment.get("id"), int) else None
+        status_item = latest_deployment_status(statuses)
+        if not status_item:
+            result["reason"] = "deployment_status_missing"
             return result
+        result["latest_status"] = {
+            "state": status_item.get("state") if isinstance(status_item.get("state"), str) else None,
+            "created_at": status_item.get("created_at") if isinstance(status_item.get("created_at"), str) else None,
+            "updated_at": status_item.get("updated_at") if isinstance(status_item.get("updated_at"), str) else None,
+        }
+        environment_url = status_item.get("environment_url") or status_item.get("target_url")
+        if status_item.get("state") != "success" or not isinstance(environment_url, str) or not environment_url.startswith("https://"):
+            result["reason"] = "successful_production_deployment_missing"
+            return result
+        inspect = subprocess_adapter.run_command(["vercel", "inspect", environment_url, "--logs"], str(worktree), 180, None, True)
+        result["inspect"] = {
+            "exit_code": inspect.returncode,
+            "stdout_bytes": inspect.stdout_bytes,
+            "stderr_bytes": inspect.stderr_bytes,
+            "url_hash": hashlib.sha256(environment_url.encode()).hexdigest(),
+        }
+        if inspect.returncode != 0 or output_has_forbidden_deployment_marker(inspect.stdout, inspect.stderr):
+            result["reason"] = "deployment_log_verification_failed"
+            return result
+        result["passed"] = True
+        result["environment_url_hash"] = hashlib.sha256(environment_url.encode()).hexdigest()
+        result["deployment_id"] = deployment.get("id") if isinstance(deployment.get("id"), int) else None
+        return result
 
     result["reason"] = "successful_production_deployment_missing"
     return result
@@ -2928,6 +3006,7 @@ def run_shipping_gates(
     run_id: str,
     goal_data: dict[str, Any],
     acceptance_body: str,
+    reviewed_diff_fingerprint: dict[str, Any],
     subprocess_adapter: SubprocessAdapter,
     control_plane_baseline: dict[str, Any] | None = None,
     expected_origin: str = EXPECTED_CANONICAL_REPO_URL,
@@ -2964,6 +3043,22 @@ def run_shipping_gates(
         stages["reason"] = "acceptance_rerun_failed"
         return stages
     if not control_plane_gate("after_shipping_acceptance_rerun"):
+        return stages
+
+    post_rerun_fingerprint = git_diff_fingerprint(worktree, subprocess_adapter)
+    stages["reviewed_diff_fingerprint"] = {
+        "passed": bool(reviewed_diff_fingerprint.get("passed")),
+        "sha256": reviewed_diff_fingerprint.get("sha256", ""),
+        "changed_count": reviewed_diff_fingerprint.get("changed_count", 0),
+        "untracked_count": reviewed_diff_fingerprint.get("untracked_count", 0),
+    }
+    stages["diff_fingerprint_after_acceptance_rerun"] = post_rerun_fingerprint
+    if (
+        not reviewed_diff_fingerprint.get("passed")
+        or not post_rerun_fingerprint.get("passed")
+        or post_rerun_fingerprint.get("sha256") != reviewed_diff_fingerprint.get("sha256")
+    ):
+        stages["reason"] = "post_review_acceptance_mutated_diff"
         return stages
 
     shipping_scope = check_git_scope(worktree, goal_data.get("allowed_files", []), subprocess_adapter)
@@ -3016,10 +3111,12 @@ def run_shipping_gates(
 
     if not control_plane_gate("before_git_push"):
         return stages
-    push = subprocess_adapter.run_command(controller_git_cmd(["push", "-u", "origin", branch]), str(worktree), 300, _controller_git_env("0"), True)
+    push = subprocess_adapter.run_command(controller_git_cmd(["push", "origin", branch]), str(worktree), 300, _controller_git_env("0"), True)
     stages["push"] = {"exit_code": push.returncode, "stdout_bytes": push.stdout_bytes, "stderr_bytes": push.stderr_bytes}
     if push.returncode != 0 or output_has_forbidden_shipping_marker(push.stdout, push.stderr):
         stages["reason"] = "push_failed_or_forbidden_marker"
+        return stages
+    if not control_plane_gate("after_git_push"):
         return stages
 
     if not control_plane_gate("before_pr_create"):
@@ -3040,42 +3137,73 @@ def run_shipping_gates(
     if pr_create.returncode != 0 or not pr_url.startswith("https://github.com/") or output_has_forbidden_shipping_marker(pr_create.stdout, pr_create.stderr):
         stages["reason"] = "pr_create_failed"
         return stages
+    pr_number_from_url = parse_pr_number_from_url(pr_url)
+    if pr_number_from_url is None:
+        stages["reason"] = "pr_number_unreadable"
+        return stages
 
     if not control_plane_gate("before_pr_view"):
         return stages
-    pr_view = subprocess_adapter.run_command(["gh", "pr", "view", "--json", "number,url,headRefOid,reviewDecision"], str(worktree), 60, _controller_git_env("0"), True)
-    try:
-        pr_meta = json.loads(pr_view.stdout or "{}")
-    except json.JSONDecodeError:
-        pr_meta = {}
+    pr_view, pr_meta = view_pr_head(worktree, pr_number_from_url, subprocess_adapter)
     pr_number = pr_meta.get("number")
     stages["pull_request"].update({
         "number": pr_number if isinstance(pr_number, int) else None,
         "head_sha": pr_meta.get("headRefOid") if isinstance(pr_meta.get("headRefOid"), str) else commit_sha,
+        "state": pr_meta.get("state") if isinstance(pr_meta.get("state"), str) else None,
         "review_decision": pr_meta.get("reviewDecision") if isinstance(pr_meta.get("reviewDecision"), str) else None,
     })
-    if pr_view.returncode != 0 or not isinstance(pr_number, int) or pr_meta.get("reviewDecision") == "CHANGES_REQUESTED":
+    if pr_view.returncode != 0 or not isinstance(pr_number, int):
         stages["reason"] = "pr_review_blocked"
+        return stages
+    pr_head_reason = validate_pr_head(pr_meta, pr_number_from_url, commit_sha, True)
+    if pr_head_reason:
+        stages["reason"] = pr_head_reason
         return stages
 
     if not control_plane_gate("before_pr_checks"):
         return stages
-    checks = subprocess_adapter.run_command(["gh", "pr", "checks", "--watch", "--interval", "10", "--fail-fast"], str(worktree), 900, _controller_git_env("0"), True)
+    checks = subprocess_adapter.run_command(["gh", "pr", "checks", str(pr_number), "--watch", "--interval", "10", "--fail-fast"], str(worktree), 900, _controller_git_env("0"), True)
     stages["checks"] = {"exit_code": checks.returncode, "stdout_bytes": checks.stdout_bytes, "stderr_bytes": checks.stderr_bytes}
     if checks.returncode != 0 or output_has_forbidden_shipping_marker(checks.stdout, checks.stderr):
         stages["reason"] = "checks_failed"
         return stages
 
+    if not control_plane_gate("after_pr_checks"):
+        return stages
+    post_checks_view, post_checks_meta = view_pr_head(worktree, pr_number, subprocess_adapter)
+    stages["post_checks_pr"] = {
+        "view_exit_code": post_checks_view.returncode,
+        "head_sha": post_checks_meta.get("headRefOid") if isinstance(post_checks_meta.get("headRefOid"), str) else None,
+        "state": post_checks_meta.get("state") if isinstance(post_checks_meta.get("state"), str) else None,
+        "review_decision": post_checks_meta.get("reviewDecision") if isinstance(post_checks_meta.get("reviewDecision"), str) else None,
+    }
+    post_checks_reason = validate_pr_head(post_checks_meta, pr_number, commit_sha, True)
+    if post_checks_view.returncode != 0 or post_checks_reason:
+        stages["reason"] = post_checks_reason or "pr_review_blocked"
+        return stages
+
     if not control_plane_gate("before_pr_merge"):
         return stages
-    merge = subprocess_adapter.run_command(["gh", "pr", "merge", "--squash", "--delete-branch"], str(worktree), 300, _controller_git_env("0"), True)
+    pre_merge_view, pre_merge_meta = view_pr_head(worktree, pr_number, subprocess_adapter)
+    stages["pre_merge_pr"] = {
+        "view_exit_code": pre_merge_view.returncode,
+        "head_sha": pre_merge_meta.get("headRefOid") if isinstance(pre_merge_meta.get("headRefOid"), str) else None,
+        "state": pre_merge_meta.get("state") if isinstance(pre_merge_meta.get("state"), str) else None,
+        "review_decision": pre_merge_meta.get("reviewDecision") if isinstance(pre_merge_meta.get("reviewDecision"), str) else None,
+    }
+    pre_merge_reason = validate_pr_head(pre_merge_meta, pr_number, commit_sha, True)
+    if pre_merge_view.returncode != 0 or pre_merge_reason:
+        stages["reason"] = pre_merge_reason or "pr_review_blocked"
+        return stages
+
+    merge = subprocess_adapter.run_command(["gh", "pr", "merge", str(pr_number), "--squash", "--delete-branch", "--match-head-commit", commit_sha], str(worktree), 300, _controller_git_env("0"), True)
     stages["merge"] = {"exit_code": merge.returncode, "stdout_bytes": merge.stdout_bytes, "stderr_bytes": merge.stderr_bytes}
     if merge.returncode != 0 or output_has_forbidden_shipping_marker(merge.stdout, merge.stderr):
         stages["reason"] = "merge_failed"
         return stages
 
     merged_view = subprocess_adapter.run_command(
-        ["gh", "pr", "view", str(pr_number), "--json", "state,mergedAt,mergeCommit,url"],
+        ["gh", "pr", "view", str(pr_number), "--json", "number,state,headRefOid,mergedAt,mergeCommit,url"],
         str(worktree),
         60,
         _controller_git_env("0"),
@@ -3092,12 +3220,14 @@ def run_shipping_gates(
         "state": merged_meta.get("state") if isinstance(merged_meta.get("state"), str) else None,
         "merged_at_present": isinstance(merged_meta.get("mergedAt"), str) and bool(merged_meta.get("mergedAt")),
         "merge_sha": merge_sha,
-        "head_sha": stages.get("pull_request", {}).get("head_sha"),
+        "head_sha": merged_meta.get("headRefOid") if isinstance(merged_meta.get("headRefOid"), str) else None,
         "url_hash": hashlib.sha256(str(merged_meta.get("url", "")).encode()).hexdigest() if merged_meta.get("url") else "",
     })
     if (
         merged_view.returncode != 0
+        or merged_meta.get("number") != pr_number
         or merged_meta.get("state") != "MERGED"
+        or merged_meta.get("headRefOid") != commit_sha
         or not isinstance(merged_meta.get("mergedAt"), str)
         or not merged_meta.get("mergedAt")
         or not valid_git_sha(merge_sha)
@@ -3512,7 +3642,7 @@ def run_goal(
     if not lifecycle_control_plane_gate("before_shipping"):
         return False, stages
     log_event(events_path, "shipping.started", "Running deterministic shipping gates", {})
-    shipping_result = run_shipping_gates(worktree, goal_id, run_id, goal_data, acceptance_body, subprocess_adapter, control_plane_baseline)
+    shipping_result = run_shipping_gates(worktree, goal_id, run_id, goal_data, acceptance_body, post_review_fingerprint, subprocess_adapter, control_plane_baseline)
     stages["shipping"] = shipping_result
     if shipping_result.get("terminal_state") == PENDING_SURFACE_STATE:
         log_event(events_path, "deploy.ready", "Changes shipped but surface verification is pending", {
@@ -3617,16 +3747,18 @@ class FakeSubprocess:
             return CmdResult(returncode=0, stdout="", stderr="", stdout_bytes=0, stderr_bytes=0)
         if cmd[:3] == ["gh", "pr", "create"]:
             return CmdResult(returncode=0, stdout="https://github.com/director-phil/hermes-mission-control/pull/1\n", stderr="", stdout_bytes=62, stderr_bytes=0)
-        if cmd[:3] == ["gh", "pr", "view"] and "state,mergedAt,mergeCommit,url" in cmd:
+        if cmd[:3] == ["gh", "pr", "view"] and any("mergedAt" in arg for arg in cmd):
             body = json.dumps({
+                "number": 1,
                 "state": "MERGED",
+                "headRefOid": "0123456789abcdef0123456789abcdef01234567",
                 "mergedAt": "2026-08-05T00:00:00Z",
                 "mergeCommit": {"oid": "abcdefabcdefabcdefabcdefabcdefabcdefabcd"},
                 "url": "https://github.com/director-phil/hermes-mission-control/pull/1",
             })
             return CmdResult(returncode=0, stdout=body, stderr="", stdout_bytes=len(body), stderr_bytes=0)
         if cmd[:3] == ["gh", "pr", "view"]:
-            body = json.dumps({"number": 1, "url": "https://github.com/director-phil/hermes-mission-control/pull/1", "headRefOid": "0123456789abcdef0123456789abcdef01234567", "reviewDecision": "APPROVED"})
+            body = json.dumps({"number": 1, "url": "https://github.com/director-phil/hermes-mission-control/pull/1", "state": "OPEN", "headRefOid": "0123456789abcdef0123456789abcdef01234567", "reviewDecision": "APPROVED"})
             return CmdResult(returncode=0, stdout=body, stderr="", stdout_bytes=len(body), stderr_bytes=0)
         if cmd[:3] == ["gh", "pr", "checks"] or cmd[:3] == ["gh", "pr", "merge"]:
             return CmdResult(returncode=0, stdout="", stderr="", stdout_bytes=0, stderr_bytes=0)
@@ -5469,6 +5601,9 @@ def self_test() -> tuple[bool, str]:
             fake_adapter.set_response("git status", CmdResult(0, " M test.txt\x00", "", 14, 0))
             fake_adapter.set_response("git diff --numstat", CmdResult(0, "1\t1\ttest.txt\n", "", 15, 0))
 
+        def reviewed_fixture_fingerprint(repo: Path, fake_adapter: FakeSubprocess) -> dict[str, Any]:
+            return git_diff_fingerprint(repo, fake_adapter)
+
         def create_minimal_control_repo(name: str) -> Path:
             repo = Path(tmpdir) / name
             repo.mkdir()
@@ -5514,19 +5649,100 @@ def self_test() -> tuple[bool, str]:
         (worktree_dir / "test.txt").write_text("shipping\n", encoding="utf-8")
         fake_ship = FakeSubprocess()
         prime_allowed_shipping_scope(fake_ship)
-        ship_result = run_shipping_gates(worktree_dir, "ship-goal", "ship-goal", ship_goal, ship_goal["acceptance_body"], fake_ship)
+        ship_reviewed = reviewed_fixture_fingerprint(worktree_dir, fake_ship)
+        ship_result = run_shipping_gates(worktree_dir, "ship-goal", "ship-goal", ship_goal, ship_goal["acceptance_body"], ship_reviewed, fake_ship)
         check("shipping_success_passes", ship_result.get("passed") is True and ship_result.get("terminal_state") == SHIPPING_SUCCESS_STATE)
         check("shipping_records_squash_sha_difference", ship_result.get("pull_request", {}).get("head_sha") == "0123456789abcdef0123456789abcdef01234567" and ship_result.get("merge", {}).get("merge_sha") == "abcdefabcdefabcdefabcdefabcdefabcdefabcd")
         check("shipping_verifies_origin_main_merge_sha", any(normalized_git_cmd(call["cmd"]) == ["git", "merge-base", "--is-ancestor", "abcdefabcdefabcdefabcdefabcdefabcdefabcd", "origin/main"] for call in fake_ship.calls))
+        push_argvs = [normalized_git_cmd(call["cmd"]) for call in fake_ship.calls if normalized_git_cmd(call["cmd"])[:2] == ["git", "push"]]
+        check("shipping_push_avoids_tracking_mutation", push_argvs == [["git", "push", "origin", "feat/native-fixture"]] and all("-u" not in argv and "--set-upstream" not in argv for argv in push_argvs))
+        check("shipping_control_plane_after_push_unchanged", ship_result.get("control_plane_after_git_push", {}).get("passed") is True and ship_result.get("control_plane_after_git_push", {}).get("baseline_fingerprint") == ship_result.get("control_plane_after_git_push", {}).get("current_fingerprint"))
+        check("shipping_merge_uses_explicit_pr_and_head_match", any(call["cmd"] == ["gh", "pr", "merge", "1", "--squash", "--delete-branch", "--match-head-commit", "0123456789abcdef0123456789abcdef01234567"] for call in fake_ship.calls))
+
+        fake_acceptance_mutates_diff = FakeSubprocess()
+        fake_acceptance_mutates_diff.set_response("git status", CmdResult(0, " M test.txt\x00", "", 14, 0))
+        fake_acceptance_mutates_diff.set_response("--cached --binary", [CmdResult(0, "", "", 0, 0), CmdResult(0, "", "", 0, 0)])
+        fake_acceptance_mutates_diff.set_response("git diff --binary", [
+            CmdResult(0, "diff --git a/test.txt b/test.txt\n-old\n+reviewed\n", "", 48, 0),
+            CmdResult(0, "diff --git a/test.txt b/test.txt\n-old\n+mutated\n", "", 47, 0),
+        ])
+        fake_acceptance_mutates_diff.set_response("git diff --numstat", CmdResult(0, "1\t1\ttest.txt\n", "", 15, 0))
+        mutating_reviewed = reviewed_fixture_fingerprint(worktree_dir, fake_acceptance_mutates_diff)
+        acceptance_mutated_ship = run_shipping_gates(
+            worktree_dir,
+            "ship-acceptance-mutates-diff",
+            "ship-acceptance-mutates-diff",
+            ship_goal,
+            ship_goal["acceptance_body"],
+            mutating_reviewed,
+            fake_acceptance_mutates_diff,
+        )
+        check("shipping_acceptance_allowed_file_mutation_fails", acceptance_mutated_ship.get("passed") is False and acceptance_mutated_ship.get("reason") == "post_review_acceptance_mutated_diff")
+        check("shipping_acceptance_allowed_file_mutation_no_ship", no_shipping_mutation_commands(fake_acceptance_mutates_diff))
+
+        class PushControlMutationFake(FakeSubprocess):
+            def __init__(self, mutate: Callable[[], None]) -> None:
+                super().__init__()
+                self.mutate = mutate
+                self.mutated = False
+
+            def run_command(
+                self,
+                cmd: list[str],
+                cwd: str,
+                timeout: int,
+                env: dict[str, str] | None,
+                capture: bool,
+                stdin_data: str | None = None,
+            ) -> CmdResult:
+                result = super().run_command(cmd, cwd, timeout, env, capture, stdin_data)
+                if normalized_git_cmd(cmd)[:2] == ["git", "push"] and not self.mutated:
+                    self.mutate()
+                    self.mutated = True
+                return result
+
+        push_control_repo = create_minimal_control_repo("control-push-mutation")
+        push_control_goal = {**ship_goal, "repo_worktree": str(push_control_repo)}
+        fake_push_control = PushControlMutationFake(lambda: (push_control_repo / ".git" / "config").write_text((push_control_repo / ".git" / "config").read_text(encoding="utf-8") + "[alias]\n\tp = push\n", encoding="utf-8"))
+        prime_allowed_shipping_scope(fake_push_control)
+        push_control_ship = run_shipping_gates(push_control_repo, "ship-push-control", "ship-push-control", push_control_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(push_control_repo, fake_push_control), fake_push_control)
+        check("shipping_push_control_plane_mutation_blocks", push_control_ship.get("passed") is False and push_control_ship.get("reason") == "control_plane_changed" and push_control_ship.get("control_plane_after_git_push", {}).get("passed") is False)
+        check("shipping_push_control_plane_mutation_no_pr", not any(call["cmd"][:3] == ["gh", "pr", "create"] for call in fake_push_control.calls))
+
+        pr_head_view_key = "number,url,state,headRefOid,reviewDecision"
+        pr_ok = CmdResult(0, json.dumps({"number": 1, "url": "https://github.com/director-phil/hermes-mission-control/pull/1", "state": "OPEN", "headRefOid": "0123456789abcdef0123456789abcdef01234567", "reviewDecision": "APPROVED"}), "", 180, 0)
+        pr_drift = CmdResult(0, json.dumps({"number": 1, "url": "https://github.com/director-phil/hermes-mission-control/pull/1", "state": "OPEN", "headRefOid": "fedcba9876543210fedcba9876543210fedcba98", "reviewDecision": "APPROVED"}), "", 180, 0)
+
+        fake_pr_mismatch_before_checks = FakeSubprocess()
+        prime_allowed_shipping_scope(fake_pr_mismatch_before_checks)
+        fake_pr_mismatch_before_checks.set_response(pr_head_view_key, pr_drift)
+        pr_mismatch_before_checks = run_shipping_gates(worktree_dir, "ship-pr-mismatch-before-checks", "ship-pr-mismatch-before-checks", ship_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_pr_mismatch_before_checks), fake_pr_mismatch_before_checks)
+        check("shipping_pr_head_mismatch_before_checks_blocks", pr_mismatch_before_checks.get("passed") is False and pr_mismatch_before_checks.get("reason") == "pr_head_mismatch")
+        check("shipping_pr_head_mismatch_before_checks_no_merge", not any(call["cmd"][:3] == ["gh", "pr", "merge"] for call in fake_pr_mismatch_before_checks.calls))
+
+        fake_pr_drift_after_checks = FakeSubprocess()
+        prime_allowed_shipping_scope(fake_pr_drift_after_checks)
+        fake_pr_drift_after_checks.set_response(pr_head_view_key, [pr_ok, pr_drift])
+        pr_drift_after_checks = run_shipping_gates(worktree_dir, "ship-pr-drift-after-checks", "ship-pr-drift-after-checks", ship_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_pr_drift_after_checks), fake_pr_drift_after_checks)
+        check("shipping_pr_head_drift_after_checks_blocks", pr_drift_after_checks.get("passed") is False and pr_drift_after_checks.get("reason") == "pr_head_mismatch")
+        check("shipping_pr_head_drift_after_checks_no_merge", not any(call["cmd"][:3] == ["gh", "pr", "merge"] for call in fake_pr_drift_after_checks.calls))
+
+        fake_pr_drift_pre_merge = FakeSubprocess()
+        prime_allowed_shipping_scope(fake_pr_drift_pre_merge)
+        fake_pr_drift_pre_merge.set_response(pr_head_view_key, [pr_ok, pr_ok, pr_drift])
+        pr_drift_pre_merge = run_shipping_gates(worktree_dir, "ship-pr-drift-pre-merge", "ship-pr-drift-pre-merge", ship_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_pr_drift_pre_merge), fake_pr_drift_pre_merge)
+        check("shipping_pr_head_drift_pre_merge_blocks", pr_drift_pre_merge.get("passed") is False and pr_drift_pre_merge.get("reason") == "pr_head_mismatch")
+        check("shipping_pr_head_drift_pre_merge_no_merge", not any(call["cmd"][:3] == ["gh", "pr", "merge"] for call in fake_pr_drift_pre_merge.calls))
+
         fake_not_merged = FakeSubprocess()
         prime_allowed_shipping_scope(fake_not_merged)
-        fake_not_merged.set_response("state,mergedAt,mergeCommit,url", CmdResult(0, json.dumps({"state": "OPEN", "mergedAt": None, "mergeCommit": None, "url": "https://github.com/director-phil/rt-ops-v2/pull/2"}), "", 120, 0))
-        not_merged_ship = run_shipping_gates(worktree_dir, "ship-not-merged", "ship-not-merged", ship_goal, ship_goal["acceptance_body"], fake_not_merged)
+        fake_not_merged.set_response("mergedAt", CmdResult(0, json.dumps({"number": 1, "state": "OPEN", "headRefOid": "0123456789abcdef0123456789abcdef01234567", "mergedAt": None, "mergeCommit": None, "url": "https://github.com/director-phil/hermes-mission-control/pull/1"}), "", 120, 0))
+        not_merged_ship = run_shipping_gates(worktree_dir, "ship-not-merged", "ship-not-merged", ship_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_not_merged), fake_not_merged)
         check("shipping_failed_not_merged_pr_blocks_done", not_merged_ship.get("passed") is False and not_merged_ship.get("reason") == "pr_not_merged")
         fake_checks_fail = FakeSubprocess()
         prime_allowed_shipping_scope(fake_checks_fail)
         fake_checks_fail.set_response("gh pr checks", CmdResult(1, "FAILED unit\n", "", 12, 0))
-        failed_ship = run_shipping_gates(worktree_dir, "ship-fail", "ship-fail", ship_goal, ship_goal["acceptance_body"], fake_checks_fail)
+        failed_ship = run_shipping_gates(worktree_dir, "ship-fail", "ship-fail", ship_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_checks_fail), fake_checks_fail)
         check("shipping_checks_failure_blocks_done", failed_ship.get("passed") is False and failed_ship.get("reason") == "checks_failed")
         (native_root / "goals" / "running" / "no-local-done.md").write_text(_make_test_goal(str(worktree_dir), title="No Local Done"), encoding="utf-8")
         create_controller_lock(native_root / "controller.lock", "no-local-done", os.getpid(), get_process_start_ticks(os.getpid()))
@@ -5541,16 +5757,16 @@ def self_test() -> tuple[bool, str]:
             "environment": "Production",
             "statuses_url": "https://api.github.com/repos/director-phil/rt-ops-v2/deployments/2002/statuses",
         }]), "", 180, 0))
-        unrelated_deploy_ship = run_shipping_gates(worktree_dir, "vercel-unrelated", "vercel-unrelated", vercel_goal, ship_goal["acceptance_body"], fake_unrelated_deploy)
+        unrelated_deploy_ship = run_shipping_gates(worktree_dir, "vercel-unrelated", "vercel-unrelated", vercel_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_unrelated_deploy), fake_unrelated_deploy)
         check("vercel_unrelated_deployment_sha_cannot_satisfy", unrelated_deploy_ship.get("passed") is False and unrelated_deploy_ship.get("reason") == "successful_production_deployment_missing")
         fake_missing_deploy = FakeSubprocess()
         prime_allowed_shipping_scope(fake_missing_deploy)
         fake_missing_deploy.set_response("deployments?sha=", CmdResult(0, "[]", "", 2, 0))
-        missing_deploy_ship = run_shipping_gates(worktree_dir, "vercel-missing", "vercel-missing", vercel_goal, ship_goal["acceptance_body"], fake_missing_deploy)
+        missing_deploy_ship = run_shipping_gates(worktree_dir, "vercel-missing", "vercel-missing", vercel_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_missing_deploy), fake_missing_deploy)
         check("vercel_missing_deployment_blocks", missing_deploy_ship.get("passed") is False and missing_deploy_ship.get("reason") == "deployment_missing")
         fake_pending = FakeSubprocess()
         prime_allowed_shipping_scope(fake_pending)
-        pending_ship = run_shipping_gates(worktree_dir, "vercel-pending", "vercel-pending", vercel_goal, ship_goal["acceptance_body"], fake_pending)
+        pending_ship = run_shipping_gates(worktree_dir, "vercel-pending", "vercel-pending", vercel_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_pending), fake_pending)
         check("vercel_inspects_exact_environment_url", any(call["cmd"] == ["vercel", "inspect", "https://rt-ops-v2.vercel.app", "--logs"] for call in fake_pending.calls) and not any(call["cmd"] == ["vercel", "inspect", "--logs"] for call in fake_pending.calls))
         (native_root / "goals" / "running" / "vercel-pending.md").write_text(_make_test_goal(str(worktree_dir), title="Vercel Pending"), encoding="utf-8")
         create_controller_lock(native_root / "controller.lock", "vercel-pending", os.getpid(), get_process_start_ticks(os.getpid()))
@@ -5558,20 +5774,40 @@ def self_test() -> tuple[bool, str]:
         check("vercel_pending_surface_state", pending_ship.get("terminal_state") == PENDING_SURFACE_STATE and (native_root / "goals" / PENDING_SURFACE_STATE / "vercel-pending.md").exists())
         pending_result = json.loads((native_root / "runs" / "vercel-pending" / "result.json").read_text(encoding="utf-8"))
         check("vercel_pending_not_success", pending_result.get("success") is False and pending_result.get("terminal_state") == PENDING_SURFACE_STATE)
+        fake_success_then_failure = FakeSubprocess()
+        prime_allowed_shipping_scope(fake_success_then_failure)
+        fake_success_then_failure.set_response("/statuses", CmdResult(0, json.dumps([
+            {"state": "success", "environment_url": "https://rt-ops-v2.vercel.app", "created_at": "2026-08-05T00:00:00Z"},
+            {"state": "failure", "environment_url": "https://rt-ops-v2.vercel.app", "created_at": "2026-08-05T00:02:00Z"},
+        ]), "", 220, 0))
+        success_then_failure_ship = run_shipping_gates(worktree_dir, "vercel-success-then-failure", "vercel-success-then-failure", vercel_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_success_then_failure), fake_success_then_failure)
+        check("vercel_latest_failure_after_success_blocks", success_then_failure_ship.get("passed") is False and success_then_failure_ship.get("reason") == "successful_production_deployment_missing" and success_then_failure_ship.get("deployment", {}).get("latest_status", {}).get("state") == "failure")
+        check("vercel_latest_failure_after_success_no_inspect", not any(call["cmd"][:2] == ["vercel", "inspect"] for call in fake_success_then_failure.calls))
+        fake_failure_then_latest_success = FakeSubprocess()
+        prime_allowed_shipping_scope(fake_failure_then_latest_success)
+        fake_failure_then_latest_success.set_response("/statuses", CmdResult(0, json.dumps([
+            {"state": "failure", "environment_url": "https://rt-ops-v2.vercel.app", "created_at": "2026-08-05T00:00:00Z"},
+            {"state": "success", "environment_url": "https://rt-ops-v2.vercel.app", "created_at": "2026-08-05T00:02:00Z"},
+        ]), "", 220, 0))
+        failure_then_latest_success_ship = run_shipping_gates(worktree_dir, "vercel-failure-then-success", "vercel-failure-then-success", vercel_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_failure_then_latest_success), fake_failure_then_latest_success)
+        check("vercel_latest_success_after_failure_passes_deploy_gate", failure_then_latest_success_ship.get("terminal_state") == PENDING_SURFACE_STATE and failure_then_latest_success_ship.get("deployment", {}).get("passed") is True and failure_then_latest_success_ship.get("deployment", {}).get("latest_status", {}).get("state") == "success")
+        check("vercel_latest_success_after_failure_inspects_url", any(call["cmd"] == ["vercel", "inspect", "https://rt-ops-v2.vercel.app", "--logs"] for call in fake_failure_then_latest_success.calls))
         vercel_surface_true_goal = {**ship_goal, "vercel_impact": True, "surface_verification": True}
         fake_surface_true = FakeSubprocess()
         prime_allowed_shipping_scope(fake_surface_true)
-        surface_true_ship = run_shipping_gates(worktree_dir, "vercel-surface-true", "vercel-surface-true", vercel_surface_true_goal, ship_goal["acceptance_body"], fake_surface_true)
+        surface_true_ship = run_shipping_gates(worktree_dir, "vercel-surface-true", "vercel-surface-true", vercel_surface_true_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_surface_true), fake_surface_true)
         check("vercel_surface_verification_true_cannot_bypass_pending", surface_true_ship.get("terminal_state") == PENDING_SURFACE_STATE and surface_true_ship.get("passed") is False)
         fake_shipping_scope_escape = FakeSubprocess()
         fake_shipping_scope_escape.set_response("git status", CmdResult(0, " M test.txt\x00?? ship-forbidden.txt\x00", "", 35, 0))
         fake_shipping_scope_escape.set_response("git diff --numstat", CmdResult(0, "1\t1\ttest.txt\n", "", 15, 0))
+        shipping_scope_escape_reviewed = reviewed_fixture_fingerprint(worktree_dir, fake_shipping_scope_escape)
         shipping_scope_escape = run_shipping_gates(
             worktree_dir,
             "ship-scope-escape",
             "ship-scope-escape",
             ship_goal,
             ship_goal["acceptance_body"],
+            shipping_scope_escape_reviewed,
             fake_shipping_scope_escape,
         )
         check("shipping_post_acceptance_scope_escape_fails", shipping_scope_escape.get("passed") is False and shipping_scope_escape.get("reason") == "post_acceptance_rerun_scope_failed")
@@ -5589,7 +5825,7 @@ def self_test() -> tuple[bool, str]:
             case_goal = {**ship_goal, "repo_worktree": str(control_repo)}
             mutation_fake = ControlPlaneMutationFake(control_repo, "acceptance", mutation_factory(control_repo))
             prime_allowed_shipping_scope(mutation_fake)
-            mutation_result = run_shipping_gates(control_repo, f"ship-{case_name}", f"ship-{case_name}", case_goal, ship_goal["acceptance_body"], mutation_fake)
+            mutation_result = run_shipping_gates(control_repo, f"ship-{case_name}", f"ship-{case_name}", case_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(control_repo, mutation_fake), mutation_fake)
             check(f"shipping_acceptance_{case_name}_blocks", mutation_result.get("passed") is False and mutation_result.get("reason") == "control_plane_changed")
             check(f"shipping_acceptance_{case_name}_no_mutation", no_shipping_mutation_commands(mutation_fake))
 
@@ -5624,7 +5860,7 @@ def self_test() -> tuple[bool, str]:
         prime_allowed_shipping_scope(fake_preview_contains)
         fake_preview_contains.set_response("git merge-base --is-ancestor", CmdResult(1, "", "", 0, 0))
         fake_preview_contains.set_response("git branch -r --contains", CmdResult(0, "  origin/main-preview\n  origin/main-old\n", "", 35, 0))
-        preview_result = run_shipping_gates(worktree_dir, "ship-preview", "ship-preview", ship_goal, ship_goal["acceptance_body"], fake_preview_contains)
+        preview_result = run_shipping_gates(worktree_dir, "ship-preview", "ship-preview", ship_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_preview_contains), fake_preview_contains)
         check("origin_main_preview_old_cannot_satisfy", preview_result.get("passed") is False and preview_result.get("reason") == "origin_main_missing_merge_commit")
         check("origin_main_preview_old_branch_contains_unused", not any(normalized_git_cmd(call["cmd"])[:4] == ["git", "branch", "-r", "--contains"] for call in fake_preview_contains.calls))
         check("origin_main_actual_ancestor_passes", ship_result.get("origin_main", {}).get("ancestor_exit_code") == 0 and ship_result.get("passed") is True)

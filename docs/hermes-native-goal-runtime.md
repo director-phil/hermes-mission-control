@@ -259,21 +259,38 @@ except for the explicitly recovered staged+ready crash case above.
 
 Review pass is no longer terminal success. After final review, the runner:
 
-1. Re-runs deterministic acceptance in the actual checkout.
-2. Re-runs the full scope check immediately after acceptance rerun and before any `git add --all`. Any staged, unstaged, untracked, or binary/NUL violation fails closed.
-3. Commits with the approved `director-phil` identity.
-4. Pushes the neutral branch.
-5. Creates a GitHub PR with `gh`.
-6. Records PR URL hash, PR number, pre-squash head SHA, check status, merge
+1. Captures the authoritative reviewed diff fingerprint immediately after the
+   final read-only `REVIEW_PASS` check.
+2. Re-runs deterministic acceptance in the actual checkout.
+3. Requires the post-acceptance-rerun diff fingerprint to exactly match the
+   reviewed fingerprint passed into shipping. Any allowed or disallowed content
+   change fails closed as `post_review_acceptance_mutated_diff` before
+   `git add`, commit, push, PR creation, or merge.
+4. Re-runs the full scope check immediately after acceptance rerun and before any
+   `git add --all`. Any staged, unstaged, untracked, or binary/NUL violation
+   fails closed.
+5. Commits with the approved `director-phil` identity.
+6. Pushes the neutral branch with `git push origin <branch>` and no upstream or
+   tracking mutation. The Git control-plane fingerprint must remain unchanged
+   after push.
+7. Creates a GitHub PR with `gh`.
+8. Records PR URL hash, PR number, pre-squash head SHA, check status, merge
    status, and origin/main containment metadata.
-7. Waits boundedly for required checks and merges only when checks pass and no
-   review blockers are present.
-8. Reads `gh pr view <number> --json state,mergedAt,mergeCommit,url`, requires
-   `MERGED`, records the actual merge SHA, fetches `origin/main`, and verifies
-   `origin/main` contains that merge SHA. This supports normal squash merges.
-9. For Vercel-impacting goals, uses GitHub deployments/status API for the exact
-   merge SHA, requires a successful Production deployment with an environment
-   URL, and runs `vercel inspect <environment_url> --logs`.
+9. Requires every PR view to use the explicit PR number and to show
+   `headRefOid` exactly equal to the reviewed local commit SHA. It checks this
+   immediately after PR creation, after required checks complete, and
+   immediately before merge; the PR must remain open with no changes requested.
+10. Merges the explicit PR number with expected-head semantics and then reads
+   `gh pr view <number> --json number,state,headRefOid,mergedAt,mergeCommit,url`,
+   requiring the same PR number, same head SHA, `MERGED`, a merge timestamp, and
+   a valid merge commit SHA. It fetches `origin/main` and verifies `origin/main`
+   contains that merge SHA. This supports normal squash merges.
+11. For Vercel-impacting goals, uses GitHub deployments/status API for the exact
+   merge SHA. For each exact Production deployment, it selects the latest status
+   deterministically by `created_at` or `updated_at`; if timestamps are absent,
+   it falls back to the GitHub API's newest-first order. The latest status must
+   be `success` with a valid HTTPS environment URL, then the runner executes
+   `vercel inspect <environment_url> --logs`.
 
 `done/` means shipped and verified. A local diff, acceptance pass, or review
 pass alone cannot produce `done/`. The controller does not own browser/visual
