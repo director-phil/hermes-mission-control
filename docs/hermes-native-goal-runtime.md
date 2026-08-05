@@ -6,13 +6,13 @@ orchestrated by a single-process controller with atomic state transitions.
 
 Default stage profiles are safe and configurable:
 
-- Plan: `architect`, a local read-only planner.
+- Plan: `default`, a cloud Codex-backed read-only planner.
 - Code implementation: `default`, a cloud Codex-backed orchestrator.
 - Final review: `default`, a cloud Codex-backed orchestrator.
 
 The `HERMES_NATIVE_PLAN_PROFILE`, `HERMES_NATIVE_CODE_PROFILE`, and
 `HERMES_NATIVE_REVIEW_PROFILE` environment variables can pin compatible
-profiles. Code and final review resolve the configured Hermes profile provider
+profiles. Plan, code, and final review resolve the configured Hermes profile provider
 with `hermes --profile <profile> config get model.provider` before work starts
 and fail closed unless the provider is exactly `openai-codex`.
 
@@ -123,19 +123,19 @@ heading followed by `- path` or ``- `path` `` bullets. Other prose is ignored.
 1. **Ready block checks**: Parse the next `ready/` goal. If `hard_stop: true`, leave it in `ready/`, emit non-terminal `promotion.blocked` and `goal.blocked` evidence, and continue without dependency release, controller lock creation, or model calls.
 2. **Lock**: Create controller lock with `O_EXCL`.
 3. **Claim**: Atomically move goal from `ready/` to `running/` via `os.replace()`.
-4. **Plan**: Run `hermes --profile "${HERMES_NATIVE_PLAN_PROFILE:-architect}" chat --query-file - --source mission-control-goal-plan` with the prompt supplied on stdin.
+4. **Plan**: Run `hermes --profile "${HERMES_NATIVE_PLAN_PROFILE:-default}" chat --quiet --reasoning none --toolsets terminal,file --query-file - --source mission-control-goal-plan` with the prompt supplied on stdin.
    Goal markdown is treated as untrusted data. The model prompt separates controller authority/stage instructions from a bounded serialized goal-data envelope. The envelope preserves title, worktree, allowed files, model-visible requirements, and the acceptance SHA-256, but excludes the raw Acceptance section and shell body.
    Before invocation, the controller captures a full worktree fingerprint covering staged, unstaged, untracked, and ignored state plus a Git control-plane fingerprint. Immediately after the planner returns, both fingerprints must match and origin/control-plane validation must still pass before `PLAN_APPROVED` can be accepted. Any planner mutation fails closed as `planner_mutated_worktree` or `planner_mutated_control_plane`, and no implementation, review, or shipping stage is invoked.
-   Requires bounded stdout, stripped of surrounding whitespace, to equal exactly `PLAN_APPROVED`.
-5. **Code**: Run `hermes --profile "${HERMES_NATIVE_CODE_PROFILE:-default}" chat --query-file - --source mission-control-goal-code` with the prompt supplied on stdin.
+   Requires bounded stdout whose final non-empty line is exactly `PLAN_APPROVED`. Bounded rationale must come before the verdict. Earlier echoes of `PLAN_APPROVED` are ignored as non-authoritative provider output, but missing output, oversized output, a non-final/embedded verdict, or any `REVIEW_PASS` marker anywhere fail closed.
+5. **Code**: Run `hermes --profile "${HERMES_NATIVE_CODE_PROFILE:-default}" chat --quiet --toolsets terminal,file --query-file - --source mission-control-goal-code` with the prompt supplied on stdin.
    The prompt states Codex-only production implementation authority, names the exact controller markers, and reserves those markers for plan/final review.
    Requires exit 0 and substantive git diff within allowed files.
 6. **Scope Check**: Verify all staged, unstaged, and untracked changed files are in the allowed list. Reject binary/NUL diffs, including direct NUL inspection of every untracked allowed path because untracked files are absent from `git diff --numstat`.
 7. **Acceptance**: Execute the bash acceptance block with minimal env, passing the byte-preserved body on stdin. The raw acceptance shell is controller-only: it is hashed for model-visible evidence and execution records, but is never sent to planner, code, or review prompts.
 8. **Post-acceptance Scope Check**: Re-run the full scope check immediately after acceptance and before review. Any staged, unstaged, untracked, or binary/NUL violation fails closed.
-9. **Review**: Run `hermes --profile "${HERMES_NATIVE_REVIEW_PROFILE:-default}" chat --query-file - --source mission-control-goal-review` with the prompt supplied on stdin.
+9. **Review**: Run `hermes --profile "${HERMES_NATIVE_REVIEW_PROFILE:-default}" chat --quiet --reasoning none --toolsets terminal,file --query-file - --source mission-control-goal-review` with the prompt supplied on stdin.
    The prompt states Codex-only final code review authority and the exact required marker.
-   Requires bounded stdout, stripped of surrounding whitespace, to equal exactly `REVIEW_PASS`.
+   Requires bounded stdout whose final non-empty line is exactly `REVIEW_PASS`. Bounded rationale must come before the verdict. Earlier echoes of `REVIEW_PASS` are ignored as non-authoritative provider output, but missing output, oversized output, a non-final/embedded verdict, or any `PLAN_APPROVED` marker anywhere fail closed.
 10. **Post-review Scope Check**: Re-run the full scope check immediately after review and before shipping. Review is read-only: any diff fingerprint mutation by review fails closed even if the changed path is in-scope. There is no repair stage in this runtime.
 11. **Finalize**: Move to `done/` or `failed/`, write terminal result JSON, emit the terminal event, then clean the owned lock. If the terminal move fails, the runner records non-terminal recovery evidence, preserves the lock/running file, and does not emit a false terminal event.
 
