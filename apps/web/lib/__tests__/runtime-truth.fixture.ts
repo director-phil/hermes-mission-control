@@ -59,6 +59,37 @@ test("orphan wrapper is detected when no goal or systemd owner exists", async ()
   assert.equal(snapshot.processes[0]?.orphan, true);
 });
 
+test("manual native goal runner process is controller evidence", async () => {
+  const snapshot = await buildRuntimeSnapshot(roots, adapters({
+    files: {
+      "/fixture/proc/501/status": status("python3", 1, 1200),
+      "/fixture/proc/501/stat": stat(501, "python3", 1),
+      "/fixture/proc/501/cmdline": cmd("python3", "/home/phillip_downs/Documents/GitHub/hermes-mission-control/scripts/hermes_native_goal_runner.py", "--native-root", "/native-rt"),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    },
+  }));
+  assert.equal(snapshot.processes.find((process) => process.pid === 501)?.role, "controller");
+  assert.equal(snapshot.processes.filter((process) => process.role === "controller").length, 1);
+});
+
+test("systemd native goal runner service is controller evidence with service attribution", async () => {
+  const snapshot = await buildRuntimeSnapshot(roots, adapters({
+    files: {
+      "/fixture/proc/502/status": status("python3", 1, 1200),
+      "/fixture/proc/502/stat": stat(502, "python3", 1),
+      "/fixture/proc/502/cmdline": cmd("/usr/bin/env", "python3", "/home/phillip_downs/Documents/GitHub/hermes-mission-control/scripts/hermes_native_goal_runner.py"),
+      "/fixture/proc/502/cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/hermes-native-goal-runner.service\n",
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    },
+    systemctlUnits: ["hermes-native-goal-runner.service"],
+  }));
+  const process = snapshot.processes.find((item) => item.pid === 502);
+  assert.equal(process?.role, "controller");
+  assert.equal(process?.service_unit, "hermes-native-goal-runner.service");
+  assert.equal(snapshot.processes.filter((item) => item.pid === 502).length, 1);
+  assert.equal(snapshot.processes.filter((item) => item.role === "controller").length, 1);
+});
+
 test("runtime snapshot never serializes raw argv secrets across API boundary", async () => {
   const snapshot = await buildRuntimeSnapshot(roots, adapters({
     files: {
@@ -154,6 +185,24 @@ test("forbidden GitHub worktree roots are rejected before any Git exec", async (
   assert.equal(snapshot.worktrees.length, 0);
   assert.equal(snapshot.goals[0]?.worktree?.dirty, null);
   assert.equal(snapshot.source_warnings.some((warning) => warning.source === forbidden && warning.message.includes("Git was not executed")), true);
+});
+
+test("primary V2 WIP checkout is a default forbidden worktree root", async () => {
+  const primaryWip = "/home/phillip_downs/Documents/GitHub/reliable-tradies-ops-v2";
+  const gitCwds: string[] = [];
+  const snapshot = await buildRuntimeSnapshot({
+    ...roots,
+    allowedWorktreeRoots: ["/home/phillip_downs/.hermes/mission-control-worktrees"],
+  }, adapters({
+    files: {
+      "/fixture/LegacyRuntime/goals/state/goal-primary-wip.json": JSON.stringify({ id: "goal-primary-wip", status: "ready", worktree: primaryWip }),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    },
+    gitCwds,
+  }));
+  assert.deepEqual(gitCwds, []);
+  assert.equal(snapshot.goals[0]?.worktree?.dirty, null);
+  assert.equal(snapshot.source_warnings.some((warning) => warning.source === primaryWip && warning.message.includes("forbidden roots") && warning.message.includes("Git was not executed")), true);
 });
 
 test("allowed-root symlink resolving to forbidden worktree is rejected before Git exec", async () => {
@@ -314,6 +363,72 @@ test("proc stat parser handles command names with spaces", () => {
   });
 });
 
+test("duplicate native goal IDs surface as critical conflicted integrity failure", async () => {
+  const snapshot = await buildRuntimeSnapshot({
+    ...roots,
+    nativeRuntimeRoot: "/native-rt",
+    allowedWorktreeRoots: ["/fixture/worktrees"],
+  }, adapters({
+    files: {
+      "/native-rt/goals/ready/duplicate-native.md": nativeGoal("Duplicate Ready", "/fixture/worktrees/a"),
+      "/native-rt/goals/running/duplicate-native.md": nativeGoal("Duplicate Running", "/fixture/worktrees/b"),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    },
+  }));
+  const goal = snapshot.goals.find((item) => item.goal_id === "duplicate-native");
+  assert.equal(goal?.status, "conflicted");
+  assert.equal(goal?.queue_state, "unknown");
+  assert.equal(goal?.sources.length, 2);
+  assert.equal(goal?.sources.every((source) => source.status === "warning" && source.note?.startsWith("native-duplicate-state-conflict")), true);
+  assert.equal(snapshot.goals.filter((item) => item.goal_id === "duplicate-native").length, 1);
+  assert.equal(snapshot.source_warnings.some((warning) => warning.status === "critical" && warning.message.includes("duplicate native goal id duplicate-native")), true);
+});
+
+test("unique native goal IDs keep normal status and counts semantics", async () => {
+  const snapshot = await buildRuntimeSnapshot({
+    ...roots,
+    nativeRuntimeRoot: "/native-rt",
+    allowedWorktreeRoots: ["/fixture/worktrees"],
+  }, adapters({
+    files: {
+      "/native-rt/goals/ready/unique-native.md": nativeGoal("Unique Ready", "/fixture/worktrees/a"),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    },
+  }));
+  const goal = snapshot.goals.find((item) => item.goal_id === "unique-native");
+  assert.equal(goal?.status, "ready");
+  assert.equal(goal?.queue_state, "ready");
+  assert.equal(snapshot.source_warnings.some((warning) => warning.message.includes("duplicate native goal id")), false);
+});
+
+test("native dependency aliases and list forms surface blockers in runtime truth", async () => {
+  const snapshot = await buildRuntimeSnapshot({
+    ...roots,
+    nativeRuntimeRoot: "/native-rt",
+    allowedWorktreeRoots: ["/fixture/worktrees"],
+  }, adapters({
+    files: {
+      "/native-rt/goals/ready/depends-on-scalar.md": nativeGoal("Depends On Scalar", "/fixture/worktrees/a").replace("dependencies:\n", "depends_on: parent-a, parent-b\n"),
+      "/native-rt/goals/ready/dependency-ids-list.md": nativeGoal("Dependency Ids List", "/fixture/worktrees/a").replace("dependencies:\n", "dependency_ids:\n  - parent-c\n  - parent-d\n"),
+      "/native-rt/goals/ready/dependencies-inline-list.md": nativeGoal("Dependencies Inline List", "/fixture/worktrees/a").replace("dependencies:\n", "dependencies: [parent-e, parent-f]\n"),
+      "/native-rt/goals/done/parent-a.md": nativeGoal("Parent A", "/fixture/worktrees/a"),
+      "/native-rt/runs/parent-a/result.json": JSON.stringify({ goal_id: "parent-a", success: true }),
+      "/native-rt/goals/done/parent-c.md": nativeGoal("Parent C", "/fixture/worktrees/a"),
+      "/native-rt/runs/parent-c/result.json": JSON.stringify({ goal_id: "parent-c", success: true }),
+      "/native-rt/goals/done/parent-e.md": nativeGoal("Parent E", "/fixture/worktrees/a"),
+      "/native-rt/runs/parent-e/result.json": JSON.stringify({ goal_id: "parent-e", success: true }),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    },
+  }));
+
+  assert.deepEqual(snapshot.goals.find((goal) => goal.goal_id === "depends-on-scalar")?.dependency_ids, ["parent-a", "parent-b"]);
+  assert.deepEqual(snapshot.goals.find((goal) => goal.goal_id === "depends-on-scalar")?.blocker_ids, ["parent-b"]);
+  assert.deepEqual(snapshot.goals.find((goal) => goal.goal_id === "dependency-ids-list")?.dependency_ids, ["parent-c", "parent-d"]);
+  assert.deepEqual(snapshot.goals.find((goal) => goal.goal_id === "dependency-ids-list")?.blocker_ids, ["parent-d"]);
+  assert.deepEqual(snapshot.goals.find((goal) => goal.goal_id === "dependencies-inline-list")?.dependency_ids, ["parent-e", "parent-f"]);
+  assert.deepEqual(snapshot.goals.find((goal) => goal.goal_id === "dependencies-inline-list")?.blocker_ids, ["parent-f"]);
+});
+
 function adapters({
   files,
   gitCwds,
@@ -383,6 +498,7 @@ function commandAdapter({
       if (file === "systemctl" && args[1] === "list-units") return { ok: true, stdout: systemctlUnits.map((unit) => `${unit} loaded active running fixture`).join("\n"), stderr: "", code: 0 };
       if (file === "systemctl" && args[1] === "show") {
         const unit = args[2];
+        const isHermesNative = unit === "hermes-native-goal-runner.service";
         return {
           ok: true,
           stdout: [
@@ -390,8 +506,12 @@ function commandAdapter({
             "ActiveState=active",
             "SubState=running",
             `Description=${unit}`,
-            unit === "custom-worker.service" ? "MainPID=0" : "MainPID=0",
-            unit === "custom-worker.service" ? "ControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/custom-worker.service" : "ControlGroup=",
+            isHermesNative ? "MainPID=502" : "MainPID=0",
+            unit === "custom-worker.service"
+              ? "ControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/custom-worker.service"
+              : isHermesNative
+                ? "ControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/hermes-native-goal-runner.service"
+                : "ControlGroup=",
           ].join("\n"),
           stderr: "",
           code: 0,
@@ -412,4 +532,25 @@ function stat(pid: number, name: string, ppid: number) {
 
 function cmd(...parts: string[]) {
   return `${parts.join("\0")}\0`;
+}
+
+function nativeGoal(title: string, worktree: string) {
+  return `---
+title: ${title}
+repo/workdir: ${worktree}
+dependencies:
+---
+
+${title}
+
+## Allowed files
+
+- \`test.txt\`
+
+## Acceptance
+
+\`\`\`bash
+echo test
+\`\`\`
+`;
 }

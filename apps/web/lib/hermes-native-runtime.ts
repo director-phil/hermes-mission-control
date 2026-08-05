@@ -5,6 +5,7 @@ import type {
   RuntimeAdapters,
   RuntimeRoots,
 } from "./runtime-truth";
+import { parseNativeGoalMarkdown } from "./native-goal-markdown";
 import { isAllowedWorktree, isForbiddenWorktree } from "./runtime-truth";
 
 /**
@@ -30,7 +31,7 @@ export async function readNativeGoalState(
   const warnings: { source: string; message: string }[] = [];
   const goals: NativeGoalRecord[] = [];
 
-  const statusDirs = ["ready", "running", "done", "failed"] as const;
+  const statusDirs = ["staged", "ready", "running", "done", "failed", "changed_pending_surface_verification"] as const;
   for (const dir of statusDirs) {
     try {
       const entries = await adapters.fs.readdir(path.join(resolvedRoot, "goals", dir));
@@ -47,12 +48,12 @@ export async function readNativeGoalState(
           continue;
         }
 
-        const parsed = parseGoalMarkdown(body);
+        const parsed = parseNativeGoalMarkdown(body);
         if (!parsed) {
           warnings.push({ source: goalPath, message: "malformed native goal file" });
           continue;
         }
-        const { title, repoWorktree, dependencies, hasAcceptanceBlock } = parsed;
+        const { title, repoWorktree, dependencies, hasAcceptance: hasAcceptanceBlock } = parsed;
         const worktreePreflight = repoWorktree ? await preflightWorktreeForGit(repoWorktree, roots, adapters) : null;
         const worktreeAllowed = Boolean(worktreePreflight?.ok);
         if (repoWorktree && !worktreeAllowed) {
@@ -63,13 +64,13 @@ export async function readNativeGoalState(
               : "native worktree path rejected by Mission Control allowed roots; Git was not executed",
           });
         }
-        const blockerIds = dir === "ready"
+        const blockerIds = dir === "ready" || dir === "staged"
           ? await blockedNativeDependencies(resolvedRoot, dependencies, adapters.fs)
           : [];
-        const terminalEvidence = dir === "done" || dir === "failed"
-          ? await readTerminalEvidence(resolvedRoot, goalId, dir === "done", adapters.fs)
+        const terminalEvidence = dir === "done" || dir === "failed" || dir === "changed_pending_surface_verification"
+          ? await readTerminalEvidence(resolvedRoot, goalId, dir, adapters.fs)
           : null;
-        const terminalStatus = terminalEvidence?.status ?? (dir === "ready" ? "ready" : "running");
+        const terminalStatus = terminalEvidence?.status ?? (dir === "staged" ? "staged" : dir === "ready" ? "ready" : "running");
 
         goals.push({
           goal_id: goalId,
@@ -77,7 +78,7 @@ export async function readNativeGoalState(
           status: terminalStatus,
           controller_pid: null,
           controller_lock: null,
-          queue_state: dir === "ready" ? "ready" : dir === "running" ? "running" : "unknown",
+          queue_state: dir === "staged" ? "staged" : dir === "ready" ? "ready" : dir === "running" ? "running" : "unknown",
           stage: hasAcceptanceBlock ? "acceptance" : null,
           last_event_timestamp: null,
           stall_age_ms: null,
@@ -120,45 +121,6 @@ export async function readNativeGoalState(
   return { goals, warnings };
 }
 
-function parseGoalMarkdown(body: string): {
-  title: string | null;
-  repoWorktree: string | null;
-  dependencies: string[];
-  hasAcceptanceBlock: boolean;
-} | null {
-  const lines = body.split("\n");
-  if (lines[0]?.trim() !== "---") return null;
-  let closedFrontmatter = false;
-  let fmBody = "";
-
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i].trim() === "---") {
-      closedFrontmatter = true;
-      break;
-    }
-    fmBody += lines[i] + "\n";
-  }
-  if (!closedFrontmatter) return null;
-
-  const metadata: Record<string, string> = {};
-  for (const line of fmBody.split("\n")) {
-    if (!line.trim() || !line.includes(":")) continue;
-    const [key, ...rest] = line.split(":");
-    metadata[key.trim().toLowerCase()] = rest.join(":").trim();
-  }
-
-  const hasAcceptanceBlock = body.includes("## Acceptance");
-
-  return {
-    title: metadata.title ?? null,
-    repoWorktree: metadata["repo/workdir"] ?? metadata.worktree ?? metadata.repo ?? null,
-    dependencies: metadata.dependencies
-      ? metadata.dependencies.split(",").map((d) => d.trim()).filter(Boolean)
-      : [],
-    hasAcceptanceBlock,
-  };
-}
-
 async function blockedNativeDependencies(
   nativeRoot: string,
   dependencies: string[],
@@ -180,20 +142,24 @@ async function blockedNativeDependencies(
 async function readTerminalEvidence(
   nativeRoot: string,
   goalId: string,
-  expectSuccess: boolean,
+  dir: "done" | "failed" | "changed_pending_surface_verification",
   fsAdapter: FsAdapter,
 ): Promise<{ status: GoalRecord["status"]; source: string; timestamp: string | null; sourceStatus: "ok" | "warning"; note: string }> {
   const resultPath = path.join(nativeRoot, "runs", goalId, "result.json");
   try {
-    const result = JSON.parse(await fsAdapter.readFile(resultPath)) as { goal_id?: unknown; success?: unknown };
+    const result = JSON.parse(await fsAdapter.readFile(resultPath)) as { goal_id?: unknown; success?: unknown; provenance?: unknown; terminal_state?: unknown };
     const timestamp = await sourceTimestamp(fsAdapter, resultPath);
-    if (terminalResultMatches(result, goalId, expectSuccess)) {
+    const expectSuccess = dir === "done";
+    const pendingMatch = dir === "changed_pending_surface_verification"
+      && terminalResultMatches(result, goalId, false)
+      && result.terminal_state === "changed_pending_surface_verification";
+    if (terminalResultMatches(result, goalId, expectSuccess) && (dir !== "changed_pending_surface_verification" || pendingMatch)) {
       return {
-        status: expectSuccess ? "completed" : "failed",
+        status: dir === "done" ? "completed" : dir === "failed" ? "failed" : "changed_pending_surface_verification",
         source: resultPath,
         timestamp,
         sourceStatus: "ok",
-        note: "native-terminal-result",
+        note: result.provenance === "migrated_historical" ? "native-terminal-result:migrated_historical" : "native-terminal-result",
       };
     }
     return {

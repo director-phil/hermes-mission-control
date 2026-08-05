@@ -153,6 +153,50 @@ test("reads native events from JSONL files", async () => {
   assert.equal(result.events[2]?.summary, "Goal completed");
 });
 
+test("reads staged, pending surface, and migrated historical native evidence", async () => {
+  const files: Record<string, string> = {
+    "/runtime/goals/staged/staged-goal.md": `---
+title: Staged Goal
+repo/workdir: /fixture/repo
+dependencies: migrated-parent
+---
+
+Staged goal.
+
+## Acceptance
+
+\`\`\`bash
+exit 0
+\`\`\`
+`,
+    "/runtime/goals/done/migrated-parent.md": nativeGoal("Migrated Parent"),
+    "/runtime/runs/migrated-parent/result.json": JSON.stringify({ goal_id: "migrated-parent", success: true, provenance: "migrated_historical" }),
+    "/runtime/goals/changed_pending_surface_verification/surface-pending.md": nativeGoal("Surface Pending"),
+    "/runtime/runs/surface-pending/result.json": JSON.stringify({ goal_id: "surface-pending", success: false, terminal_state: "changed_pending_surface_verification" }),
+  };
+
+  const roots: RuntimeRoots = {
+    procRoot: "/proc",
+    chatDevRoot: "/fixture/LegacyRuntime",
+    repoRoot: "/fixture/repo",
+    nativeRuntimeRoot: "/runtime",
+    allowedWorktreeRoots: ["/fixture/repo"],
+  };
+
+  const result = await readNativeGoalState(roots, fullAdapters(files));
+  const staged = result.goals.find((goal) => goal.goal_id === "staged-goal");
+  const migrated = result.goals.find((goal) => goal.goal_id === "migrated-parent");
+  const pending = result.goals.find((goal) => goal.goal_id === "surface-pending");
+
+  assert.equal(staged?.status, "staged");
+  assert.equal(staged?.queue_state, "staged");
+  assert.deepEqual(staged?.blocker_ids, []);
+  assert.equal(migrated?.status, "completed");
+  assert.equal(migrated?.sources.some((source) => source.note === "native-terminal-result:migrated_historical"), true);
+  assert.equal(pending?.status, "changed_pending_surface_verification");
+  assert.equal(pending?.sources.some((source) => source.note === "native-terminal-result"), true);
+});
+
 test("standalone native events redact prompts responses secrets and paths", async () => {
   const secret = "sk-nativeSecret123456789";
   const sensitivePath = "/home/phillip_downs/Documents/GitHub/reliable-tradies-ops/private.txt";
@@ -590,6 +634,35 @@ exit 0
   assert.equal(timeline.events.some((event) => event.goal_id === "aaa-blocked" && event.type === "goal.blocked"), true);
   assert.equal(timeline.events.some((event) => event.goal_id === "aaa-blocked" && event.type === "goal.failed"), false);
   assert.equal(timeline.events.some((event) => event.goal_id === "aaa-blocked" && event.type === "goal.completed"), false);
+});
+
+test("native dependency aliases and list forms match runner parsing", async () => {
+  const files: Record<string, string> = {
+    "/native-rt/goals/ready/depends-on-scalar.md": nativeGoal("Depends On Scalar").replace("dependencies:\n", "depends_on: parent-a, parent-b\n"),
+    "/native-rt/goals/ready/dependency-ids-list.md": nativeGoal("Dependency Ids List").replace("dependencies:\n", "dependency_ids:\n  - parent-c\n  - parent-d\n"),
+    "/native-rt/goals/ready/dependencies-inline-list.md": nativeGoal("Dependencies Inline List").replace("dependencies:\n", "dependencies: [parent-e, parent-f]\n"),
+    "/native-rt/goals/done/parent-a.md": nativeGoal("Parent A"),
+    "/native-rt/runs/parent-a/result.json": JSON.stringify({ goal_id: "parent-a", success: true }),
+    "/native-rt/goals/done/parent-c.md": nativeGoal("Parent C"),
+    "/native-rt/runs/parent-c/result.json": JSON.stringify({ goal_id: "parent-c", success: true }),
+    "/native-rt/goals/done/parent-e.md": nativeGoal("Parent E"),
+    "/native-rt/runs/parent-e/result.json": JSON.stringify({ goal_id: "parent-e", success: true }),
+  };
+  const roots: RuntimeRoots = {
+    procRoot: "/fixture/proc",
+    chatDevRoot: "/fixture/LegacyRuntime",
+    repoRoot: "/fixture/repo",
+    nativeRuntimeRoot: "/native-rt",
+    allowedWorktreeRoots: ["/fixture/repo"],
+  };
+
+  const result = await readNativeGoalState(roots, fullAdapters(files));
+  assert.deepEqual(result.goals.find((goal) => goal.goal_id === "depends-on-scalar")?.dependency_ids, ["parent-a", "parent-b"]);
+  assert.deepEqual(result.goals.find((goal) => goal.goal_id === "depends-on-scalar")?.blocker_ids, ["parent-b"]);
+  assert.deepEqual(result.goals.find((goal) => goal.goal_id === "dependency-ids-list")?.dependency_ids, ["parent-c", "parent-d"]);
+  assert.deepEqual(result.goals.find((goal) => goal.goal_id === "dependency-ids-list")?.blocker_ids, ["parent-d"]);
+  assert.deepEqual(result.goals.find((goal) => goal.goal_id === "dependencies-inline-list")?.dependency_ids, ["parent-e", "parent-f"]);
+  assert.deepEqual(result.goals.find((goal) => goal.goal_id === "dependencies-inline-list")?.blocker_ids, ["parent-f"]);
 });
 
 test("native lock PID is surfaced in snapshot", async () => {

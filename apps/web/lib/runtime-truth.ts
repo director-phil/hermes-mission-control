@@ -3,11 +3,12 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { parseNativeGoalMarkdown } from "./native-goal-markdown";
 
 const execFileAsync = promisify(nodeExecFile);
 
 export type EvidenceStatus = "ok" | "unknown" | "warning";
-export type GoalStatus = "unknown" | "ready" | "running" | "completed" | "failed" | "paused" | "blocked";
+export type GoalStatus = "unknown" | "staged" | "ready" | "running" | "completed" | "failed" | "changed_pending_surface_verification" | "paused" | "blocked" | "conflicted";
 export type ProcessRole = "controller" | "wrapper" | "child" | "model_server" | "systemd_service" | "unrelated";
 
 export interface FsAdapter {
@@ -73,7 +74,7 @@ export interface GoalRecord {
   status: GoalStatus;
   controller_pid: number | null;
   controller_lock: ControllerLock | null;
-  queue_state: "unknown" | "ready" | "running" | "paused" | "blocked";
+  queue_state: "unknown" | "staged" | "ready" | "running" | "paused" | "blocked";
   stage: string | null;
   last_event_timestamp: string | null;
   stall_age_ms: number | null;
@@ -112,7 +113,7 @@ export interface RuntimeSnapshot {
   processes: ProcessRecord[];
   services: ServiceRecord[];
   worktrees: WorktreeRecord[];
-  source_warnings: Array<{ source: string; status: "unknown" | "warning"; message: string }>;
+  source_warnings: Array<{ source: string; status: "unknown" | "warning" | "critical"; message: string }>;
 }
 
 type SourceWarning = RuntimeSnapshot["source_warnings"][number];
@@ -129,7 +130,10 @@ const processCgroups = new WeakMap<ProcessRecord, string[]>();
 
 const HOME = os.homedir();
 const LEGACY_EXECUTION_DIR = "Chat" + "Dev";
-export const DEFAULT_FORBIDDEN_WORKTREE_ROOTS = ["/home/phillip_downs/Documents/GitHub/reliable-tradies-ops"];
+export const DEFAULT_FORBIDDEN_WORKTREE_ROOTS = [
+  "/home/phillip_downs/Documents/GitHub/reliable-tradies-ops",
+  "/home/phillip_downs/Documents/GitHub/reliable-tradies-ops-v2",
+];
 export const DEFAULT_ROOTS: RuntimeRoots = {
   procRoot: "/proc",
   chatDevRoot: path.join(HOME, LEGACY_EXECUTION_DIR),
@@ -338,9 +342,9 @@ export async function buildRuntimeSnapshot(
 async function readNativeGoals(roots: RuntimeRoots, adapters: RuntimeAdapters, warnings: SourceWarning[]): Promise<GoalRecord[]> {
   const nativeRoot = roots.nativeRuntimeRoot;
   if (!nativeRoot) return [];
-  const goals: GoalRecord[] = [];
-  const statusDirs = ["ready", "running", "done", "failed"] as const;
-  const queueMap: Record<string, GoalRecord["queue_state"]> = { ready: "ready", running: "running", done: "unknown", failed: "unknown" };
+  const goals: Array<GoalRecord & { native_state_dir: string }> = [];
+  const statusDirs = ["staged", "ready", "running", "done", "failed", "changed_pending_surface_verification"] as const;
+  const queueMap: Record<string, GoalRecord["queue_state"]> = { staged: "staged", ready: "ready", running: "running", done: "unknown", failed: "unknown", changed_pending_surface_verification: "unknown" };
   for (const dir of statusDirs) {
     let entries: string[];
     try {
@@ -377,12 +381,12 @@ async function readNativeGoals(roots: RuntimeRoots, adapters: RuntimeAdapters, w
             : "native worktree path rejected by Mission Control allowed roots; Git was not executed",
         });
       }
-      const blockerIds = dir === "ready"
+      const blockerIds = dir === "ready" || dir === "staged"
         ? await blockedNativeDependencies(nativeRoot, parsed.dependencies, adapters.fs)
         : [];
-      const terminal: NativeTerminalEvidence = dir === "done" || dir === "failed"
-        ? await readNativeTerminalResult(nativeRoot, goalId, adapters.fs, dir === "done")
-        : { status: dir === "ready" ? "ready" : "running", sourceStatus: "ok", source: goalPath, timestamp: null, note: null };
+      const terminal: NativeTerminalEvidence = dir === "done" || dir === "failed" || dir === "changed_pending_surface_verification"
+        ? await readNativeTerminalResult(nativeRoot, goalId, adapters.fs, dir)
+        : { status: dir === "staged" ? "staged" : dir === "ready" ? "ready" : "running", sourceStatus: "ok", source: goalPath, timestamp: null, note: null };
       if (terminal.warning) warnings.push({ source: terminal.source, status: "warning", message: terminal.warning });
       goals.push({
         goal_id: goalId,
@@ -397,6 +401,7 @@ async function readNativeGoals(roots: RuntimeRoots, adapters: RuntimeAdapters, w
         blocker_ids: blockerIds,
         dependency_ids: parsed.dependencies,
         worktree: worktreeValue && worktreeAllowed ? await readWorktree(worktreeValue, adapters, roots) : null,
+        native_state_dir: dir,
         sources: [
           { source: goalPath, timestamp: null, status: "ok", note: "native-runner" },
           ...(terminal.note
@@ -410,26 +415,84 @@ async function readNativeGoals(roots: RuntimeRoots, adapters: RuntimeAdapters, w
       });
     }
   }
-  return goals;
+  return collapseNativeGoalConflicts(goals, nativeRoot, warnings);
+}
+
+function collapseNativeGoalConflicts(
+  goals: Array<GoalRecord & { native_state_dir: string }>,
+  nativeRoot: string,
+  warnings: SourceWarning[],
+): GoalRecord[] {
+  const byId = new Map<string, Array<GoalRecord & { native_state_dir: string }>>();
+  for (const goal of goals) {
+    byId.set(goal.goal_id, [...(byId.get(goal.goal_id) ?? []), goal]);
+  }
+  const collapsed: GoalRecord[] = [];
+  for (const [goalId, records] of byId) {
+    if (records.length === 1) {
+      const { native_state_dir: _stateDir, ...goal } = records[0];
+      collapsed.push(goal);
+      continue;
+    }
+    const conflictSources = records
+      .flatMap((record) => record.sources.filter((source) => source.note === "native-runner").map((source) => ({
+        state: record.native_state_dir,
+        source: source.source,
+      })))
+      .sort((a, b) => a.state.localeCompare(b.state) || a.source.localeCompare(b.source));
+    const states = [...new Set(conflictSources.map((item) => item.state))].sort();
+    const paths = conflictSources.map((item) => path.relative(nativeRoot, item.source));
+    warnings.push({
+      source: path.join(nativeRoot, "goals"),
+      status: "critical",
+      message: `duplicate native goal id ${goalId} across states ${states.join(",")} at ${paths.join(",")}`,
+    });
+    collapsed.push({
+      goal_id: goalId,
+      title: null,
+      status: "conflicted",
+      controller_pid: null,
+      controller_lock: null,
+      queue_state: "unknown",
+      stage: null,
+      last_event_timestamp: null,
+      stall_age_ms: null,
+      blocker_ids: [],
+      dependency_ids: [...new Set(records.flatMap((record) => record.dependency_ids))].sort(),
+      worktree: null,
+      sources: conflictSources.map((item) => ({
+        source: item.source,
+        timestamp: null,
+        status: "warning" as const,
+        note: `native-duplicate-state-conflict:${item.state}`,
+      })),
+    });
+  }
+  return collapsed;
 }
 
 async function readNativeTerminalResult(
   nativeRoot: string,
   goalId: string,
   fsAdapter: FsAdapter,
-  expectSuccess: boolean,
+  dir: "done" | "failed" | "changed_pending_surface_verification",
 ): Promise<NativeTerminalEvidence> {
   const resultPath = path.join(nativeRoot, "runs", goalId, "result.json");
   try {
-    const result = JSON.parse(await fsAdapter.readFile(resultPath)) as { goal_id?: unknown; success?: unknown };
+    const result = JSON.parse(await fsAdapter.readFile(resultPath)) as { goal_id?: unknown; success?: unknown; provenance?: unknown; terminal_state?: unknown };
     const resultTimestamp = await sourceTimestamp(fsAdapter, resultPath);
-    if (terminalResultMatches(result, goalId, expectSuccess)) {
+    const expectSuccess = dir === "done";
+    const pendingMatch = dir === "changed_pending_surface_verification"
+      && terminalResultMatches(result, goalId, false)
+      && result.terminal_state === "changed_pending_surface_verification";
+    if (terminalResultMatches(result, goalId, expectSuccess) && (dir !== "changed_pending_surface_verification" || pendingMatch)) {
+      const migrated = result.provenance === "migrated_historical";
       return {
-        status: expectSuccess ? "completed" : "failed",
+        status: dir === "done" ? "completed" : dir === "failed" ? "failed" : "changed_pending_surface_verification",
         sourceStatus: "ok",
         source: resultPath,
         timestamp: resultTimestamp,
-        note: "native-terminal-result",
+        note: migrated ? "native-terminal-result:migrated_historical" : "native-terminal-result",
       };
     }
     return {
@@ -458,30 +521,6 @@ async function sourceTimestamp(fsAdapter: FsAdapter, source: string): Promise<st
   } catch {
     return null;
   }
-}
-
-function parseNativeGoalMarkdown(body: string): { title: string | null; repoWorktree: string | null; dependencies: string[]; hasAcceptance: boolean } | null {
-  const lines = body.split("\n");
-  let fmFound = false;
-  const fm: Record<string, string> = {};
-  if (lines[0]?.trim() !== "---") return null;
-  for (const line of lines.slice(1)) {
-    if (line.trim() === "---") {
-      fmFound = true;
-      break;
-    }
-    if (line.includes(":")) {
-      const [k, ...v] = line.split(":");
-      fm[k.trim().toLowerCase()] = v.join(":").trim();
-    }
-  }
-  if (!fmFound) return null;
-  return {
-    title: fm.title ?? null,
-    repoWorktree: fm["repo/workdir"] ?? fm.worktree ?? null,
-    dependencies: fm.dependencies ? fm.dependencies.split(",").map((d) => d.trim()).filter(Boolean) : [],
-    hasAcceptance: body.includes("## Acceptance"),
-  };
 }
 
 async function blockedNativeDependencies(
@@ -930,6 +969,7 @@ function classifyProcess(process: ProcessRecord): ProcessRole {
   const argv = redactedArgv(process).join(" ").toLowerCase();
   const name = process.name.toLowerCase();
   if (argv.includes("bridge/escalate.py") && argv.includes(" run ")) return "controller";
+  if (argv.includes("hermes_native_goal_runner.py") || process.service_unit === "hermes-native-goal-runner.service") return "controller";
   if (argv.includes("fastmcp") || argv.includes("mcp-server")) return process.owner_goal_id ? "wrapper" : "wrapper";
   if (name.includes("ollama") || name.includes("vllm") || argv.includes("llama-server")) return "model_server";
   if (process.owner_goal_id && process.ppid > 1) return "child";
@@ -1127,14 +1167,18 @@ function normalizeGoalStatus(value: string | null): GoalStatus {
   if (value === "done" || value === "complete" || value === "completed") return "completed";
   if (value === "fail" || value === "failed" || value === "error") return "failed";
   if (value === "running" || value === "claimed" || value === "in_progress") return "running";
+  if (value === "staged") return "staged";
+  if (value === "changed_pending_surface_verification") return "changed_pending_surface_verification";
   if (value === "ready" || value === "pending") return "ready";
   if (value === "paused") return "paused";
   if (value === "blocked") return "blocked";
+  if (value === "conflicted") return "conflicted";
   return "unknown";
 }
 
 function normalizeQueueState(value: string | null): GoalRecord["queue_state"] {
   if (value === "ready" || value === "waiting") return "ready";
+  if (value === "staged") return "staged";
   if (value === "running" || value === "claimed" || value === "focused") return "running";
   if (value === "paused") return "paused";
   if (value === "blocked") return "blocked";

@@ -29,6 +29,8 @@ export type RuntimeEventType =
   | "review.started"
   | "review.failed"
   | "review.passed"
+  | "shipping.started"
+  | "shipping.failed"
   | "pr.opened"
   | "ci.started"
   | "ci.failed"
@@ -37,6 +39,8 @@ export type RuntimeEventType =
   | "deploy.ready"
   | "browser.verified"
   | "process.orphaned"
+  | "goal.shipped"
+  | "goal.changed_pending_surface_verification"
   | "goal.completed"
   | "goal.failed";
 
@@ -102,6 +106,8 @@ const EVENT_MAP: Record<string, RuntimeEventType> = {
   "review.started": "review.started",
   "review.failed": "review.failed",
   "review.passed": "review.passed",
+  "shipping.started": "shipping.started",
+  "shipping.failed": "shipping.failed",
   "pr.opened": "pr.opened",
   "ci.started": "ci.started",
   "ci.failed": "ci.failed",
@@ -110,6 +116,8 @@ const EVENT_MAP: Record<string, RuntimeEventType> = {
   "deploy.ready": "deploy.ready",
   "browser.verified": "browser.verified",
   "process.orphaned": "process.orphaned",
+  "goal.shipped": "goal.shipped",
+  "goal.changed_pending_surface_verification": "goal.changed_pending_surface_verification",
   "goal.completed": "goal.completed",
   "goal.failed": "goal.failed",
   created: "goal.created",
@@ -172,11 +180,12 @@ export function buildRuntimeAlerts(snapshot: RuntimeSnapshot, timeline: Timeline
   const livePids = new Set(snapshot.processes.map((process) => process.pid));
 
   for (const warning of snapshot.source_warnings) {
+    const severity = warning.status === "critical" ? "critical" : "warning";
     alerts.push({
       id: `source:${sanitizeEventText(warning.source)}`,
       goal_id: null,
-      severity: "warning",
-      title: "Runtime source unknown",
+      severity,
+      title: severity === "critical" ? "Runtime integrity failure" : "Runtime source unknown",
       message: sanitizeEventText(warning.message),
       evidence: sanitizeEventText(warning.source),
       source_timestamp: null,
@@ -197,6 +206,9 @@ export function buildRuntimeAlerts(snapshot: RuntimeSnapshot, timeline: Timeline
     }
     if (goal.controller_lock?.pid && goal.controller_pid && goal.controller_lock.pid !== goal.controller_pid) {
       alerts.push(goalAlert(goal, "critical", "Controller source disagreement", `goal state PID ${goal.controller_pid} disagrees with lock PID ${goal.controller_lock.pid}.`, "Inspect both cited sources before changing queue state."));
+    }
+    if (goal.status === "conflicted") {
+      alerts.push(goalAlert(goal, "critical", "Duplicate native goal ID", "Native state contains the same goal ID in multiple state directories.", "Quarantine duplicate native state before trusting counts or dispatching work."));
     }
     if ((goal.status === "completed" || goal.status === "failed") && goal.worktree?.dirty) {
       alerts.push(goalAlert(goal, "warning", "Terminal goal has dirty worktree", `${goal.worktree.path} has uncommitted Git changes.`, "Inspect git status for the cited worktree."));

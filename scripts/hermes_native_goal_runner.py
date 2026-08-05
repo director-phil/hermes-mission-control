@@ -10,10 +10,14 @@ every lifecycle and failure path without real model/network calls.
 """
 
 import argparse
+import ctypes
+from concurrent.futures import ThreadPoolExecutor
+import errno
 import hashlib
 import json
 import os
 import re
+import shutil
 import stat as stat_module
 import subprocess
 import sys
@@ -26,10 +30,23 @@ from typing import Any, Callable, Protocol
 HOME = os.path.expanduser("~")
 DEFAULT_NATIVE_ROOT = Path(HOME) / ".hermes" / "mission-control" / "runtime"
 DEFAULT_ALLOWED_WORKTREE_ROOTS = [Path(HOME) / ".hermes" / "mission-control-worktrees"]
-FORBIDDEN_WORKTREE_ROOTS = [Path(HOME) / "Documents" / "GitHub" / "reliable-tradies-ops"]
+EXPECTED_CANONICAL_REPO_URL = "https://github.com/director-phil/rt-ops-v2.git"
+DEFAULT_CANONICAL_REPO = Path(HOME) / ".hermes" / "mission-control-source" / "rt-ops-v2"
+PRIMARY_V2_WIP_CHECKOUT = Path(HOME) / "Documents" / "GitHub" / "reliable-tradies-ops-v2"
+FORBIDDEN_WORKTREE_ROOTS = [
+    Path(HOME) / "Documents" / "GitHub" / "reliable-tradies-ops",
+    PRIMARY_V2_WIP_CHECKOUT,
+]
+DEFAULT_WORKTREE_ROOT = Path(HOME) / ".hermes" / "mission-control-worktrees"
 MAX_GOAL_CONTRACT_BYTES = 16_384
 MAX_COMPLETE_PROMPT_BYTES = 32_768
 MAX_MARKER_STDOUT_BYTES = 4_096
+MAX_MIGRATION_FILES = 500
+MAX_MIGRATION_FILE_BYTES = 128_000
+MAX_MIGRATION_TOTAL_BYTES = 4_000_000
+MIGRATED_HISTORICAL_PROVENANCE = "migrated_historical"
+PENDING_SURFACE_STATE = "changed_pending_surface_verification"
+SHIPPING_SUCCESS_STATE = "shipped"
 
 # Contract markers - exact strings required by controller
 PLAN_APPROVED_MARKER = "PLAN_APPROVED"
@@ -51,7 +68,34 @@ STAGE_SOURCES = {
     "code": "mission-control-goal-code",
     "review": "mission-control-goal-review",
 }
-LOCAL_IMPLEMENTATION_FORBIDDEN_PROFILES = {"coder", "reviewer"}
+CODEX_STAGE_PROVIDERS = {"openai-codex"}
+TERMINAL_DIRS = {"done", "failed", PENDING_SURFACE_STATE}
+NATIVE_GOAL_STATE_DIRS = ("staged", "ready", "running", "done", "failed", PENDING_SURFACE_STATE)
+SHIPPING_FORBIDDEN_MARKERS = ("FAILED", "NOT verified", "NOT VERIFIED")
+DEPLOYMENT_FORBIDDEN_MARKERS = ("FAILED", "ERROR", "Error:", "Command failed", "NOT verified", "NOT VERIFIED")
+CONTROLLER_GIT_DIR = Path(tempfile.gettempdir()) / "hermes-native-controller-git"
+CONTROL_PLANE_ALLOWED_REMOTE_FETCH = "+refs/heads/*:refs/remotes/origin/*"
+CONTROL_PLANE_FORBIDDEN_CONFIG_PREFIXES = (
+    "alias.",
+    "credential.",
+    "include.",
+    "includeif.",
+    "protocol.",
+    "safe.",
+    "ssh.",
+    "url.",
+)
+CONTROL_PLANE_FORBIDDEN_CONFIG_KEYS = {
+    "core.askpass",
+    "core.hookspath",
+    "core.sshcommand",
+    "http.proxy",
+    "https.proxy",
+    "remote.origin.proxy",
+    "remote.origin.pushurl",
+    "remote.origin.receivepack",
+    "remote.origin.uploadpack",
+}
 
 
 class TerminalMoveError(RuntimeError):
@@ -155,6 +199,14 @@ def path_within_path_only(path_value: Path, root_value: Path) -> bool:
         return False
 
 
+def path_in_forbidden_roots_path_only(path_value: Path) -> bool:
+    return any(path_within_path_only(path_value, forbidden) for forbidden in FORBIDDEN_WORKTREE_ROOTS)
+
+
+def path_in_forbidden_roots(path_value: Path) -> bool:
+    return any(path_within(path_value, forbidden) for forbidden in FORBIDDEN_WORKTREE_ROOTS)
+
+
 def validate_goal_worktree(
     worktree: Path,
     native_root: Path,
@@ -184,8 +236,8 @@ def validate_goal_worktree(
     if not resolved.exists() or not resolved.is_dir():
         return False, "worktree path does not exist or is not a directory"
     git_check = subprocess_adapter.run_command(
-        cmd=["git", "rev-parse", "--is-inside-work-tree"],
-        cwd=str(resolved), timeout=30, env=None, capture=True,
+        cmd=controller_git_cmd(["rev-parse", "--is-inside-work-tree"]),
+        cwd=str(resolved), timeout=30, env=_git_read_env(), capture=True,
     )
     if git_check.returncode != 0 or git_check.stdout.strip() != "true":
         return False, "worktree path is not a Git worktree"
@@ -273,6 +325,31 @@ def atomic_write_json(target: Path, data: dict) -> None:
     fsync_dir(target.parent)
 
 
+def exclusive_write_bytes(target: Path, payload: bytes) -> None:
+    """Create target with O_EXCL and fsync; raises FileExistsError on collision."""
+    ensure_dir_durable(target.parent)
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    fsync_dir(target.parent)
+
+
+def exclusive_write_text(target: Path, content: str) -> None:
+    exclusive_write_bytes(target, content.encode("utf-8"))
+
+
+def exclusive_write_json(target: Path, data: dict) -> None:
+    exclusive_write_bytes(target, json.dumps(data, indent=2).encode("utf-8"))
+
+
+def exclusive_append_jsonl(path: Path, record: dict) -> None:
+    line = json.dumps(record, separators=(",", ":")) + "\n"
+    exclusive_write_bytes(path, line.encode("utf-8"))
+
+
 def append_jsonl(path: Path, record: dict) -> None:
     """Append one JSONL line with fsync."""
     ensure_dir_durable(path.parent)
@@ -284,6 +361,238 @@ def append_jsonl(path: Path, record: dict) -> None:
     finally:
         os.close(fd)
     fsync_dir(path.parent)
+
+
+def realpath_no_symlink(path_value: Path, must_exist: bool = True) -> Path:
+    """Resolve a path and reject symlinks in every existing component."""
+    expanded = Path(os.path.abspath(os.path.expanduser(os.fspath(path_value))))
+    if must_exist and not expanded.exists():
+        raise ValueError(f"path does not exist: {expanded}")
+    current = Path(expanded.anchor) if expanded.is_absolute() else Path(".")
+    parts = expanded.parts[1:] if expanded.is_absolute() else expanded.parts
+    for part in parts:
+        current = current / part
+        if current.exists() and current.is_symlink():
+            raise ValueError(f"symlink rejected: {current}")
+    return expanded.resolve(strict=must_exist)
+
+
+def reject_symlink_ancestors_under(root: Path, target: Path) -> None:
+    """Reject target when any existing component from root down is a symlink."""
+    root_abs = path_only_absolute(root)
+    target_abs = path_only_absolute(target)
+    try:
+        relative = target_abs.relative_to(root_abs)
+    except ValueError as exc:
+        raise ValueError("checkout path is outside worktree root") from exc
+    current = root_abs
+    for part in relative.parts:
+        current = current / part
+        try:
+            st = os.lstat(current)
+        except FileNotFoundError:
+            continue
+        if stat_module.S_ISLNK(st.st_mode):
+            raise ValueError(f"symlink rejected: {current}")
+
+
+def validate_checkout_path_candidate(root: Path, candidate: Path, *, must_not_exist: bool) -> Path:
+    """Validate a final/temp checkout path before running Git against it."""
+    root_abs = path_only_absolute(root)
+    candidate_abs = path_only_absolute(candidate)
+    try:
+        candidate_abs.relative_to(root_abs)
+    except ValueError:
+        raise ValueError("checkout path is outside worktree root")
+    if candidate_abs == root_abs:
+        raise ValueError("checkout path must be below worktree root")
+    if path_in_forbidden_roots_path_only(candidate_abs):
+        raise ValueError("checkout path is forbidden")
+    reject_symlink_ancestors_under(root_abs, candidate_abs)
+    if must_not_exist:
+        try:
+            os.lstat(candidate_abs)
+            raise ValueError("checkout path already exists")
+        except FileNotFoundError:
+            pass
+    try:
+        resolved = candidate_abs.resolve(strict=not must_not_exist)
+    except FileNotFoundError:
+        resolved = candidate_abs.resolve(strict=False)
+    if not path_within_path_only(resolved, root_abs):
+        raise ValueError("checkout path resolves outside worktree root")
+    if path_in_forbidden_roots_path_only(resolved):
+        raise ValueError("checkout path resolves to forbidden root")
+    if not must_not_exist and not candidate_abs.is_dir():
+        raise ValueError("checkout path is not a directory")
+    return candidate_abs
+
+
+def validate_checkout_path_after_create(root: Path, candidate: Path) -> Path:
+    """Validate an existing checkout path after clone/rename before more Git commands."""
+    validated = validate_checkout_path_candidate(root, candidate, must_not_exist=False)
+    reject_symlink_ancestors_under(root, validated)
+    if validated.is_symlink():
+        raise ValueError("checkout path is a symlink")
+    real = validated.resolve(strict=True)
+    if not path_within_path_only(real, root):
+        raise ValueError("checkout path resolves outside worktree root")
+    if path_in_forbidden_roots_path_only(real):
+        raise ValueError("checkout path resolves to forbidden root")
+    return validated
+
+
+def fail_if_checkout_temp_leftovers(root: Path, dest: Path) -> None:
+    prefix = f".{dest.name}.tmp-"
+    try:
+        children = list(root.iterdir())
+    except OSError as exc:
+        raise ValueError("checkout root cannot be scanned") from exc
+    for child in children:
+        if child.name.startswith(prefix):
+            raise ValueError("checkout temp directory already exists")
+
+
+def path_identity(path_value: Path) -> tuple[int, int]:
+    st = os.lstat(path_value)
+    return st.st_dev, st.st_ino
+
+
+def cleanup_owned_checkout_temp(root: Path, temp_dir: Path, identity: tuple[int, int]) -> tuple[bool, str]:
+    """Remove only the exact temp directory created by this attempt."""
+    root_abs = path_only_absolute(root)
+    temp_abs = path_only_absolute(temp_dir)
+    try:
+        temp_abs.relative_to(root_abs)
+    except ValueError:
+        return False, "checkout temp containment failure"
+    try:
+        st = os.lstat(temp_abs)
+    except FileNotFoundError:
+        fsync_dir(root_abs)
+        return True, ""
+    if stat_module.S_ISLNK(st.st_mode) or not stat_module.S_ISDIR(st.st_mode):
+        return False, "checkout temp containment failure"
+    if (st.st_dev, st.st_ino) != identity:
+        return False, "checkout temp containment failure"
+    try:
+        shutil.rmtree(temp_abs)
+        fsync_dir(root_abs)
+        return True, ""
+    except OSError as exc:
+        return False, f"checkout temp cleanup failed:{exc.errno}"
+
+
+def atomic_rename_no_replace(src: Path, dst: Path) -> None:
+    """Atomically rename src to dst without replacing an existing destination."""
+    if sys.platform.startswith("linux"):
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is not None:
+            renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+            renameat2.restype = ctypes.c_int
+            # AT_FDCWD = -100; RENAME_NOREPLACE = 1.
+            result = renameat2(-100, os.fsencode(src), -100, os.fsencode(dst), 1)
+            if result == 0:
+                return
+            err = ctypes.get_errno()
+            if err == errno.EEXIST:
+                raise FileExistsError(os.fspath(dst))
+            if err not in (errno.ENOSYS, errno.EINVAL):
+                raise OSError(err, os.strerror(err), os.fspath(dst))
+    if dst.exists() or dst.is_symlink():
+        raise FileExistsError(os.fspath(dst))
+    os.rename(src, dst)
+
+
+def validate_canonical_repo_path(
+    canonical_repo: Path,
+    expected_origin: str,
+    subprocess_adapter: SubprocessAdapter,
+    configured_canonical_repo: Path | None = None,
+) -> tuple[bool, str, Path | None]:
+    """Validate the explicitly allowed canonical source checkout without mutating it."""
+    if expected_origin != EXPECTED_CANONICAL_REPO_URL:
+        return False, "canonical repo expected origin is not the configured V2 origin", None
+    try:
+        resolved = realpath_no_symlink(canonical_repo)
+        configured_resolved = realpath_no_symlink(configured_canonical_repo or DEFAULT_CANONICAL_REPO)
+    except ValueError as exc:
+        return False, str(exc), None
+    if resolved != configured_resolved:
+        return False, "canonical repo path mismatch", None
+    if path_in_forbidden_roots_path_only(resolved):
+        return False, "canonical repo path is forbidden", None
+    remote = subprocess_adapter.run_command(
+        controller_git_cmd(["remote", "get-url", "origin"]),
+        cwd=str(resolved),
+        timeout=30,
+        env=_git_read_env(),
+        capture=True,
+    )
+    if remote.returncode != 0 or remote.stdout.strip() != expected_origin:
+        return False, "canonical repo origin mismatch", None
+    dirty = subprocess_adapter.run_command(
+        controller_git_cmd(["status", "--porcelain=v1"]),
+        cwd=str(resolved),
+        timeout=30,
+        env=_git_read_env(),
+        capture=True,
+    )
+    if dirty.returncode != 0:
+        return False, "canonical repo status unreadable", None
+    if dirty.stdout.strip():
+        return False, "canonical repo dirty", None
+    return True, "", resolved
+
+
+def migration_report_path(native_root: Path) -> Path:
+    return native_root / "migration-report.json"
+
+
+def native_id_collision_locations(native_root: Path, goal_id: str, owned_run_dir: Path | None = None) -> list[str]:
+    """Return deterministic native authority locations for goal_id without reading contents."""
+    locations: list[str] = []
+    for dir_name in NATIVE_GOAL_STATE_DIRS:
+        goal_path = native_root / "goals" / dir_name / f"{goal_id}.md"
+        if goal_path.exists():
+            locations.append(str(goal_path))
+    run_dir = native_root / "runs" / goal_id
+    if run_dir.exists() and (owned_run_dir is None or run_dir != owned_run_dir):
+        locations.append(str(run_dir))
+    return sorted(locations)
+
+
+def relative_collision_locations(native_root: Path, locations: list[str]) -> list[str]:
+    rels: list[str] = []
+    for location in locations:
+        try:
+            rels.append(str(Path(location).relative_to(native_root)))
+        except ValueError:
+            rels.append(location)
+    return sorted(rels)
+
+
+def add_migration_collision(report: dict[str, Any], native_root: Path, goal_id: str, locations: list[str], reason: str = "native_id_collision") -> None:
+    report.setdefault("collisions", []).append({
+        "goal_id": goal_id,
+        "locations": relative_collision_locations(native_root, locations),
+        "reason": reason,
+    })
+
+
+def atomic_move_file(src: Path, dst: Path) -> None:
+    ensure_dir_durable(dst.parent)
+    os.replace(str(src), str(dst))
+    fsync_dir(src.parent)
+    fsync_dir(dst.parent)
+
+
+def read_bounded_text(path_value: Path, max_bytes: int) -> str:
+    st = path_value.stat()
+    if st.st_size > max_bytes:
+        raise ValueError("file exceeds byte bound")
+    return path_value.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -491,17 +800,79 @@ def recover_orphan_running_goals(native_root: Path) -> None:
 # Goal markdown parsing
 # ---------------------------------------------------------------------------
 
-def parse_goal_markdown(content: str) -> dict:
+def parse_frontmatter_fields(fm_lines: list[str]) -> dict[str, Any]:
     """
-    Parse goal markdown to extract frontmatter fields, allowed_files, and acceptance body.
-    Preserves the fenced bash body byte-for-byte.
-    Fails if required fields or acceptance block are absent.
+    Parse a bounded YAML-frontmatter subset used by legacy/native ledgers.
+    Supports scalar keys and block lists only; values are metadata, not code.
     """
-    lines = content.split("\n")
+    metadata: dict[str, Any] = {}
+    current_key: str | None = None
+    for raw_line in fm_lines:
+        line = raw_line.rstrip("\r")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line.startswith((" ", "\t")) and current_key and line.strip().startswith("- "):
+            existing = metadata.get(current_key)
+            if not isinstance(existing, list):
+                existing = []
+                metadata[current_key] = existing
+            existing.append(clean_yaml_scalar(line.strip()[2:].strip()))
+            continue
+        current_key = None
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        clean_key = key.strip()
+        clean_value = value.strip()
+        if not clean_key:
+            continue
+        current_key = clean_key
+        if clean_value == "":
+            metadata[clean_key] = []
+        elif clean_value.startswith("[") and clean_value.endswith("]"):
+            inner = clean_value[1:-1].strip()
+            metadata[clean_key] = [clean_yaml_scalar(item.strip()) for item in inner.split(",") if item.strip()]
+        else:
+            metadata[clean_key] = clean_yaml_scalar(clean_value)
+    return metadata
 
+
+def clean_yaml_scalar(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def metadata_string(metadata: dict[str, Any], *keys: str) -> str:
+    lowered = {key.lower(): value for key, value in metadata.items()}
+    for key in keys:
+        value = lowered.get(key.lower())
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def metadata_list(metadata: dict[str, Any], *keys: str) -> list[str]:
+    lowered = {key.lower(): value for key, value in metadata.items()}
+    values: list[str] = []
+    for key in keys:
+        value = lowered.get(key.lower())
+        if isinstance(value, list):
+            values.extend(str(item).strip() for item in value if str(item).strip())
+        elif isinstance(value, str):
+            values.extend(item.strip() for item in value.split(",") if item.strip())
+    return values
+
+
+def metadata_bool(metadata: dict[str, Any], *keys: str) -> bool:
+    value = metadata_string(metadata, *keys).strip().lower()
+    return value in {"1", "true", "yes", "y", "hard_stop"}
+
+
+def split_goal_frontmatter(content: str) -> tuple[list[str], str, int]:
+    lines = content.split("\n")
     if not lines or lines[0].strip() != "---":
         raise ValueError("goal missing opening frontmatter fence")
-
     fm_lines: list[str] = []
     fm_end: int | None = None
     for i, line in enumerate(lines[1:], start=1):
@@ -509,18 +880,10 @@ def parse_goal_markdown(content: str) -> dict:
             fm_end = i
             break
         fm_lines.append(line)
-
     if fm_end is None:
         raise ValueError("goal missing closing frontmatter fence")
-
-    metadata: dict[str, str] = {}
-    for fm_line in fm_lines:
-        if ":" in fm_line:
-            key, value = fm_line.split(":", 1)
-            metadata[key.strip()] = value.strip()
-
-    body_start_offset = 0
     offset = 0
+    body_start_offset = 0
     for i, line in enumerate(lines):
         offset += len(line)
         if i < len(lines) - 1:
@@ -528,12 +891,27 @@ def parse_goal_markdown(content: str) -> dict:
         if i == fm_end:
             body_start_offset = offset
             break
-    body = content[body_start_offset:].strip()
+    return fm_lines, content[body_start_offset:].strip(), fm_end
+
+
+def parse_goal_markdown(content: str) -> dict:
+    """
+    Parse goal markdown to extract frontmatter fields, allowed_files, and acceptance body.
+    Preserves the fenced bash body byte-for-byte.
+    Fails if required fields or acceptance block are absent.
+    """
+    lines = content.split("\n")
+    fm_lines, body, _ = split_goal_frontmatter(content)
+    metadata = parse_frontmatter_fields(fm_lines)
 
     goal_data: dict[str, Any] = {
-        "title": metadata.get("title", ""),
-        "repo_worktree": metadata.get("repo/workdir", metadata.get("worktree", "")),
-        "dependencies": [d.strip() for d in metadata.get("dependencies", "").split(",") if d.strip()],
+        "title": metadata_string(metadata, "title"),
+        "repo_worktree": metadata_string(metadata, "repo/workdir", "worktree"),
+        "dependencies": metadata_list(metadata, "dependencies", "depends_on", "dependency_ids"),
+        "hard_stop": metadata_bool(metadata, "hard_stop"),
+        "branch_kind": metadata_string(metadata, "branch_kind") or "feat",
+        "vercel_impact": metadata_bool(metadata, "vercel_impact", "vercel"),
+        "surface_verification": metadata_bool(metadata, "surface_verification", "surface_verified"),
         "goal_contract": body,
     }
 
@@ -554,11 +932,10 @@ def parse_goal_markdown(content: str) -> dict:
                 allowed_files.append(path_part)
 
     # Also check for allowed_files in frontmatter
-    if "allowed_files" in metadata:
-        for f in metadata["allowed_files"].split(","):
-            f = f.strip().strip("`")
-            if f:
-                allowed_files.append(f)
+    for f in metadata_list(metadata, "allowed_files", "allowed"):
+        f = f.strip().strip("`")
+        if f:
+            allowed_files.append(f)
 
     goal_data["allowed_files"] = allowed_files
 
@@ -703,6 +1080,478 @@ def dependency_satisfied(native_root: Path, dep_id: str) -> bool:
     )
 
 
+def hard_stop_blocked(goal_data: dict[str, Any]) -> bool:
+    return bool(goal_data.get("hard_stop"))
+
+
+def neutral_branch_name(goal_id: str, branch_kind: str) -> str:
+    prefix = "fix" if branch_kind == "fix" else "feat"
+    clean_id = bounded_identifier(goal_id.lower(), "goal", max_len=80)
+    return f"{prefix}/native-{clean_id}"
+
+
+def checkout_path_for_goal(worktree_root: Path, goal_id: str) -> Path:
+    return worktree_root / bounded_identifier(goal_id.lower(), "goal", max_len=96)
+
+
+def validate_worktree_root(worktree_root: Path) -> tuple[bool, str, Path | None]:
+    try:
+        resolved = realpath_no_symlink(worktree_root, must_exist=False)
+    except ValueError as exc:
+        return False, str(exc), None
+    if not any(path_within_path_only(resolved, allowed) or path_only_absolute(resolved) == path_only_absolute(allowed) for allowed in allowed_worktree_roots()):
+        return False, "worktree root is outside allowed roots", None
+    for forbidden in FORBIDDEN_WORKTREE_ROOTS:
+        if path_within_path_only(resolved, forbidden):
+            return False, "worktree root is forbidden", None
+    return True, "", resolved
+
+
+def prepare_isolated_checkout(
+    goal_id: str,
+    branch_kind: str,
+    canonical_repo: Path,
+    expected_origin: str,
+    worktree_root: Path,
+    subprocess_adapter: SubprocessAdapter,
+    configured_canonical_repo: Path | None = None,
+) -> tuple[bool, dict[str, Any]]:
+    """Create a fresh isolated checkout from origin/main for one promoted goal."""
+    root_ok, root_reason, resolved_root = validate_worktree_root(worktree_root)
+    if not root_ok or resolved_root is None:
+        return False, {"reason": root_reason}
+    ensure_dir_durable(resolved_root)
+    root_ok, root_reason, resolved_root = validate_worktree_root(resolved_root)
+    if not root_ok or resolved_root is None:
+        return False, {"reason": root_reason}
+    dest = checkout_path_for_goal(resolved_root, goal_id)
+    try:
+        dest = validate_checkout_path_candidate(resolved_root, dest, must_not_exist=True)
+        fail_if_checkout_temp_leftovers(resolved_root, dest)
+    except ValueError as exc:
+        return False, {"reason": str(exc), "path_hash": hashlib.sha256(str(dest).encode()).hexdigest()}
+
+    canonical_ok, canonical_reason, canonical_resolved = validate_canonical_repo_path(
+        canonical_repo,
+        expected_origin,
+        subprocess_adapter,
+        configured_canonical_repo=configured_canonical_repo,
+    )
+    if not canonical_ok or canonical_resolved is None:
+        return False, {"reason": canonical_reason}
+
+    temp_dir = Path(tempfile.mkdtemp(prefix=f".{dest.name}.tmp-", dir=resolved_root))
+    temp_identity = path_identity(temp_dir)
+    temp_published = False
+
+    def fail_after_temp(metadata: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        if not temp_published:
+            cleaned, cleanup_reason = cleanup_owned_checkout_temp(resolved_root, temp_dir, temp_identity)
+            metadata["temp_cleanup"] = "removed" if cleaned else "skipped"
+            if cleanup_reason:
+                metadata["cleanup_reason"] = cleanup_reason
+                if cleanup_reason == "checkout temp containment failure":
+                    metadata["reason"] = cleanup_reason
+        return False, metadata
+
+    try:
+        temp_dir = validate_checkout_path_candidate(resolved_root, temp_dir, must_not_exist=False)
+    except ValueError as exc:
+        return fail_after_temp({"reason": str(exc)})
+
+    clone = subprocess_adapter.run_command(
+        controller_git_cmd(["clone", "--origin", "origin", expected_origin, str(temp_dir)]),
+        cwd=str(resolved_root),
+        timeout=600,
+        env=_controller_git_env("0"),
+        capture=True,
+    )
+    if clone.returncode != 0:
+        return fail_after_temp({"reason": "clone failed", "exit_code": clone.returncode})
+    try:
+        validate_checkout_path_after_create(resolved_root, temp_dir)
+        validate_checkout_path_candidate(resolved_root, dest, must_not_exist=True)
+    except ValueError as exc:
+        return fail_after_temp({"reason": str(exc)})
+
+    hooks_ok, hooks_reason = empty_hooks_dir_for_fresh_checkout(temp_dir / ".git")
+    if not hooks_ok:
+        return fail_after_temp({"reason": hooks_reason})
+
+    remote = subprocess_adapter.run_command(controller_git_cmd(["remote", "get-url", "origin"]), str(temp_dir), 30, _git_read_env(), True)
+    if remote.returncode != 0 or remote.stdout.strip() != expected_origin:
+        return fail_after_temp({"reason": "checkout origin mismatch"})
+    pre_fetch_control = collect_git_control_plane(temp_dir, expected_origin, subprocess_adapter)
+    if not pre_fetch_control.get("passed"):
+        return fail_after_temp({"reason": pre_fetch_control.get("reason", "control plane invalid")})
+    fetch = subprocess_adapter.run_command(controller_git_cmd(["fetch", "origin", "main"]), str(temp_dir), 300, _controller_git_env("0"), True)
+    if fetch.returncode != 0:
+        return fail_after_temp({"reason": "origin main fetch failed", "exit_code": fetch.returncode})
+    branch = neutral_branch_name(goal_id, branch_kind)
+    post_fetch_control = verify_git_control_plane(temp_dir, expected_origin, subprocess_adapter, pre_fetch_control, "fresh_checkout_after_fetch")
+    if not post_fetch_control.get("passed"):
+        return fail_after_temp({"reason": post_fetch_control.get("reason", "control plane changed")})
+    checkout = subprocess_adapter.run_command(controller_git_cmd(["checkout", "-B", branch, "origin/main"]), str(temp_dir), 120, _controller_git_env("0"), True)
+    if checkout.returncode != 0:
+        return fail_after_temp({"reason": "branch checkout failed", "exit_code": checkout.returncode})
+    post_checkout_control = verify_git_control_plane(temp_dir, expected_origin, subprocess_adapter, pre_fetch_control, "fresh_checkout_after_branch")
+    if not post_checkout_control.get("passed"):
+        return fail_after_temp({"reason": post_checkout_control.get("reason", "control plane changed")})
+    clean = subprocess_adapter.run_command(controller_git_cmd(["status", "--porcelain=v1", "--untracked-files=all"]), str(temp_dir), 30, _git_read_env(), True)
+    if clean.returncode != 0 or clean.stdout.strip():
+        return fail_after_temp({"reason": "fresh checkout is dirty"})
+    ignored = subprocess_adapter.run_command(controller_git_cmd(["status", "--ignored", "--porcelain=v1"]), str(temp_dir), 30, _git_read_env(), True)
+    if ignored.returncode != 0:
+        return fail_after_temp({"reason": "fresh checkout ignored status unreadable"})
+    if ignored.stdout.strip():
+        return fail_after_temp({"reason": "fresh checkout has ignored artifacts"})
+    head = subprocess_adapter.run_command(controller_git_cmd(["rev-parse", "HEAD"]), str(temp_dir), 30, _git_read_env(), True)
+    if head.returncode != 0:
+        return fail_after_temp({"reason": "checkout head unreadable"})
+    final_control = verify_git_control_plane(temp_dir, expected_origin, subprocess_adapter, pre_fetch_control, "fresh_checkout_before_publish")
+    if not final_control.get("passed"):
+        return fail_after_temp({"reason": final_control.get("reason", "control plane changed")})
+    try:
+        validate_checkout_path_after_create(resolved_root, temp_dir)
+        validate_checkout_path_candidate(resolved_root, dest, must_not_exist=True)
+        atomic_rename_no_replace(temp_dir, dest)
+        temp_published = True
+        validate_checkout_path_after_create(resolved_root, dest)
+    except (OSError, ValueError) as exc:
+        return fail_after_temp({"reason": f"checkout publish failed: {type(exc).__name__}"})
+    fsync_dir(resolved_root)
+    return True, {
+        "path": str(dest),
+        "branch": branch,
+        "base_ref": "origin/main",
+        "base_sha": head.stdout.strip(),
+    }
+
+
+def replace_frontmatter_value(content: str, key: str, value: str) -> str:
+    fm_lines, body, _ = split_goal_frontmatter(content)
+    replaced = False
+    new_lines: list[str] = ["---"]
+    for line in fm_lines:
+        if line.split(":", 1)[0].strip() == key:
+            new_lines.append(f"{key}: {value}")
+            replaced = True
+        else:
+            new_lines.append(line)
+    if not replaced:
+        new_lines.append(f"{key}: {value}")
+    new_lines.append("---")
+    return "\n".join(new_lines) + "\n\n" + body.strip() + "\n"
+
+
+def proc_start_ticks_match(pid: int, expected_ticks: int) -> bool:
+    if not isinstance(pid, int) or pid <= 0 or not isinstance(expected_ticks, int) or expected_ticks <= 0:
+        return False
+    stat_path = Path("/proc") / str(pid) / "stat"
+    if not stat_path.exists():
+        return False
+    try:
+        _, actual_ticks = parse_proc_stat(stat_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return actual_ticks == expected_ticks
+
+
+def create_promotion_lock(native_root: Path, purpose: str = "promote-staged-goal") -> dict[str, Any] | None:
+    lock_path = native_root / "promotion.lock"
+    pid = os.getpid()
+    start_ticks = get_process_start_ticks(pid)
+    if not isinstance(start_ticks, int) or start_ticks <= 0:
+        return None
+    if lock_path.exists():
+        try:
+            data = json.loads(lock_path.read_text(encoding="utf-8"))
+        except Exception:
+            log_controller_warning_once(
+                native_root,
+                "Native promotion lock invalid or unreadable; promotion blocked fail-closed",
+                {"lock_path": str(lock_path), "lock_invalid": True, "content_recorded": False},
+                f"promotion-lock-invalid:{lock_warning_identity(lock_path)}",
+            )
+            return None
+        holder_pid = data.get("pid")
+        holder_ticks = data.get("proc_start_ticks")
+        if proc_start_ticks_match(holder_pid, holder_ticks):
+            return None
+        if not isinstance(holder_pid, int) or holder_pid <= 0 or not isinstance(holder_ticks, int) or holder_ticks <= 0:
+            log_controller_warning_once(
+                native_root,
+                "Native promotion lock invalid; promotion blocked fail-closed",
+                {
+                    "lock_path": str(lock_path),
+                    "pid_valid": isinstance(holder_pid, int) and holder_pid > 0,
+                    "proc_start_ticks_valid": isinstance(holder_ticks, int) and holder_ticks > 0,
+                    "lock_invalid": True,
+                    "content_recorded": False,
+                },
+                f"promotion-lock-invalid:{lock_warning_identity(lock_path)}",
+            )
+            return None
+        lock_path.unlink(missing_ok=True)
+        fsync_dir(lock_path.parent)
+        log_event(
+            native_root / "controller-events.jsonl",
+            "integrity.recovered",
+            "Recovered stale native promotion lock",
+            {"pid": holder_pid, "proc_start_ticks": holder_ticks, "purpose": data.get("purpose"), "recovery": True},
+        )
+    owner = {
+        "pid": pid,
+        "proc_start_ticks": start_ticks,
+        "created_at": datetime.now(UTC).isoformat(),
+        "purpose": purpose,
+    }
+    payload = json.dumps(owner).encode("utf-8")
+    try:
+        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return None
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    fsync_dir(lock_path.parent)
+    return owner
+
+
+def cleanup_promotion_lock(native_root: Path, owner: dict[str, Any] | None = None) -> None:
+    lock_path = native_root / "promotion.lock"
+    try:
+        if owner is not None:
+            data = json.loads(lock_path.read_text(encoding="utf-8"))
+            if data.get("pid") != owner.get("pid") or data.get("proc_start_ticks") != owner.get("proc_start_ticks"):
+                return
+        lock_path.unlink(missing_ok=True)
+        fsync_dir(lock_path.parent)
+    except Exception:
+        pass
+
+
+def active_ready_or_running_goal_exists(native_root: Path) -> bool:
+    """Return True when ready/running already contains a goal, or fail closed on malformed authority."""
+    for dir_name in ("ready", "running"):
+        state_dir = native_root / "goals" / dir_name
+        if not state_dir.exists():
+            continue
+        for goal_path in sorted(state_dir.glob("*.md")):
+            goal_id = goal_path.stem
+            try:
+                parse_goal_markdown(goal_path.read_text(encoding="utf-8"))
+            except UnicodeDecodeError:
+                log_controller_warning_once(
+                    native_root,
+                    "Native promotion blocked by invalid active goal file",
+                    {"goal_id": goal_id, "state": dir_name, "reason": "invalid_utf8", "terminal": False},
+                    f"promotion-active-invalid:{dir_name}:{goal_id}",
+                )
+                return True
+            except (OSError, ValueError) as exc:
+                log_controller_warning_once(
+                    native_root,
+                    "Native promotion blocked by invalid active goal file",
+                    {"goal_id": goal_id, "state": dir_name, "reason": str(exc), "terminal": False},
+                    f"promotion-active-invalid:{dir_name}:{goal_id}",
+                )
+                return True
+            return True
+    return False
+
+
+def native_state_locations(native_root: Path, goal_id: str) -> dict[str, Path]:
+    locations: dict[str, Path] = {}
+    for dir_name in NATIVE_GOAL_STATE_DIRS:
+        goal_path = native_root / "goals" / dir_name / f"{goal_id}.md"
+        if goal_path.exists():
+            locations[dir_name] = goal_path
+    return locations
+
+
+def promotion_contents_match(staged_content: str, ready_content: str) -> bool:
+    try:
+        staged = parse_goal_markdown(staged_content)
+        ready = parse_goal_markdown(ready_content)
+    except (UnicodeDecodeError, ValueError):
+        return False
+    return (
+        staged.get("title") == ready.get("title")
+        and staged.get("dependencies") == ready.get("dependencies")
+        and staged.get("allowed_files") == ready.get("allowed_files")
+        and staged.get("acceptance_body") == ready.get("acceptance_body")
+        and staged.get("goal_contract") != ""
+        and ready.get("goal_contract") != ""
+    )
+
+
+def quarantine_state_conflict(native_root: Path, goal_id: str, locations: dict[str, Path], reason: str) -> None:
+    failed_dir = native_root / "goals" / "failed"
+    ensure_dir_durable(failed_dir)
+    moved: list[str] = []
+    for state, source in sorted(locations.items()):
+        if not source.exists():
+            continue
+        target = failed_dir / f"{goal_id}.{state}.conflict.md"
+        os.replace(str(source), str(target))
+        fsync_dir(source.parent)
+        moved.append(state)
+    fsync_dir(failed_dir)
+    log_event(native_root / "runs" / goal_id / "events.jsonl", "integrity.quarantined", "Duplicate native goal state quarantined", {
+        "goal_id": goal_id,
+        "states": moved,
+        "reason": reason,
+        "terminal": False,
+    })
+
+
+def recover_staged_ready_promotion_conflicts(native_root: Path) -> None:
+    staged_dir = native_root / "goals" / "staged"
+    ready_dir = native_root / "goals" / "ready"
+    if not staged_dir.exists() or not ready_dir.exists():
+        return
+    for staged_path in sorted(staged_dir.glob("*.md")):
+        goal_id = staged_path.stem
+        ready_path = ready_dir / staged_path.name
+        if not ready_path.exists():
+            continue
+        try:
+            staged_content = staged_path.read_text(encoding="utf-8")
+            ready_content = ready_path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            quarantine_state_conflict(native_root, goal_id, {"staged": staged_path, "ready": ready_path}, "unreadable_staged_ready_duplicate")
+            continue
+        if promotion_contents_match(staged_content, ready_content):
+            staged_path.unlink()
+            fsync_dir(staged_dir)
+            log_event(native_root / "runs" / goal_id / "events.jsonl", "integrity.recovered", "Recovered staged plus ready promotion duplicate", {
+                "goal_id": goal_id,
+                "recovery": "removed-staged-authority",
+                "terminal": False,
+            })
+        else:
+            quarantine_state_conflict(native_root, goal_id, {"staged": staged_path, "ready": ready_path}, "staged_ready_content_conflict")
+
+
+def duplicate_state_blocks_claim(native_root: Path, goal_id: str) -> bool:
+    locations = native_state_locations(native_root, goal_id)
+    if len(locations) <= 1:
+        return False
+    log_event(native_root / "runs" / goal_id / "events.jsonl", "integrity.failed", "Duplicate native goal ID blocks claim", {
+        "goal_id": goal_id,
+        "states": sorted(locations),
+        "terminal": False,
+    })
+    return True
+
+
+def promote_one_staged_goal(
+    native_root: Path,
+    canonical_repo: Path,
+    expected_origin: str,
+    subprocess_adapter: SubprocessAdapter,
+    worktree_root: Path = DEFAULT_WORKTREE_ROOT,
+    configured_canonical_repo: Path | None = None,
+) -> tuple[bool, str | None]:
+    """Promote exactly one dependency-ready non-hard-stopped staged goal into ready."""
+    promotion_lock_owner = create_promotion_lock(native_root)
+    if not promotion_lock_owner:
+        return False, None
+    try:
+        if not recover_stale_lock(native_root):
+            return False, None
+        recover_orphan_running_goals(native_root)
+        recover_staged_ready_promotion_conflicts(native_root)
+        if active_ready_or_running_goal_exists(native_root):
+            return False, None
+        staged_dir = native_root / "goals" / "staged"
+        ready_dir = native_root / "goals" / "ready"
+        if not staged_dir.exists():
+            return False, None
+        for staged_path in sorted(staged_dir.glob("*.md")):
+            goal_id = staged_path.stem
+            try:
+                content = staged_path.read_text(encoding="utf-8")
+                goal_data = parse_goal_markdown(content)
+            except (UnicodeDecodeError, OSError, ValueError) as exc:
+                log_event(native_root / "runs" / goal_id / "events.jsonl", "promotion.skipped", "Staged goal was not promotable", {
+                    "reason": type(exc).__name__ if isinstance(exc, UnicodeDecodeError) else str(exc),
+                    "terminal": False,
+                })
+                continue
+            if hard_stop_blocked(goal_data):
+                log_event(native_root / "runs" / goal_id / "events.jsonl", "promotion.blocked", "Hard-stopped staged goal is ineligible", {
+                    "hard_stop": True,
+                    "terminal": False,
+                })
+                continue
+            blockers = [dep_id for dep_id in goal_data.get("dependencies", []) if not dependency_satisfied(native_root, dep_id)]
+            if blockers:
+                log_event(native_root / "runs" / goal_id / "events.jsonl", "goal.blocked", "Staged goal is waiting for dependencies", {
+                    "queue_state": "staged",
+                    "blocker_ids": blockers,
+                    "dependency_ids": blockers,
+                    "terminal": False,
+                })
+                continue
+            ok, checkout_meta = prepare_isolated_checkout(
+                goal_id,
+                str(goal_data.get("branch_kind") or "feat"),
+                canonical_repo,
+                expected_origin,
+                worktree_root,
+                subprocess_adapter,
+                configured_canonical_repo=configured_canonical_repo,
+            )
+            if not ok:
+                log_event(native_root / "runs" / goal_id / "events.jsonl", "promotion.failed", "Fresh checkout preparation failed", {
+                    "reason": checkout_meta.get("reason", "unknown"),
+                    "terminal": False,
+                })
+                return False, None
+            promoted_content = replace_frontmatter_value(content, "repo/workdir", str(checkout_meta["path"]))
+            ready_path = ready_dir / staged_path.name
+            if native_state_locations(native_root, goal_id) != {"staged": staged_path}:
+                log_event(native_root / "runs" / goal_id / "events.jsonl", "integrity.failed", "Duplicate native goal ID blocks promotion", {
+                    "goal_id": goal_id,
+                    "states": sorted(native_state_locations(native_root, goal_id)),
+                    "terminal": False,
+                })
+                return False, None
+            tmp = staged_path.with_name(f".{staged_path.name}.promote-{os.getpid()}-{time.monotonic_ns()}.tmp")
+            try:
+                exclusive_write_text(tmp, promoted_content)
+                os.replace(str(tmp), str(staged_path))
+                fsync_dir(staged_dir)
+                ensure_dir_durable(ready_dir)
+                atomic_rename_no_replace(staged_path, ready_path)
+                fsync_dir(staged_dir)
+                fsync_dir(ready_dir)
+            except (OSError, FileExistsError) as exc:
+                tmp.unlink(missing_ok=True)
+                fsync_dir(staged_dir)
+                log_event(native_root / "runs" / goal_id / "events.jsonl", "integrity.failed", "Promotion authority transition failed", {
+                    "goal_id": goal_id,
+                    "reason": type(exc).__name__,
+                    "terminal": False,
+                })
+                return False, None
+            log_event(native_root / "runs" / goal_id / "events.jsonl", "goal.ready", "Promoted staged goal to ready", {
+                "branch": checkout_meta["branch"],
+                "base_ref": checkout_meta["base_ref"],
+                "base_sha": checkout_meta["base_sha"],
+                "worktree_path_hash": hashlib.sha256(str(checkout_meta["path"]).encode()).hexdigest(),
+                "terminal": False,
+            })
+            return True, goal_id
+        return False, None
+    finally:
+        cleanup_promotion_lock(native_root, promotion_lock_owner)
+
+
 def quarantine_invalid_goal(native_root: Path, goal_path: Path, reason: str) -> None:
     """Move an invalid ready goal to failed with metadata-only evidence."""
     goal_id = goal_path.stem
@@ -735,6 +1584,289 @@ def log_dependency_blocked_goal(native_root: Path, goal_id: str, blocker_ids: li
     )
 
 
+def log_ready_hard_stop_blocked_goal(native_root: Path, goal_id: str) -> None:
+    """Leave ready hard-stop goals ready and emit non-terminal metadata evidence."""
+    metadata = {
+        "queue_state": "ready",
+        "hard_stop": True,
+        "terminal": False,
+    }
+    log_event(
+        native_root / "runs" / goal_id / "events.jsonl",
+        "promotion.blocked",
+        "Hard-stopped ready goal is ineligible",
+        metadata,
+    )
+    log_event(
+        native_root / "runs" / goal_id / "events.jsonl",
+        "goal.blocked",
+        "Ready goal is hard-stopped",
+        metadata,
+    )
+
+
+# ---------------------------------------------------------------------------
+# One-shot legacy migration
+# ---------------------------------------------------------------------------
+
+def goal_id_allowed(goal_id: str, include_re: re.Pattern[str] | None, exclude_re: re.Pattern[str] | None, explicit_ids: set[str] | None) -> bool:
+    if explicit_ids is not None and goal_id not in explicit_ids:
+        return False
+    if include_re and not include_re.search(goal_id):
+        return False
+    if exclude_re and exclude_re.search(goal_id):
+        return False
+    return True
+
+
+def find_legacy_goal_files(legacy_source_root: Path) -> list[Path]:
+    files: list[Path] = []
+    total_bytes = 0
+    for path_value in sorted(legacy_source_root.rglob("*.md")):
+        if len(files) >= MAX_MIGRATION_FILES:
+            raise ValueError("migration file count bound exceeded")
+        if path_value.is_symlink():
+            raise ValueError("migration symlink rejected")
+        st = path_value.stat()
+        if st.st_size > MAX_MIGRATION_FILE_BYTES:
+            raise ValueError("migration file byte bound exceeded")
+        total_bytes += st.st_size
+        if total_bytes > MAX_MIGRATION_TOTAL_BYTES:
+            raise ValueError("migration total byte bound exceeded")
+        files.append(path_value)
+    return files
+
+
+def markdown_sections(content: str, wanted: set[str]) -> list[str]:
+    sections: list[str] = []
+    current: list[str] | None = None
+    for line in content.splitlines():
+        heading = re.match(r"^##[ \t]+(.+?)[ \t]*$", line)
+        if heading:
+            if current is not None:
+                sections.append("\n".join(current))
+            title = heading.group(1).strip().lower()
+            current = [] if title in wanted else None
+            continue
+        if current is not None:
+            current.append(line)
+    if current is not None:
+        sections.append("\n".join(current))
+    return sections
+
+
+def historical_done_evidence(content: str, metadata: dict[str, Any]) -> dict[str, Any] | None:
+    status_value = metadata_string(metadata, "status", "state").lower()
+    if status_value not in {"done", "complete", "completed", "success", "shipped"}:
+        return None
+    sections = markdown_sections(content, {"result", "evidence"})
+    if not sections:
+        return None
+    negated_or_blocked = re.compile(
+        r"(?i)\b(not[ \t-]+verified|not[ \t-]+shipped|not[ \t-]+merged|failed|failure|blocked|held|pending|raw[ \t-]+data|hard[ \t-]+stop)\b"
+    )
+    if any(negated_or_blocked.search(section) for section in sections):
+        return None
+    positive = re.compile(r"(?is)\b(verified|verification|confirmed|success|succeeded)\b.*\b(merged|shipped)\b|\b(merged|shipped)\b.*\b(verified|verification|confirmed|success|succeeded)\b")
+    concrete_pr_or_merge = re.compile(
+        r"(?i)(https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+|\bPR[ \t#:-]*[0-9]+\b|\bmerge[ \t_-]*(sha|commit)[ \t:=#-]*[0-9a-f]{7,40}\b|\b[0-9a-f]{40}\b)"
+    )
+    accepted_section = None
+    for section in sections:
+        if positive.search(section) and concrete_pr_or_merge.search(section):
+            accepted_section = section
+            break
+    if accepted_section is None:
+        return None
+    return {
+        "provenance": MIGRATED_HISTORICAL_PROVENANCE,
+        "evidence_sha256": hashlib.sha256(accepted_section.encode("utf-8")).hexdigest(),
+        "evidence_bytes": len(accepted_section.encode("utf-8")),
+    }
+
+
+def render_native_goal(content: str, goal_data: dict[str, Any], canonical_repo: Path) -> str:
+    dependencies = ", ".join(goal_data.get("dependencies", []))
+    allowed_files = "\n".join(f"- `{item}`" for item in goal_data.get("allowed_files", []))
+    hard_stop = "true" if goal_data.get("hard_stop") else "false"
+    branch_kind = goal_data.get("branch_kind") if goal_data.get("branch_kind") in {"feat", "fix"} else "feat"
+    vercel_impact = "true" if goal_data.get("vercel_impact") else "false"
+    surface_verification = "true" if goal_data.get("surface_verification") else "false"
+    return (
+        "---\n"
+        f"title: {goal_data['title']}\n"
+        f"repo/workdir: {canonical_repo}\n"
+        f"dependencies: {dependencies}\n"
+        f"hard_stop: {hard_stop}\n"
+        f"branch_kind: {branch_kind}\n"
+        f"vercel_impact: {vercel_impact}\n"
+        f"surface_verification: {surface_verification}\n"
+        "---\n\n"
+        f"{goal_data.get('goal_contract', '').strip()}\n\n"
+        "## Allowed files\n\n"
+        f"{allowed_files}\n\n"
+        "## Acceptance\n\n"
+        "```bash\n"
+        f"{goal_data['acceptance_body']}"
+        "```\n"
+    )
+
+
+def migrate_legacy_goals(
+    legacy_source_root: Path,
+    native_root: Path,
+    canonical_repo: Path,
+    expected_origin: str = EXPECTED_CANONICAL_REPO_URL,
+    include_regex: str | None = None,
+    exclude_regex: str | None = None,
+    explicit_ids: set[str] | None = None,
+    subprocess_adapter: SubprocessAdapter | None = None,
+    configured_canonical_repo: Path | None = None,
+) -> dict[str, Any]:
+    """One-shot bounded migration from preserved legacy Markdown into native state."""
+    adapter = subprocess_adapter or RealSubprocess()
+    source_root = realpath_no_symlink(legacy_source_root)
+    native_resolved = realpath_no_symlink(native_root, must_exist=False)
+    canonical_ok, canonical_reason, canonical_resolved = validate_canonical_repo_path(
+        canonical_repo,
+        expected_origin,
+        adapter,
+        configured_canonical_repo=configured_canonical_repo,
+    )
+    if not canonical_ok or canonical_resolved is None:
+        raise ValueError(canonical_reason)
+    if path_within(source_root, native_resolved) or path_within(native_resolved, source_root):
+        raise ValueError("legacy source and native root must be separate")
+    if path_in_forbidden_roots(source_root):
+        raise ValueError("legacy source root is forbidden")
+
+    include_re = re.compile(include_regex) if include_regex else None
+    exclude_re = re.compile(exclude_regex) if exclude_regex else None
+    report: dict[str, Any] = {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "legacy_source_root": str(source_root),
+        "native_root": str(native_resolved),
+        "canonical_repo": str(canonical_resolved),
+        "imported": [],
+        "skipped": [],
+        "historical_done": [],
+        "duplicates": [],
+        "collisions": [],
+    }
+
+    legacy_files = find_legacy_goal_files(source_root)
+    paths_by_goal_id: dict[str, list[Path]] = {}
+    for legacy_path in legacy_files:
+        paths_by_goal_id.setdefault(legacy_path.stem, []).append(legacy_path)
+    duplicate_goal_ids = {goal_id for goal_id, paths in paths_by_goal_id.items() if len(paths) > 1}
+    for goal_id in sorted(duplicate_goal_ids):
+        report["duplicates"].append({
+            "goal_id": goal_id,
+            "source_paths": sorted(str(path.relative_to(source_root)) for path in paths_by_goal_id[goal_id]),
+            "reason": "duplicate_goal_id",
+        })
+
+    ensure_dir_durable(native_resolved / "goals" / "staged")
+    ensure_dir_durable(native_resolved / "goals" / "done")
+    ensure_dir_durable(native_resolved / "runs")
+
+    for legacy_path in legacy_files:
+        goal_id = legacy_path.stem
+        if goal_id in duplicate_goal_ids:
+            continue
+        collisions = native_id_collision_locations(native_resolved, goal_id)
+        if collisions:
+            add_migration_collision(report, native_resolved, goal_id, collisions)
+            continue
+        if not goal_id_allowed(goal_id, include_re, exclude_re, explicit_ids):
+            report["skipped"].append({"goal_id": goal_id, "reason": "operator_excluded"})
+            continue
+        try:
+            content = read_bounded_text(legacy_path, MAX_MIGRATION_FILE_BYTES)
+            fm_lines, _, _ = split_goal_frontmatter(content)
+            metadata = parse_frontmatter_fields(fm_lines)
+            goal_data = parse_goal_markdown(content)
+        except (UnicodeDecodeError, OSError, ValueError) as exc:
+            report["skipped"].append({"goal_id": goal_id, "reason": type(exc).__name__ if isinstance(exc, UnicodeDecodeError) else str(exc)})
+            continue
+
+        rendered = render_native_goal(content, goal_data, canonical_resolved)
+        done_evidence = historical_done_evidence(content, metadata)
+        if done_evidence:
+            target = native_resolved / "goals" / "done" / f"{goal_id}.md"
+            run_dir = native_resolved / "runs" / goal_id
+            try:
+                if native_id_collision_locations(native_resolved, goal_id):
+                    add_migration_collision(report, native_resolved, goal_id, native_id_collision_locations(native_resolved, goal_id))
+                    continue
+                ensure_dir_durable(run_dir.parent)
+                run_dir.mkdir(mode=0o700)
+                fsync_dir(run_dir.parent)
+                fsync_dir(run_dir)
+                collisions = native_id_collision_locations(native_resolved, goal_id, owned_run_dir=run_dir)
+                if collisions:
+                    add_migration_collision(report, native_resolved, goal_id, collisions)
+                    continue
+                exclusive_write_json(run_dir / "result.json", {
+                    "goal_id": goal_id,
+                    "success": True,
+                    "completed_at": datetime.now(UTC).isoformat(),
+                    "provenance": MIGRATED_HISTORICAL_PROVENANCE,
+                    "historical_evidence": done_evidence,
+                    "stages": {"migration": {"passed": True, "provenance": MIGRATED_HISTORICAL_PROVENANCE}},
+                })
+                collisions = native_id_collision_locations(native_resolved, goal_id, owned_run_dir=run_dir)
+                if collisions:
+                    add_migration_collision(report, native_resolved, goal_id, collisions)
+                    continue
+                exclusive_append_jsonl(run_dir / "events.jsonl", {
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "type": "migration.historical_done",
+                    "summary": "Migrated verified historical done dependency",
+                    "metadata": {
+                        "provenance": MIGRATED_HISTORICAL_PROVENANCE,
+                        "evidence_sha256": done_evidence["evidence_sha256"],
+                        "evidence_bytes": done_evidence["evidence_bytes"],
+                    },
+                })
+                collisions = native_id_collision_locations(native_resolved, goal_id, owned_run_dir=run_dir)
+                if collisions:
+                    add_migration_collision(report, native_resolved, goal_id, collisions)
+                    continue
+                exclusive_write_text(target, rendered)
+            except FileExistsError as exc:
+                add_migration_collision(report, native_resolved, goal_id, [str(Path(exc.filename)) if exc.filename else str(target)])
+                continue
+            except OSError as exc:
+                report["skipped"].append({"goal_id": goal_id, "reason": f"write_failed:{exc.errno}"})
+                continue
+            report["historical_done"].append({"goal_id": goal_id, "provenance": MIGRATED_HISTORICAL_PROVENANCE})
+            continue
+
+        target = native_resolved / "goals" / "staged" / f"{goal_id}.md"
+        collisions = native_id_collision_locations(native_resolved, goal_id)
+        if collisions:
+            add_migration_collision(report, native_resolved, goal_id, collisions)
+            continue
+        try:
+            exclusive_write_text(target, rendered)
+        except FileExistsError as exc:
+            add_migration_collision(report, native_resolved, goal_id, [str(Path(exc.filename)) if exc.filename else str(target)])
+            continue
+        except OSError as exc:
+            report["skipped"].append({"goal_id": goal_id, "reason": f"write_failed:{exc.errno}"})
+            continue
+        report["imported"].append({
+            "goal_id": goal_id,
+            "state": "staged",
+            "hard_stop": bool(goal_data.get("hard_stop")),
+            "dependencies": goal_data.get("dependencies", []),
+        })
+
+    atomic_write_json(migration_report_path(native_resolved), report)
+    return report
+
+
 # ---------------------------------------------------------------------------
 # Claim goal
 # ---------------------------------------------------------------------------
@@ -744,6 +1876,7 @@ def claim_ready_goal(native_root: Path) -> tuple[Path | None, dict | None]:
     if not recover_stale_lock(native_root):
         return None, None
     recover_orphan_running_goals(native_root)
+    recover_staged_ready_promotion_conflicts(native_root)
     ready_dir = native_root / "goals" / "ready"
     running_dir = native_root / "goals" / "running"
     if not ready_dir.exists():
@@ -755,6 +1888,8 @@ def claim_ready_goal(native_root: Path) -> tuple[Path | None, dict | None]:
 
     for goal_path in goal_files:
         goal_id = goal_path.stem
+        if duplicate_state_blocks_claim(native_root, goal_id):
+            return None, None
 
         # Parse goal
         try:
@@ -771,6 +1906,10 @@ def claim_ready_goal(native_root: Path) -> tuple[Path | None, dict | None]:
             continue
 
         goal_data["goal_id"] = goal_id
+
+        if hard_stop_blocked(goal_data):
+            log_ready_hard_stop_blocked_goal(native_root, goal_id)
+            continue
 
         # Check dependencies without letting one blocked file idle the queue.
         blocker_ids = [
@@ -848,6 +1987,51 @@ def _minimal_env() -> dict[str, str]:
     return env
 
 
+def ensure_controller_git_paths() -> tuple[Path, Path, Path]:
+    """Create empty controller-owned Git config and hooks paths."""
+    ensure_dir_durable(CONTROLLER_GIT_DIR)
+    global_config = CONTROLLER_GIT_DIR / "empty-global-config"
+    system_config = CONTROLLER_GIT_DIR / "empty-system-config"
+    empty_hooks = CONTROLLER_GIT_DIR / "empty-hooks"
+    for config_path in (global_config, system_config):
+        if not config_path.exists():
+            exclusive_write_bytes(config_path, b"")
+        os.chmod(config_path, 0o444)
+    if not empty_hooks.exists():
+        ensure_dir_durable(empty_hooks)
+    if not empty_hooks.is_dir() or empty_hooks.is_symlink():
+        raise ValueError("controller hooks path invalid")
+    if any(empty_hooks.iterdir()):
+        raise ValueError("controller hooks path not empty")
+    os.chmod(empty_hooks, 0o555)
+    return global_config, system_config, empty_hooks
+
+
+def _controller_git_env(optional_locks: str = "0") -> dict[str, str]:
+    """Git env controlled by the native controller, isolated from user config."""
+    global_config, system_config, _ = ensure_controller_git_paths()
+    env = _minimal_env()
+    env.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": str(global_config),
+        "GIT_CONFIG_SYSTEM": str(system_config),
+        "GIT_OPTIONAL_LOCKS": optional_locks,
+        "GIT_TERMINAL_PROMPT": "0",
+    })
+    return env
+
+
+def controller_git_cmd(args: list[str]) -> list[str]:
+    """Build a Git argv with hooks disabled to the controller-owned empty path."""
+    _, _, empty_hooks = ensure_controller_git_paths()
+    return ["git", "-c", f"core.hooksPath={empty_hooks}", *args]
+
+
+def _git_read_env() -> dict[str, str]:
+    """Minimal environment for Git reads against read-only source mirrors."""
+    return _controller_git_env("0")
+
+
 _BOUNDED_IDENTIFIER_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
 
 
@@ -872,25 +2056,51 @@ def stage_profile(stage: str) -> str:
     default = DEFAULT_STAGE_PROFILES[stage]
     env_key = STAGE_PROFILE_ENV.get(stage)
     configured = os.environ.get(env_key, "") if env_key else ""
-    profile = bounded_identifier(configured, default, max_len=64)
-    if stage in ("code", "review") and profile in LOCAL_IMPLEMENTATION_FORBIDDEN_PROFILES:
-        raise ValueError(f"{stage} stage profile {profile!r} is forbidden for Codex-only authority")
-    return profile
+    return bounded_identifier(configured, default, max_len=64)
 
 
-def stage_config_error(stage: str, reason: str, marker_found: bool = False) -> dict:
+def stage_config_error(
+    stage: str,
+    reason: str,
+    marker_found: bool = False,
+    profile: str = "",
+    authority_provider: str = "",
+) -> dict:
     result = {
         "exit_code": -1,
         "duration_sec": 0,
         "stdout_bytes": 0,
         "stderr_bytes": 0,
         "marker_found": marker_found,
-        "profile": "",
+        "profile": profile,
+        "authority_provider": authority_provider,
         "source": STAGE_SOURCES.get(stage, ""),
         "passed": False,
         "config_error": reason,
     }
     return result
+
+
+def verify_codex_stage_authority(
+    stage: str,
+    profile: str,
+    worktree: Path,
+    subprocess_adapter: SubprocessAdapter,
+) -> tuple[bool, str, str]:
+    """Resolve a Hermes profile provider and fail closed unless it is Codex."""
+    result = subprocess_adapter.run_command(
+        ["hermes", "--profile", profile, "config", "get", "model.provider"],
+        cwd=str(worktree),
+        timeout=30,
+        env=_minimal_env(),
+        capture=True,
+    )
+    provider = result.stdout.strip()
+    if result.returncode != 0:
+        return False, provider, f"{stage} stage profile provider could not be resolved"
+    if provider not in CODEX_STAGE_PROVIDERS:
+        return False, provider, f"{stage} stage profile {profile!r} resolves to non-Codex provider {provider!r}"
+    return True, provider, ""
 
 
 def run_hermes_planner(
@@ -942,10 +2152,21 @@ def run_hermes_implementation(
     Run implementation via the configured code profile and mission-control-goal-code source.
     Implementation requires exit 0 only — no marker.
     """
-    try:
-        profile = stage_profile("code")
-    except ValueError as exc:
-        return stage_config_error("code", str(exc), marker_found=True)
+    profile = stage_profile("code")
+    authority_ok, authority_provider, authority_reason = verify_codex_stage_authority(
+        "code",
+        profile,
+        worktree,
+        subprocess_adapter,
+    )
+    if not authority_ok:
+        return stage_config_error(
+            "code",
+            authority_reason,
+            marker_found=True,
+            profile=profile,
+            authority_provider=authority_provider,
+        )
     source = STAGE_SOURCES["code"]
     cmd = [
         "hermes", "--profile", profile,
@@ -966,6 +2187,7 @@ def run_hermes_implementation(
         "stderr_bytes": result.stderr_bytes,
         "marker_found": True,  # Implementation has no marker requirement
         "profile": profile,
+        "authority_provider": authority_provider,
         "source": source,
         "passed": result.returncode == 0,
     }
@@ -982,10 +2204,20 @@ def run_hermes_reviewer(
     Run final review via the configured review profile and mission-control-goal-review source.
     Final review requires REVIEW_PASS in stdout.
     """
-    try:
-        profile = stage_profile("review")
-    except ValueError as exc:
-        return stage_config_error("review", str(exc))
+    profile = stage_profile("review")
+    authority_ok, authority_provider, authority_reason = verify_codex_stage_authority(
+        "review",
+        profile,
+        worktree,
+        subprocess_adapter,
+    )
+    if not authority_ok:
+        return stage_config_error(
+            "review",
+            authority_reason,
+            profile=profile,
+            authority_provider=authority_provider,
+        )
     source = STAGE_SOURCES["review"]
     cmd = [
         "hermes", "--profile", profile,
@@ -1007,6 +2239,7 @@ def run_hermes_reviewer(
         "stderr_bytes": result.stderr_bytes,
         "marker_found": marker_found,
         "profile": profile,
+        "authority_provider": authority_provider,
         "source": source,
         "passed": result.returncode == 0 and marker_found and result.stdout_bytes > 0,
     }
@@ -1028,8 +2261,8 @@ def check_git_scope(
     """
     # Get changed + untracked with NUL-separated output
     result = subprocess_adapter.run_command(
-        cmd=["git", "status", "--porcelain=v1", "-z"],
-        cwd=str(worktree), timeout=30, env=None, capture=True,
+        cmd=controller_git_cmd(["status", "--porcelain=v1", "-z"]),
+        cwd=str(worktree), timeout=30, env=_git_read_env(), capture=True,
     )
     if result.returncode != 0:
         return {"passed": False, "reason": "git status failed", "changed_count": 0}
@@ -1086,6 +2319,8 @@ def check_git_scope(
             "reason": "out-of-allow-list changes detected",
             "changed_count": len(changed_paths),
             "violations": violations[:5],
+            "changed_paths": changed_paths[:20],
+            "untracked_paths": untracked_paths[:20],
         }
 
     for untracked in untracked_paths:
@@ -1095,12 +2330,14 @@ def check_git_scope(
                 "passed": False,
                 "reason": binary_reason,
                 "changed_count": len(changed_paths),
+                "changed_paths": changed_paths[:20],
+                "untracked_paths": untracked_paths[:20],
             }
 
     # Check for binary/NUL diffs
     numstat = subprocess_adapter.run_command(
-        cmd=["git", "diff", "--numstat", "--cached"],
-        cwd=str(worktree), timeout=30, env=None, capture=True,
+        cmd=controller_git_cmd(["diff", "--numstat", "--cached"]),
+        cwd=str(worktree), timeout=30, env=_git_read_env(), capture=True,
     )
     if numstat.returncode == 0:
         for line in numstat.stdout.splitlines():
@@ -1110,12 +2347,14 @@ def check_git_scope(
                     "passed": False,
                     "reason": f"binary diff detected: {fields[2]}",
                     "changed_count": len(changed_paths),
+                    "changed_paths": changed_paths[:20],
+                    "untracked_paths": untracked_paths[:20],
                 }
 
     # Also check unstaged diffs for binary
     numstat_unstaged = subprocess_adapter.run_command(
-        cmd=["git", "diff", "--numstat"],
-        cwd=str(worktree), timeout=30, env=None, capture=True,
+        cmd=controller_git_cmd(["diff", "--numstat"]),
+        cwd=str(worktree), timeout=30, env=_git_read_env(), capture=True,
     )
     if numstat_unstaged.returncode == 0:
         for line in numstat_unstaged.stdout.splitlines():
@@ -1125,9 +2364,16 @@ def check_git_scope(
                     "passed": False,
                     "reason": f"binary diff detected: {fields[2]}",
                     "changed_count": len(changed_paths),
+                    "changed_paths": changed_paths[:20],
+                    "untracked_paths": untracked_paths[:20],
                 }
 
-    return {"passed": True, "changed_count": len(changed_paths)}
+    return {
+        "passed": True,
+        "changed_count": len(changed_paths),
+        "changed_paths": changed_paths[:20],
+        "untracked_paths": untracked_paths[:20],
+    }
 
 
 def inspect_untracked_binary(worktree: Path, relative_path: str) -> str | None:
@@ -1154,6 +2400,379 @@ def inspect_untracked_binary(worktree: Path, relative_path: str) -> str | None:
         except OSError:
             return f"untracked file unreadable: {relative_path}"
     return None
+
+
+def scope_stage_metadata(scope_result: dict[str, Any]) -> dict[str, Any]:
+    """Bounded metadata for stage-specific scope failures."""
+    metadata: dict[str, Any] = {
+        "passed": bool(scope_result.get("passed")),
+        "changed_count": scope_result.get("changed_count", 0),
+        "reason": scope_result.get("reason", "unknown"),
+    }
+    for key in ("violations", "changed_paths", "untracked_paths"):
+        if key in scope_result:
+            metadata[key] = scope_result[key]
+    return metadata
+
+
+def hash_untracked_path(worktree: Path, relative_path: str) -> str:
+    candidate = (worktree / relative_path).resolve()
+    try:
+        candidate.relative_to(worktree.resolve())
+    except ValueError:
+        return f"escape:{relative_path}"
+    h = hashlib.sha256()
+    if candidate.is_dir():
+        for path in sorted(p for p in candidate.rglob("*") if p.is_file()):
+            rel = path.relative_to(worktree.resolve()).as_posix()
+            h.update(rel.encode("utf-8"))
+            h.update(b"\0")
+            h.update(path.read_bytes())
+            h.update(b"\0")
+    elif candidate.exists():
+        h.update(candidate.read_bytes())
+    else:
+        h.update(b"missing")
+    return h.hexdigest()
+
+
+def git_diff_fingerprint(worktree: Path, subprocess_adapter: SubprocessAdapter, include_ignored: bool = False) -> dict[str, Any]:
+    """Fingerprint staged, unstaged, untracked, and optional ignored state for read-only enforcement."""
+    status = subprocess_adapter.run_command(
+        controller_git_cmd(["status", "--porcelain=v1", "-z"]),
+        str(worktree),
+        30,
+        _git_read_env(),
+        True,
+    )
+    cached = subprocess_adapter.run_command(
+        controller_git_cmd(["diff", "--cached", "--binary"]),
+        str(worktree),
+        60,
+        _git_read_env(),
+        True,
+    )
+    unstaged = subprocess_adapter.run_command(
+        controller_git_cmd(["diff", "--binary"]),
+        str(worktree),
+        60,
+        _git_read_env(),
+        True,
+    )
+    if status.returncode != 0 or cached.returncode != 0 or unstaged.returncode != 0:
+        return {"passed": False, "reason": "diff fingerprint unreadable"}
+    ignored_stdout = ""
+    if include_ignored:
+        ignored = subprocess_adapter.run_command(
+            controller_git_cmd(["status", "--ignored", "--porcelain=v1", "-z"]),
+            str(worktree),
+            30,
+            _git_read_env(),
+            True,
+        )
+        if ignored.returncode != 0:
+            return {"passed": False, "reason": "ignored fingerprint unreadable"}
+        ignored_stdout = ignored.stdout
+    h = hashlib.sha256()
+    h.update(status.stdout.encode("utf-8", errors="surrogateescape"))
+    h.update(b"\0cached\0")
+    h.update(cached.stdout.encode("utf-8", errors="surrogateescape"))
+    h.update(b"\0unstaged\0")
+    h.update(unstaged.stdout.encode("utf-8", errors="surrogateescape"))
+    changed_count = 0
+    untracked_count = 0
+    for entry in status.stdout.split("\x00"):
+        if not entry:
+            continue
+        changed_count += 1
+        if entry.startswith("?? "):
+            untracked_count += 1
+            rel = entry[3:]
+            h.update(b"\0untracked\0")
+            h.update(rel.encode("utf-8", errors="surrogateescape"))
+            h.update(b"\0")
+            h.update(hash_untracked_path(worktree, rel).encode("utf-8"))
+    ignored_count = 0
+    if include_ignored:
+        h.update(b"\0ignored-status\0")
+        h.update(ignored_stdout.encode("utf-8", errors="surrogateescape"))
+        for entry in ignored_stdout.split("\x00"):
+            if not entry or not entry.startswith("!! "):
+                continue
+            ignored_count += 1
+            rel = entry[3:]
+            h.update(b"\0ignored\0")
+            h.update(rel.encode("utf-8", errors="surrogateescape"))
+            h.update(b"\0")
+            h.update(hash_untracked_path(worktree, rel).encode("utf-8"))
+    result: dict[str, Any] = {
+        "passed": True,
+        "sha256": h.hexdigest(),
+        "changed_count": changed_count,
+        "untracked_count": untracked_count,
+    }
+    if include_ignored:
+        result["ignored_count"] = ignored_count
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Git control-plane fingerprinting
+# ---------------------------------------------------------------------------
+
+def hash_path_identity(path_value: Path) -> str:
+    st = os.lstat(path_value)
+    return hashlib.sha256(f"{st.st_dev}:{st.st_ino}:{st.st_mode}".encode()).hexdigest()
+
+
+def read_file_hash(path_value: Path) -> tuple[str, int]:
+    data = path_value.read_bytes()
+    return hashlib.sha256(data).hexdigest(), len(data)
+
+
+def parse_raw_git_config_keys(config_bytes: bytes) -> list[tuple[str, str]]:
+    """Parse enough Git config syntax to inspect local key names without expanding includes."""
+    keys: list[tuple[str, str]] = []
+    section = ""
+    subsection = ""
+    for raw_line in config_bytes.decode("utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("[") and "]" in line:
+            header = line[1:line.index("]")].strip()
+            if " " in header:
+                section_part, subsection_part = header.split(" ", 1)
+                subsection = subsection_part.strip().strip('"').lower()
+            else:
+                section_part = header
+                subsection = ""
+            section = section_part.lower()
+            continue
+        if not section or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key_name = key.strip().lower()
+        value_str = value.strip()
+        if not key_name:
+            continue
+        full_key = f"{section}.{subsection}.{key_name}" if subsection else f"{section}.{key_name}"
+        keys.append((full_key, value_str))
+    return keys
+
+
+def forbidden_config_reason(config_bytes: bytes, expected_origin: str) -> str | None:
+    for key, value in parse_raw_git_config_keys(config_bytes):
+        if key == "remote.origin.url":
+            if value.strip().strip('"').strip("'") != expected_origin:
+                return "origin_url_mismatch"
+            continue
+        if key == "remote.origin.fetch":
+            if value.strip().strip('"').strip("'") != CONTROL_PLANE_ALLOWED_REMOTE_FETCH:
+                return "remote_fetch_rewrite"
+            continue
+        if key.startswith("remote.") and not key.startswith("remote.origin."):
+            return "unexpected_remote_config"
+        if key in CONTROL_PLANE_FORBIDDEN_CONFIG_KEYS:
+            return "forbidden_git_config"
+        if any(key.startswith(prefix) for prefix in CONTROL_PLANE_FORBIDDEN_CONFIG_PREFIXES):
+            return "forbidden_git_config"
+        if key.startswith("remote.origin.") and key not in {"remote.origin.url", "remote.origin.fetch"}:
+            return "forbidden_remote_origin_config"
+    return None
+
+
+def directory_absent_or_empty(path_value: Path) -> bool:
+    if not path_value.exists():
+        return True
+    if not path_value.is_dir() or path_value.is_symlink():
+        return False
+    return not any(path_value.iterdir())
+
+
+def file_absent_or_empty(path_value: Path) -> bool:
+    if not path_value.exists():
+        return True
+    if path_value.is_symlink() or not path_value.is_file():
+        return False
+    return path_value.stat().st_size == 0
+
+
+def empty_hooks_dir_for_fresh_checkout(git_dir: Path) -> tuple[bool, str]:
+    hooks_dir = git_dir / "hooks"
+    if not hooks_dir.exists():
+        return True, ""
+    if hooks_dir.is_symlink() or not hooks_dir.is_dir():
+        return False, "hooks_directory_invalid"
+    try:
+        for child in hooks_dir.iterdir():
+            if child.is_symlink() or child.is_dir():
+                return False, "hooks_directory_not_empty"
+            child.unlink()
+        fsync_dir(hooks_dir)
+        fsync_dir(git_dir)
+        return True, ""
+    except OSError:
+        return False, "hooks_directory_cleanup_failed"
+
+
+def collect_git_control_plane(
+    worktree: Path,
+    expected_origin: str,
+    subprocess_adapter: SubprocessAdapter,
+) -> dict[str, Any]:
+    """Collect a metadata-only Git control-plane fingerprint or fail closed."""
+    try:
+        worktree_real = realpath_no_symlink(worktree)
+    except ValueError:
+        return {"passed": False, "reason": "worktree_path_invalid"}
+    dot_git = worktree_real / ".git"
+    if dot_git.is_symlink() or not dot_git.is_dir():
+        return {"passed": False, "reason": "git_dir_not_physical_directory"}
+
+    git_dir_cmd = subprocess_adapter.run_command(
+        controller_git_cmd(["rev-parse", "--path-format=absolute", "--git-dir"]),
+        str(worktree_real),
+        30,
+        _git_read_env(),
+        True,
+    )
+    common_dir_cmd = subprocess_adapter.run_command(
+        controller_git_cmd(["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+        str(worktree_real),
+        30,
+        _git_read_env(),
+        True,
+    )
+    if git_dir_cmd.returncode != 0 or common_dir_cmd.returncode != 0:
+        return {"passed": False, "reason": "git_dir_unreadable"}
+    try:
+        git_dir = realpath_no_symlink(Path(git_dir_cmd.stdout.strip()))
+        common_dir = realpath_no_symlink(Path(common_dir_cmd.stdout.strip()))
+    except ValueError:
+        return {"passed": False, "reason": "git_dir_symlink_or_missing"}
+    if git_dir != dot_git.resolve(strict=True):
+        return {"passed": False, "reason": "git_dir_identity_mismatch"}
+    if common_dir != git_dir and not path_within_path_only(common_dir, git_dir):
+        return {"passed": False, "reason": "git_common_dir_escape"}
+
+    config_path = git_dir / "config"
+    if config_path.is_symlink() or not config_path.is_file():
+        return {"passed": False, "reason": "git_config_missing"}
+    try:
+        config_bytes = config_path.read_bytes()
+    except OSError:
+        return {"passed": False, "reason": "git_config_unreadable"}
+    config_reason = forbidden_config_reason(config_bytes, expected_origin)
+    if config_reason:
+        return {"passed": False, "reason": config_reason}
+    worktree_config = git_dir / "config.worktree"
+    worktree_config_hash = ""
+    worktree_config_bytes = 0
+    if worktree_config.exists():
+        if worktree_config.is_symlink() or not worktree_config.is_file():
+            return {"passed": False, "reason": "worktree_config_invalid"}
+        try:
+            worktree_config_data = worktree_config.read_bytes()
+        except OSError:
+            return {"passed": False, "reason": "worktree_config_unreadable"}
+        worktree_reason = forbidden_config_reason(worktree_config_data, expected_origin)
+        if worktree_reason:
+            return {"passed": False, "reason": worktree_reason}
+        worktree_config_hash = hashlib.sha256(worktree_config_data).hexdigest()
+        worktree_config_bytes = len(worktree_config_data)
+
+    remote = subprocess_adapter.run_command(
+        controller_git_cmd(["remote", "get-url", "origin"]),
+        str(worktree_real),
+        30,
+        _git_read_env(),
+        True,
+    )
+    if remote.returncode != 0 or remote.stdout.strip() != expected_origin:
+        return {"passed": False, "reason": "origin_url_mismatch"}
+    hooks_dir = git_dir / "hooks"
+    if not directory_absent_or_empty(hooks_dir):
+        return {"passed": False, "reason": "hooks_directory_not_empty"}
+    if not directory_absent_or_empty(common_dir / "refs" / "replace"):
+        return {"passed": False, "reason": "replace_refs_present"}
+    if not file_absent_or_empty(common_dir / "info" / "grafts"):
+        return {"passed": False, "reason": "grafts_present"}
+    if not file_absent_or_empty(common_dir / "objects" / "info" / "alternates"):
+        return {"passed": False, "reason": "alternates_present"}
+    refs = subprocess_adapter.run_command(
+        controller_git_cmd(["for-each-ref", "--format=%(refname)"]),
+        str(worktree_real),
+        60,
+        _git_read_env(),
+        True,
+    )
+    if refs.returncode != 0:
+        return {"passed": False, "reason": "refs_unreadable"}
+    for ref_name in refs.stdout.splitlines():
+        if not ref_name or any(ch in ref_name for ch in (" ", "\t", "\r", "\n", "\\", "..")):
+            return {"passed": False, "reason": "malicious_ref_present"}
+        if ref_name.startswith("refs/replace/"):
+            return {"passed": False, "reason": "replace_refs_present"}
+
+    config_hash, config_bytes_len = read_file_hash(config_path)
+    metadata = {
+        "git_dir_identity": hash_path_identity(git_dir),
+        "common_dir_identity": hash_path_identity(common_dir),
+        "config_sha256": config_hash,
+        "config_bytes": config_bytes_len,
+        "worktree_config_sha256": worktree_config_hash,
+        "worktree_config_bytes": worktree_config_bytes,
+        "origin_url_sha256": hashlib.sha256(expected_origin.encode()).hexdigest(),
+        "hooks_empty": True,
+        "replace_refs_absent": True,
+        "grafts_absent": True,
+        "alternates_absent": True,
+    }
+    fingerprint = hashlib.sha256(json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {"passed": True, "fingerprint": fingerprint, "metadata": metadata}
+
+
+def verify_git_control_plane(
+    worktree: Path,
+    expected_origin: str,
+    subprocess_adapter: SubprocessAdapter,
+    baseline: dict[str, Any] | None,
+    stage: str,
+) -> dict[str, Any]:
+    if not baseline or not baseline.get("passed"):
+        return {"passed": False, "stage": stage, "reason": "control_plane_baseline_missing"}
+    current = collect_git_control_plane(worktree, expected_origin, subprocess_adapter)
+    result = {
+        "passed": False,
+        "stage": stage,
+        "reason": current.get("reason", ""),
+        "baseline_fingerprint": baseline.get("fingerprint", ""),
+        "current_fingerprint": current.get("fingerprint", ""),
+    }
+    if not current.get("passed"):
+        return result
+    if current.get("fingerprint") != baseline.get("fingerprint"):
+        result["reason"] = "control_plane_changed"
+        return result
+    result["passed"] = True
+    result["reason"] = ""
+    return result
+
+
+def normalized_git_cmd(cmd: list[str]) -> list[str]:
+    """Return logical Git argv, stripping controller -c pairs for test matching."""
+    if not cmd or cmd[0] != "git":
+        return cmd
+    normalized = ["git"]
+    i = 1
+    while i < len(cmd):
+        if cmd[i] == "-c" and i + 1 < len(cmd):
+            i += 2
+            continue
+        normalized.append(cmd[i])
+        i += 1
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -1193,6 +2812,326 @@ def run_acceptance(
 
 
 # ---------------------------------------------------------------------------
+# Shipping gates
+# ---------------------------------------------------------------------------
+
+def current_branch(worktree: Path, subprocess_adapter: SubprocessAdapter) -> str | None:
+    result = subprocess_adapter.run_command(controller_git_cmd(["rev-parse", "--abbrev-ref", "HEAD"]), str(worktree), 30, _git_read_env(), True)
+    return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
+
+
+def output_has_forbidden_shipping_marker(*values: str) -> bool:
+    joined = "\n".join(values)
+    return any(marker in joined for marker in SHIPPING_FORBIDDEN_MARKERS)
+
+
+def output_has_forbidden_deployment_marker(*values: str) -> bool:
+    joined = "\n".join(values)
+    return any(marker in joined for marker in DEPLOYMENT_FORBIDDEN_MARKERS)
+
+
+def valid_git_sha(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{7,40}", value) is not None
+
+
+def github_deployments_api_path(merge_sha: str) -> str:
+    return f"repos/director-phil/rt-ops-v2/deployments?sha={merge_sha}&environment=Production"
+
+
+def verify_exact_production_deployment(
+    worktree: Path,
+    merge_sha: str,
+    subprocess_adapter: SubprocessAdapter,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {"passed": False, "merge_sha": merge_sha}
+    deployments_cmd = subprocess_adapter.run_command(
+        ["gh", "api", github_deployments_api_path(merge_sha)],
+        str(worktree),
+        120,
+        None,
+        True,
+    )
+    result["deployments"] = {
+        "exit_code": deployments_cmd.returncode,
+        "stdout_bytes": deployments_cmd.stdout_bytes,
+        "stderr_bytes": deployments_cmd.stderr_bytes,
+    }
+    if deployments_cmd.returncode != 0 or output_has_forbidden_deployment_marker(deployments_cmd.stdout, deployments_cmd.stderr):
+        result["reason"] = "deployment_lookup_failed"
+        return result
+    try:
+        deployments = json.loads(deployments_cmd.stdout or "[]")
+    except json.JSONDecodeError:
+        result["reason"] = "deployment_lookup_invalid_json"
+        return result
+    if not isinstance(deployments, list) or not deployments:
+        result["reason"] = "deployment_missing"
+        return result
+
+    for deployment in deployments:
+        if not isinstance(deployment, dict):
+            continue
+        if deployment.get("sha") != merge_sha:
+            continue
+        if deployment.get("environment") != "Production":
+            continue
+        statuses_url = deployment.get("statuses_url")
+        if not isinstance(statuses_url, str) or not statuses_url:
+            continue
+        statuses_cmd = subprocess_adapter.run_command(["gh", "api", statuses_url], str(worktree), 120, None, True)
+        result["statuses"] = {
+            "exit_code": statuses_cmd.returncode,
+            "stdout_bytes": statuses_cmd.stdout_bytes,
+            "stderr_bytes": statuses_cmd.stderr_bytes,
+        }
+        if statuses_cmd.returncode != 0 or output_has_forbidden_deployment_marker(statuses_cmd.stdout, statuses_cmd.stderr):
+            result["reason"] = "deployment_status_lookup_failed"
+            return result
+        try:
+            statuses = json.loads(statuses_cmd.stdout or "[]")
+        except json.JSONDecodeError:
+            result["reason"] = "deployment_status_invalid_json"
+            return result
+        if not isinstance(statuses, list):
+            result["reason"] = "deployment_status_invalid_json"
+            return result
+        for status_item in statuses:
+            if not isinstance(status_item, dict):
+                continue
+            if status_item.get("state") != "success":
+                continue
+            environment_url = status_item.get("environment_url") or status_item.get("target_url")
+            if not isinstance(environment_url, str) or not environment_url.startswith("https://"):
+                continue
+            inspect = subprocess_adapter.run_command(["vercel", "inspect", environment_url, "--logs"], str(worktree), 180, None, True)
+            result["inspect"] = {
+                "exit_code": inspect.returncode,
+                "stdout_bytes": inspect.stdout_bytes,
+                "stderr_bytes": inspect.stderr_bytes,
+                "url_hash": hashlib.sha256(environment_url.encode()).hexdigest(),
+            }
+            if inspect.returncode != 0 or output_has_forbidden_deployment_marker(inspect.stdout, inspect.stderr):
+                result["reason"] = "deployment_log_verification_failed"
+                return result
+            result["passed"] = True
+            result["environment_url_hash"] = hashlib.sha256(environment_url.encode()).hexdigest()
+            result["deployment_id"] = deployment.get("id") if isinstance(deployment.get("id"), int) else None
+            return result
+
+    result["reason"] = "successful_production_deployment_missing"
+    return result
+
+
+def run_shipping_gates(
+    worktree: Path,
+    goal_id: str,
+    run_id: str,
+    goal_data: dict[str, Any],
+    acceptance_body: str,
+    subprocess_adapter: SubprocessAdapter,
+    control_plane_baseline: dict[str, Any] | None = None,
+    expected_origin: str = EXPECTED_CANONICAL_REPO_URL,
+) -> dict[str, Any]:
+    """Ship reviewed changes through GitHub and verify origin/main contains them."""
+    stages: dict[str, Any] = {"passed": False}
+    if control_plane_baseline is None:
+        control_plane_baseline = collect_git_control_plane(worktree, expected_origin, subprocess_adapter)
+        stages["control_plane_baseline"] = {
+            "passed": bool(control_plane_baseline.get("passed")),
+            "fingerprint": control_plane_baseline.get("fingerprint", ""),
+            "reason": control_plane_baseline.get("reason", ""),
+        }
+        if not control_plane_baseline.get("passed"):
+            stages["reason"] = "control_plane_baseline_failed"
+            return stages
+
+    def control_plane_gate(stage: str) -> bool:
+        gate = verify_git_control_plane(worktree, expected_origin, subprocess_adapter, control_plane_baseline, stage)
+        stages[f"control_plane_{stage}"] = gate
+        if not gate.get("passed"):
+            stages["reason"] = "control_plane_changed"
+            return False
+        return True
+
+    rerun = run_acceptance(acceptance_body, worktree, goal_id, run_id, subprocess_adapter)
+    stages["acceptance_rerun"] = {
+        "sha256": rerun["sha256"],
+        "exit_code": rerun["exit_code"],
+        "duration_sec": rerun["duration_sec"],
+        "passed": rerun["passed"],
+    }
+    if not rerun["passed"]:
+        stages["reason"] = "acceptance_rerun_failed"
+        return stages
+    if not control_plane_gate("after_shipping_acceptance_rerun"):
+        return stages
+
+    shipping_scope = check_git_scope(worktree, goal_data.get("allowed_files", []), subprocess_adapter)
+    stages["scope_check_after_acceptance_rerun"] = scope_stage_metadata(shipping_scope)
+    if not shipping_scope["passed"]:
+        stages["reason"] = "post_acceptance_rerun_scope_failed"
+        return stages
+
+    branch = current_branch(worktree, subprocess_adapter)
+    if not branch or not re.match(r"^(feat|fix)/native-[A-Za-z0-9_.:-]+$", branch):
+        stages["reason"] = "branch_not_neutral"
+        return stages
+    stages["branch"] = branch
+
+    if not control_plane_gate("before_git_add"):
+        return stages
+    add = subprocess_adapter.run_command(controller_git_cmd(["add", "--all"]), str(worktree), 60, _controller_git_env("0"), True)
+    if add.returncode != 0:
+        stages["reason"] = "git_add_failed"
+        return stages
+    message = f"{goal_id}: ship native goal"
+    if output_has_forbidden_shipping_marker(message):
+        stages["reason"] = "forbidden_commit_marker"
+        return stages
+    if not control_plane_gate("before_git_commit"):
+        return stages
+    commit_env = _controller_git_env("0")
+    commit_env.update({
+        "GIT_AUTHOR_NAME": "director-phil",
+        "GIT_AUTHOR_EMAIL": "director-phil@users.noreply.github.com",
+        "GIT_COMMITTER_NAME": "director-phil",
+        "GIT_COMMITTER_EMAIL": "director-phil@users.noreply.github.com",
+    })
+    commit = subprocess_adapter.run_command(controller_git_cmd(["commit", "-m", message]), str(worktree), 120, commit_env, True)
+    stages["commit"] = {"exit_code": commit.returncode, "stdout_bytes": commit.stdout_bytes, "stderr_bytes": commit.stderr_bytes}
+    if commit.returncode != 0 or output_has_forbidden_shipping_marker(commit.stdout, commit.stderr):
+        stages["reason"] = "commit_failed_or_forbidden_marker"
+        return stages
+    sha = subprocess_adapter.run_command(controller_git_cmd(["rev-parse", "HEAD"]), str(worktree), 30, _git_read_env(), True)
+    commit_sha = sha.stdout.strip() if sha.returncode == 0 else ""
+    if not valid_git_sha(commit_sha):
+        stages["reason"] = "commit_sha_unreadable"
+        return stages
+    stages["commit"]["sha"] = commit_sha
+    commit_message = subprocess_adapter.run_command(controller_git_cmd(["log", "-1", "--pretty=%B"]), str(worktree), 30, _git_read_env(), True)
+    stages["commit"]["message_bytes"] = commit_message.stdout_bytes
+    if commit_message.returncode != 0 or output_has_forbidden_shipping_marker(commit_message.stdout):
+        stages["reason"] = "commit_message_forbidden_marker"
+        return stages
+
+    if not control_plane_gate("before_git_push"):
+        return stages
+    push = subprocess_adapter.run_command(controller_git_cmd(["push", "-u", "origin", branch]), str(worktree), 300, _controller_git_env("0"), True)
+    stages["push"] = {"exit_code": push.returncode, "stdout_bytes": push.stdout_bytes, "stderr_bytes": push.stderr_bytes}
+    if push.returncode != 0 or output_has_forbidden_shipping_marker(push.stdout, push.stderr):
+        stages["reason"] = "push_failed_or_forbidden_marker"
+        return stages
+
+    if not control_plane_gate("before_pr_create"):
+        return stages
+    pr_create = subprocess_adapter.run_command(
+        ["gh", "pr", "create", "--base", "main", "--head", branch, "--title", message, "--body", "Native goal runtime shipment"],
+        str(worktree),
+        120,
+        _controller_git_env("0"),
+        True,
+    )
+    pr_url = pr_create.stdout.strip().splitlines()[-1] if pr_create.stdout.strip() else ""
+    stages["pull_request"] = {
+        "create_exit_code": pr_create.returncode,
+        "url": pr_url,
+        "url_hash": hashlib.sha256(pr_url.encode()).hexdigest() if pr_url else "",
+    }
+    if pr_create.returncode != 0 or not pr_url.startswith("https://github.com/") or output_has_forbidden_shipping_marker(pr_create.stdout, pr_create.stderr):
+        stages["reason"] = "pr_create_failed"
+        return stages
+
+    if not control_plane_gate("before_pr_view"):
+        return stages
+    pr_view = subprocess_adapter.run_command(["gh", "pr", "view", "--json", "number,url,headRefOid,reviewDecision"], str(worktree), 60, _controller_git_env("0"), True)
+    try:
+        pr_meta = json.loads(pr_view.stdout or "{}")
+    except json.JSONDecodeError:
+        pr_meta = {}
+    pr_number = pr_meta.get("number")
+    stages["pull_request"].update({
+        "number": pr_number if isinstance(pr_number, int) else None,
+        "head_sha": pr_meta.get("headRefOid") if isinstance(pr_meta.get("headRefOid"), str) else commit_sha,
+        "review_decision": pr_meta.get("reviewDecision") if isinstance(pr_meta.get("reviewDecision"), str) else None,
+    })
+    if pr_view.returncode != 0 or not isinstance(pr_number, int) or pr_meta.get("reviewDecision") == "CHANGES_REQUESTED":
+        stages["reason"] = "pr_review_blocked"
+        return stages
+
+    if not control_plane_gate("before_pr_checks"):
+        return stages
+    checks = subprocess_adapter.run_command(["gh", "pr", "checks", "--watch", "--interval", "10", "--fail-fast"], str(worktree), 900, _controller_git_env("0"), True)
+    stages["checks"] = {"exit_code": checks.returncode, "stdout_bytes": checks.stdout_bytes, "stderr_bytes": checks.stderr_bytes}
+    if checks.returncode != 0 or output_has_forbidden_shipping_marker(checks.stdout, checks.stderr):
+        stages["reason"] = "checks_failed"
+        return stages
+
+    if not control_plane_gate("before_pr_merge"):
+        return stages
+    merge = subprocess_adapter.run_command(["gh", "pr", "merge", "--squash", "--delete-branch"], str(worktree), 300, _controller_git_env("0"), True)
+    stages["merge"] = {"exit_code": merge.returncode, "stdout_bytes": merge.stdout_bytes, "stderr_bytes": merge.stderr_bytes}
+    if merge.returncode != 0 or output_has_forbidden_shipping_marker(merge.stdout, merge.stderr):
+        stages["reason"] = "merge_failed"
+        return stages
+
+    merged_view = subprocess_adapter.run_command(
+        ["gh", "pr", "view", str(pr_number), "--json", "state,mergedAt,mergeCommit,url"],
+        str(worktree),
+        60,
+        _controller_git_env("0"),
+        True,
+    )
+    try:
+        merged_meta = json.loads(merged_view.stdout or "{}")
+    except json.JSONDecodeError:
+        merged_meta = {}
+    merge_commit = merged_meta.get("mergeCommit") if isinstance(merged_meta.get("mergeCommit"), dict) else {}
+    merge_sha = merge_commit.get("oid") if isinstance(merge_commit.get("oid"), str) else ""
+    stages["merge"].update({
+        "view_exit_code": merged_view.returncode,
+        "state": merged_meta.get("state") if isinstance(merged_meta.get("state"), str) else None,
+        "merged_at_present": isinstance(merged_meta.get("mergedAt"), str) and bool(merged_meta.get("mergedAt")),
+        "merge_sha": merge_sha,
+        "head_sha": stages.get("pull_request", {}).get("head_sha"),
+        "url_hash": hashlib.sha256(str(merged_meta.get("url", "")).encode()).hexdigest() if merged_meta.get("url") else "",
+    })
+    if (
+        merged_view.returncode != 0
+        or merged_meta.get("state") != "MERGED"
+        or not isinstance(merged_meta.get("mergedAt"), str)
+        or not merged_meta.get("mergedAt")
+        or not valid_git_sha(merge_sha)
+    ):
+        stages["reason"] = "pr_not_merged"
+        return stages
+
+    if not control_plane_gate("before_origin_main_fetch"):
+        return stages
+    fetch_main = subprocess_adapter.run_command(controller_git_cmd(["fetch", "origin", "main"]), str(worktree), 300, _controller_git_env("0"), True)
+    if not control_plane_gate("before_origin_main_ancestor_check"):
+        return stages
+    ancestor = subprocess_adapter.run_command(controller_git_cmd(["merge-base", "--is-ancestor", merge_sha, "origin/main"]), str(worktree), 60, _git_read_env(), True)
+    stages["origin_main"] = {"fetch_exit_code": fetch_main.returncode, "ancestor_exit_code": ancestor.returncode, "verified_sha": merge_sha}
+    if fetch_main.returncode != 0 or ancestor.returncode != 0:
+        stages["reason"] = "origin_main_missing_merge_commit"
+        return stages
+
+    if goal_data.get("vercel_impact"):
+        deploy = verify_exact_production_deployment(worktree, merge_sha, subprocess_adapter)
+        stages["deployment"] = deploy
+        if not deploy.get("passed"):
+            stages["reason"] = deploy.get("reason", "deployment_verification_failed")
+            return stages
+        stages["terminal_state"] = PENDING_SURFACE_STATE
+        stages["reason"] = "surface_verification_pending"
+        return stages
+
+    stages["passed"] = True
+    stages["terminal_state"] = SHIPPING_SUCCESS_STATE
+    return stages
+
+
+# ---------------------------------------------------------------------------
 # Terminal result recording
 # ---------------------------------------------------------------------------
 
@@ -1209,6 +3148,9 @@ def write_terminal_result(
         "completed_at": datetime.now(UTC).isoformat(),
         "stages": stages,
     }
+    terminal_state = stages.get("terminal_state")
+    if isinstance(terminal_state, str):
+        result["terminal_state"] = terminal_state
     result_path = native_root / "runs" / goal_id / "result.json"
     atomic_write_json(result_path, result)
 
@@ -1265,7 +3207,14 @@ def finalize_result(
 ) -> None:
     """Move goal to done/failed, write terminal result, then clean owned lock."""
     running_dir = native_root / "goals" / "running"
-    target_dir = native_root / "goals" / ("done" if success else "failed")
+    requested_state = stages.get("shipping", {}).get("terminal_state") if isinstance(stages.get("shipping"), dict) else None
+    if success:
+        target_state = "done"
+    elif requested_state == PENDING_SURFACE_STATE:
+        target_state = PENDING_SURFACE_STATE
+    else:
+        target_state = "failed"
+    target_dir = native_root / "goals" / target_state
     ensure_dir_durable(target_dir)
     running_path = running_dir / f"{goal_id}.md"
 
@@ -1294,15 +3243,17 @@ def finalize_result(
         raise TerminalMoveError("running goal markdown missing")
 
     # Write terminal result only after the terminal markdown transition succeeds.
+    if target_state == PENDING_SURFACE_STATE:
+        stages = {**stages, "terminal_state": PENDING_SURFACE_STATE}
     write_terminal_result(native_root, goal_id, success, stages)
 
     # Record terminal event
     events_path = native_root / "runs" / goal_id / "events.jsonl"
     log_event(
         events_path,
-        "goal.completed" if success else "goal.failed",
-        f"Goal {goal_id} {'completed' if success else 'failed'}",
-        {"success": success},
+        "goal.completed" if success else ("goal.changed_pending_surface_verification" if target_state == PENDING_SURFACE_STATE else "goal.failed"),
+        f"Goal {goal_id} {'completed' if success else target_state}",
+        {"success": success, "terminal_state": target_state},
     )
 
     # Remove lock only if still owned by this goal+pid+start_ticks
@@ -1339,6 +3290,34 @@ def run_goal(
         )
         return False, stages
     log_event(events_path, "agent.started", f"Starting goal {goal_id}", {"worktree": str(worktree)})
+    control_plane_baseline = collect_git_control_plane(worktree, EXPECTED_CANONICAL_REPO_URL, subprocess_adapter)
+    stages["git_control_plane_baseline"] = {
+        "passed": bool(control_plane_baseline.get("passed")),
+        "fingerprint": control_plane_baseline.get("fingerprint", ""),
+        "reason": control_plane_baseline.get("reason", ""),
+    }
+    if not control_plane_baseline.get("passed"):
+        log_event(
+            events_path,
+            "control_plane.failed",
+            "Git control-plane baseline failed",
+            {"reason": control_plane_baseline.get("reason", "unknown"), "terminal": False},
+        )
+        return False, stages
+
+    def lifecycle_control_plane_gate(stage: str) -> bool:
+        gate = verify_git_control_plane(worktree, EXPECTED_CANONICAL_REPO_URL, subprocess_adapter, control_plane_baseline, stage)
+        stages[f"git_control_plane_{stage}"] = gate
+        if not gate.get("passed"):
+            stages["reason"] = "control_plane_changed"
+            log_event(
+                events_path,
+                "control_plane.failed",
+                "Git control-plane fingerprint changed",
+                {"stage": stage, "reason": gate.get("reason", "unknown"), "terminal": False},
+            )
+            return False
+        return True
 
     prompt_goal_data = {**goal_data, "repo_worktree": str(worktree)}
     try:
@@ -1351,6 +3330,20 @@ def run_goal(
 
     # Step 1: Planner
     plan_profile = stage_profile("plan")
+    planner_worktree_baseline = git_diff_fingerprint(worktree, subprocess_adapter, include_ignored=True)
+    stages["planner_read_only_baseline"] = planner_worktree_baseline
+    if not planner_worktree_baseline.get("passed"):
+        log_event(events_path, "planner.failed", "Planner baseline worktree fingerprint failed", {"reason": planner_worktree_baseline.get("reason", "unknown")})
+        return False, stages
+    planner_control_baseline = collect_git_control_plane(worktree, EXPECTED_CANONICAL_REPO_URL, subprocess_adapter)
+    stages["planner_control_plane_baseline"] = {
+        "passed": bool(planner_control_baseline.get("passed")),
+        "fingerprint": planner_control_baseline.get("fingerprint", ""),
+        "reason": planner_control_baseline.get("reason", ""),
+    }
+    if not planner_control_baseline.get("passed"):
+        log_event(events_path, "planner.failed", "Planner baseline Git control-plane failed", {"reason": planner_control_baseline.get("reason", "unknown")})
+        return False, stages
     log_event(events_path, "model.requested", "Running read-only planner", {"profile": plan_profile, "source": STAGE_SOURCES["plan"]})
     planner_result = run_hermes_planner(worktree, goal_id, run_id, plan_prompt, subprocess_adapter)
     stages["planner"] = {
@@ -1362,6 +3355,31 @@ def run_goal(
         "profile": planner_result["profile"],
         "source": planner_result["source"],
     }
+    planner_worktree_after = git_diff_fingerprint(worktree, subprocess_adapter, include_ignored=True)
+    stages["planner_read_only_after"] = planner_worktree_after
+    if (
+        not planner_worktree_after.get("passed")
+        or planner_worktree_after.get("sha256") != planner_worktree_baseline.get("sha256")
+    ):
+        stages["reason"] = "planner_mutated_worktree"
+        log_event(
+            events_path,
+            "planner.failed",
+            "Read-only planner mutated worktree state",
+            {"reason": "planner_mutated_worktree", "terminal": False},
+        )
+        return False, stages
+    planner_control_after = verify_git_control_plane(worktree, EXPECTED_CANONICAL_REPO_URL, subprocess_adapter, planner_control_baseline, "after_planner")
+    stages["planner_control_plane_after"] = planner_control_after
+    if not planner_control_after.get("passed"):
+        stages["reason"] = "planner_mutated_control_plane"
+        log_event(
+            events_path,
+            "planner.failed",
+            "Read-only planner mutated Git control-plane state",
+            {"reason": "planner_mutated_control_plane", "control_reason": planner_control_after.get("reason", "unknown"), "terminal": False},
+        )
+        return False, stages
     if not planner_result["passed"]:
         log_event(events_path, "planner.failed", "Planner did not approve", {})
         return False, stages
@@ -1377,10 +3395,13 @@ def run_goal(
         "stdout_bytes": implementation_result["stdout_bytes"],
         "stderr_bytes": implementation_result["stderr_bytes"],
         "profile": implementation_result["profile"],
+        "authority_provider": implementation_result.get("authority_provider", ""),
         "source": implementation_result["source"],
     }
     if not implementation_result["passed"]:
         log_event(events_path, "implementation.failed", "Codex implementation failed", {})
+        return False, stages
+    if not lifecycle_control_plane_gate("after_implementation"):
         return False, stages
 
     # Step 3: Verify diff scope
@@ -1411,10 +3432,28 @@ def run_goal(
     if not acceptance_result["passed"]:
         log_event(events_path, "acceptance.failed", "Acceptance failed", {"exit_code": acceptance_result["exit_code"]})
         return False, stages
+    if not lifecycle_control_plane_gate("after_acceptance"):
+        return False, stages
+
+    post_acceptance_scope = check_git_scope(worktree, goal_data.get("allowed_files", []), subprocess_adapter)
+    stages["scope_check_after_acceptance"] = scope_stage_metadata(post_acceptance_scope)
+    if not post_acceptance_scope["passed"]:
+        log_event(
+            events_path,
+            "scope.failed",
+            f"Post-acceptance scope check failed: {post_acceptance_scope.get('reason', 'unknown')}",
+            {"stage": "post_acceptance", **scope_stage_metadata(post_acceptance_scope)},
+        )
+        return False, stages
 
     log_event(events_path, "acceptance.passed", "Acceptance passed", {"exit_code": 0})
 
     # Step 5: Final Review
+    pre_review_fingerprint = git_diff_fingerprint(worktree, subprocess_adapter)
+    stages["review_read_only_baseline"] = pre_review_fingerprint
+    if not pre_review_fingerprint.get("passed"):
+        log_event(events_path, "review.failed", "Review baseline diff fingerprint failed", {"reason": pre_review_fingerprint.get("reason", "unknown")})
+        return False, stages
     try:
         review_prompt = build_prompt(
             "review",
@@ -1435,13 +3474,59 @@ def run_goal(
         "stderr_bytes": reviewer_result["stderr_bytes"],
         "marker_found": reviewer_result["marker_found"],
         "profile": reviewer_result["profile"],
+        "authority_provider": reviewer_result.get("authority_provider", ""),
         "source": reviewer_result["source"],
     }
     if not reviewer_result["passed"]:
         log_event(events_path, "review.failed", "Final review did not pass", {})
         return False, stages
+    if not lifecycle_control_plane_gate("after_review"):
+        return False, stages
+
+    post_review_scope = check_git_scope(worktree, goal_data.get("allowed_files", []), subprocess_adapter)
+    stages["scope_check_after_review"] = scope_stage_metadata(post_review_scope)
+    if not post_review_scope["passed"]:
+        log_event(
+            events_path,
+            "scope.failed",
+            f"Post-review scope check failed: {post_review_scope.get('reason', 'unknown')}",
+            {"stage": "post_review", **scope_stage_metadata(post_review_scope)},
+        )
+        return False, stages
+    post_review_fingerprint = git_diff_fingerprint(worktree, subprocess_adapter)
+    stages["review_read_only_after"] = post_review_fingerprint
+    if (
+        not post_review_fingerprint.get("passed")
+        or post_review_fingerprint.get("sha256") != pre_review_fingerprint.get("sha256")
+    ):
+        stages["reason"] = "review_mutated_diff"
+        log_event(
+            events_path,
+            "review.failed",
+            "Final review mutated the diff",
+            {"stage": "post_review", "reason": "review_mutated_diff", "terminal": False},
+        )
+        return False, stages
 
     log_event(events_path, "review.passed", "Final review passed", {"profile": reviewer_result["profile"]})
+    if not lifecycle_control_plane_gate("before_shipping"):
+        return False, stages
+    log_event(events_path, "shipping.started", "Running deterministic shipping gates", {})
+    shipping_result = run_shipping_gates(worktree, goal_id, run_id, goal_data, acceptance_body, subprocess_adapter, control_plane_baseline)
+    stages["shipping"] = shipping_result
+    if shipping_result.get("terminal_state") == PENDING_SURFACE_STATE:
+        log_event(events_path, "deploy.ready", "Changes shipped but surface verification is pending", {
+            "terminal": False,
+            "reason": shipping_result.get("reason"),
+        })
+        return False, stages
+    if not shipping_result.get("passed"):
+        log_event(events_path, "shipping.failed", "Shipping gates failed", {"reason": shipping_result.get("reason", "unknown")})
+        return False, stages
+    log_event(events_path, "goal.shipped", "Goal shipped and verified", {
+        "commit_sha": shipping_result.get("commit", {}).get("sha"),
+        "pr_number": shipping_result.get("pull_request", {}).get("number"),
+    })
     return True, stages
 
 
@@ -1453,11 +3538,26 @@ class FakeSubprocess:
     """Injectable fake for self-tests. Configurable per-command responses."""
 
     def __init__(self) -> None:
-        self.responses: dict[str, CmdResult] = {}
+        self.responses: dict[str, CmdResult | list[CmdResult]] = {}
         self.calls: list[dict[str, Any]] = []
 
     def set_response(self, key: str, result: CmdResult) -> None:
         self.responses[key] = result
+
+    def set_responses(self, key: str, results: list[CmdResult]) -> None:
+        self.responses[key] = list(results)
+
+    def materialize_fake_clone(self, cmd: list[str], result: CmdResult) -> None:
+        normalized_cmd = normalized_git_cmd(cmd)
+        if result.returncode != 0 or normalized_cmd[:2] != ["git", "clone"]:
+            return
+        git_dir = Path(normalized_cmd[-1]) / ".git"
+        git_dir.mkdir(parents=True, exist_ok=True)
+        (git_dir / "config").write_text(
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tlogallrefupdates = true\n"
+            f"[remote \"origin\"]\n\turl = {EXPECTED_CANONICAL_REPO_URL}\n\tfetch = {CONTROL_PLANE_ALLOWED_REMOTE_FETCH}\n",
+            encoding="utf-8",
+        )
 
     def run_command(
         self,
@@ -1478,13 +3578,114 @@ class FakeSubprocess:
         })
         # Match on source tag or specific command patterns
         cmd_str = " ".join(cmd)
+        normalized_cmd = normalized_git_cmd(cmd)
+        normalized_cmd_str = " ".join(normalized_cmd)
         for key, resp in self.responses.items():
-            if key in cmd_str:
+            if key in cmd_str or key in normalized_cmd_str:
+                if isinstance(resp, list):
+                    if not resp:
+                        return CmdResult(returncode=0, stdout="", stderr="", stdout_bytes=0, stderr_bytes=0)
+                    result = resp.pop(0)
+                    self.materialize_fake_clone(cmd, result)
+                    return result
+                self.materialize_fake_clone(cmd, resp)
                 return resp
-        if cmd[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
+        if normalized_cmd[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
             return CmdResult(returncode=0, stdout="true\n", stderr="", stdout_bytes=5, stderr_bytes=0)
+        if normalized_cmd == ["git", "rev-parse", "--path-format=absolute", "--git-dir"]:
+            return CmdResult(returncode=0, stdout=f"{Path(cwd) / '.git'}\n", stderr="", stdout_bytes=len(str(Path(cwd) / ".git")) + 1, stderr_bytes=0)
+        if normalized_cmd == ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"]:
+            return CmdResult(returncode=0, stdout=f"{Path(cwd) / '.git'}\n", stderr="", stdout_bytes=len(str(Path(cwd) / ".git")) + 1, stderr_bytes=0)
+        if len(cmd) >= 6 and cmd[:2] == ["hermes", "--profile"] and cmd[3:6] == ["config", "get", "model.provider"]:
+            provider = "openai-codex" if cmd[2] == "default" else cmd[2]
+            return CmdResult(returncode=0, stdout=f"{provider}\n", stderr="", stdout_bytes=len(provider) + 1, stderr_bytes=0)
+        if normalized_cmd == ["git", "remote", "get-url", "origin"]:
+            return CmdResult(returncode=0, stdout=f"{EXPECTED_CANONICAL_REPO_URL}\n", stderr="", stdout_bytes=len(EXPECTED_CANONICAL_REPO_URL) + 1, stderr_bytes=0)
+        if normalized_cmd == ["git", "for-each-ref", "--format=%(refname)"]:
+            return CmdResult(returncode=0, stdout="refs/heads/feat/native-fixture\nrefs/remotes/origin/main\n", stderr="", stdout_bytes=55, stderr_bytes=0)
+        if normalized_cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return CmdResult(returncode=0, stdout="feat/native-fixture\n", stderr="", stdout_bytes=20, stderr_bytes=0)
+        if normalized_cmd == ["git", "rev-parse", "HEAD"]:
+            return CmdResult(returncode=0, stdout="0123456789abcdef0123456789abcdef01234567\n", stderr="", stdout_bytes=41, stderr_bytes=0)
+        if normalized_cmd == ["git", "log", "-1", "--pretty=%B"]:
+            return CmdResult(returncode=0, stdout="ship native goal\n", stderr="", stdout_bytes=17, stderr_bytes=0)
+        if normalized_cmd[:2] == ["git", "config"] or normalized_cmd == ["git", "add", "--all"]:
+            return CmdResult(returncode=0, stdout="", stderr="", stdout_bytes=0, stderr_bytes=0)
+        if normalized_cmd[:2] == ["git", "commit"]:
+            return CmdResult(returncode=0, stdout="[feat/native-fixture abc1234] ship\n", stderr="", stdout_bytes=33, stderr_bytes=0)
+        if normalized_cmd[:2] == ["git", "push"]:
+            return CmdResult(returncode=0, stdout="", stderr="", stdout_bytes=0, stderr_bytes=0)
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return CmdResult(returncode=0, stdout="https://github.com/director-phil/hermes-mission-control/pull/1\n", stderr="", stdout_bytes=62, stderr_bytes=0)
+        if cmd[:3] == ["gh", "pr", "view"] and "state,mergedAt,mergeCommit,url" in cmd:
+            body = json.dumps({
+                "state": "MERGED",
+                "mergedAt": "2026-08-05T00:00:00Z",
+                "mergeCommit": {"oid": "abcdefabcdefabcdefabcdefabcdefabcdefabcd"},
+                "url": "https://github.com/director-phil/hermes-mission-control/pull/1",
+            })
+            return CmdResult(returncode=0, stdout=body, stderr="", stdout_bytes=len(body), stderr_bytes=0)
+        if cmd[:3] == ["gh", "pr", "view"]:
+            body = json.dumps({"number": 1, "url": "https://github.com/director-phil/hermes-mission-control/pull/1", "headRefOid": "0123456789abcdef0123456789abcdef01234567", "reviewDecision": "APPROVED"})
+            return CmdResult(returncode=0, stdout=body, stderr="", stdout_bytes=len(body), stderr_bytes=0)
+        if cmd[:3] == ["gh", "pr", "checks"] or cmd[:3] == ["gh", "pr", "merge"]:
+            return CmdResult(returncode=0, stdout="", stderr="", stdout_bytes=0, stderr_bytes=0)
+        if cmd[:2] == ["gh", "api"] and len(cmd) > 2 and "deployments?sha=" in cmd[2]:
+            body = json.dumps([{
+                "id": 1001,
+                "sha": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "environment": "Production",
+                "statuses_url": "https://api.github.com/repos/director-phil/rt-ops-v2/deployments/1001/statuses",
+            }])
+            return CmdResult(returncode=0, stdout=body, stderr="", stdout_bytes=len(body), stderr_bytes=0)
+        if cmd[:2] == ["gh", "api"] and len(cmd) > 2 and "/statuses" in cmd[2]:
+            body = json.dumps([{"state": "success", "environment_url": "https://rt-ops-v2.vercel.app"}])
+            return CmdResult(returncode=0, stdout=body, stderr="", stdout_bytes=len(body), stderr_bytes=0)
+        if normalized_cmd == ["git", "fetch", "origin", "main"]:
+            return CmdResult(returncode=0, stdout="", stderr="", stdout_bytes=0, stderr_bytes=0)
+        if normalized_cmd[:3] == ["git", "merge-base", "--is-ancestor"]:
+            return CmdResult(returncode=0, stdout="", stderr="", stdout_bytes=0, stderr_bytes=0)
+        if cmd[:2] == ["vercel", "inspect"]:
+            return CmdResult(returncode=0, stdout="deployment ready\n", stderr="", stdout_bytes=17, stderr_bytes=0)
+        if normalized_cmd[:2] == ["git", "clone"]:
+            result = CmdResult(returncode=0, stdout="", stderr="", stdout_bytes=0, stderr_bytes=0)
+            self.materialize_fake_clone(cmd, result)
+            return result
+        if normalized_cmd[:3] == ["git", "checkout", "-B"]:
+            return CmdResult(returncode=0, stdout="", stderr="", stdout_bytes=0, stderr_bytes=0)
         # Default: success with no output
         return CmdResult(returncode=0, stdout="", stderr="", stdout_bytes=0, stderr_bytes=0)
+
+
+class MutatingPlannerSubprocess:
+    """Planner-boundary test adapter: real Git, intercepted Hermes stages."""
+
+    def __init__(self, mutation: Callable[[Path], None]) -> None:
+        self.mutation = mutation
+        self.real = RealSubprocess()
+        self.code_called = False
+        self.review_called = False
+
+    def run_command(
+        self,
+        cmd: list[str],
+        cwd: str,
+        timeout: int,
+        env: dict[str, str] | None,
+        capture: bool,
+        stdin_data: str | None = None,
+    ) -> CmdResult:
+        cmd_str = " ".join(cmd)
+        if "mission-control-goal-plan" in cmd_str:
+            self.mutation(Path(cwd))
+            return CmdResult(0, f"{PLAN_APPROVED_MARKER}\n", "", len(PLAN_APPROVED_MARKER) + 1, 0)
+        if "mission-control-goal-code" in cmd_str:
+            self.code_called = True
+            return CmdResult(0, "code\n", "", 5, 0)
+        if "mission-control-goal-review" in cmd_str:
+            self.review_called = True
+            return CmdResult(0, f"{REVIEW_PASS_MARKER}\n", "", len(REVIEW_PASS_MARKER) + 1, 0)
+        return self.real.run_command(cmd, cwd, timeout, env, capture, stdin_data)
 
 
 def _make_test_goal(
@@ -1535,7 +3736,7 @@ def self_test() -> tuple[bool, str]:
         os.environ["HERMES_NATIVE_CODE_PROFILE"] = DEFAULT_STAGE_PROFILES["code"]
         os.environ["HERMES_NATIVE_REVIEW_PROFILE"] = DEFAULT_STAGE_PROFILES["review"]
         native_root = Path(tmpdir) / "runtime"
-        for d in ("goals/ready", "goals/running", "goals/done", "goals/failed"):
+        for d in ("goals/staged", "goals/ready", "goals/running", "goals/done", "goals/failed", f"goals/{PENDING_SURFACE_STATE}"):
             (native_root / d).mkdir(parents=True)
 
         # Create git repo for worktree
@@ -1544,9 +3745,38 @@ def self_test() -> tuple[bool, str]:
         subprocess.run(["git", "init"], cwd=worktree_dir, capture_output=True, timeout=10)
         subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=worktree_dir, capture_output=True, timeout=5)
         subprocess.run(["git", "config", "user.name", "Test"], cwd=worktree_dir, capture_output=True, timeout=5)
+        subprocess.run(["git", "remote", "add", "origin", EXPECTED_CANONICAL_REPO_URL], cwd=worktree_dir, capture_output=True, timeout=5)
+        empty_hooks_dir_for_fresh_checkout(worktree_dir / ".git")
         (worktree_dir / "test.txt").write_text("initial\n")
         subprocess.run(["git", "add", "."], cwd=worktree_dir, capture_output=True, timeout=5)
         subprocess.run(["git", "commit", "-m", "init"], cwd=worktree_dir, capture_output=True, timeout=5)
+
+        def make_planner_guard_worktree(name: str) -> Path:
+            guard_worktree = Path(tmpdir) / name
+            guard_worktree.mkdir()
+            subprocess.run(["git", "init"], cwd=guard_worktree, capture_output=True, timeout=10)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=guard_worktree, capture_output=True, timeout=5)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=guard_worktree, capture_output=True, timeout=5)
+            subprocess.run(["git", "remote", "add", "origin", EXPECTED_CANONICAL_REPO_URL], cwd=guard_worktree, capture_output=True, timeout=5)
+            empty_hooks_dir_for_fresh_checkout(guard_worktree / ".git")
+            (guard_worktree / "test.txt").write_text("initial\n", encoding="utf-8")
+            (guard_worktree / ".gitignore").write_text("ignored.log\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=guard_worktree, capture_output=True, timeout=5)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=guard_worktree, capture_output=True, timeout=5)
+            return guard_worktree
+
+        def run_planner_mutation_fixture(name: str, mutation: Callable[[Path], None], expected_reason: str) -> tuple[bool, dict[str, Any], MutatingPlannerSubprocess]:
+            guard_worktree = make_planner_guard_worktree(f"planner-guard-{name}")
+            adapter = MutatingPlannerSubprocess(mutation)
+            goal_data = parse_goal_markdown(_make_test_goal(str(guard_worktree), title=f"Planner Guard {name}", allowed_files=["test.txt"]))
+            goal_data["goal_id"] = f"planner-guard-{name}"
+            success, stages = run_goal(guard_worktree / f"{name}.md", goal_data, native_root, adapter)
+            check(
+                f"planner_mutation_{name}_blocked",
+                not success and stages.get("reason") == expected_reason and not adapter.code_called and not adapter.review_called,
+                str(stages.get("reason")),
+            )
+            return success, stages, adapter
 
         # ---- Test 1: Successful lifecycle ----
         print("\n  --- Test 1: Success lifecycle ---")
@@ -1591,6 +3821,14 @@ def self_test() -> tuple[bool, str]:
             events_content = (native_root / "runs" / "goal-success" / "events.jsonl").read_text()
             check("no_stdout_leak", "Plan looks good" not in events_content)
             check("no_stderr_leak", "Code done" not in events_content)
+
+        # ---- Test 1b: Planner is mechanically read-only ----
+        print("\n  --- Test 1b: Planner read-only boundary ---")
+        run_planner_mutation_fixture("allowed-file", lambda wt: (wt / "test.txt").write_text("planner changed\n", encoding="utf-8"), "planner_mutated_worktree")
+        run_planner_mutation_fixture("out-of-scope", lambda wt: (wt / "outside.txt").write_text("planner changed\n", encoding="utf-8"), "planner_mutated_worktree")
+        run_planner_mutation_fixture("ignored-file", lambda wt: (wt / "ignored.log").write_text("planner changed\n", encoding="utf-8"), "planner_mutated_worktree")
+        run_planner_mutation_fixture("git-config", lambda wt: (wt / ".git" / "config").write_text((wt / ".git" / "config").read_text(encoding="utf-8") + "\n# planner changed\n", encoding="utf-8"), "planner_mutated_control_plane")
+        run_planner_mutation_fixture("git-hook", lambda wt: (wt / ".git" / "hooks" / "pre-commit").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8"), "planner_mutated_control_plane")
 
         # ---- Test 2: Empty planner output fails ----
         print("\n  --- Test 2: Empty planner output fails ---")
@@ -1923,10 +4161,152 @@ def self_test() -> tuple[bool, str]:
             st11 = get_process_start_ticks(pid11)
             finalize_result(native_root, "goal-review-empty", False, {}, pid11, st11)
 
+        def no_shipping_mutation_commands(fake_adapter: FakeSubprocess) -> bool:
+            return not any(
+                normalized_git_cmd(call["cmd"]) == ["git", "add", "--all"]
+                or normalized_git_cmd(call["cmd"])[:2] == ["git", "commit"]
+                or normalized_git_cmd(call["cmd"])[:2] == ["git", "push"]
+                or call["cmd"][:3] == ["gh", "pr", "create"]
+                or call["cmd"][:3] == ["gh", "pr", "merge"]
+                for call in fake_adapter.calls
+            )
+
+        # ---- Test 11b: Acceptance-created scope escape stops before shipping ----
+        print("\n  --- Test 11b: Post-acceptance scope recheck ---")
+        acceptance_scope_goal = parse_goal_markdown(_make_test_goal(
+            str(worktree_dir),
+            title="Acceptance Scope Escape",
+            allowed_files=["test.txt"],
+        ))
+        acceptance_scope_goal["goal_id"] = "acceptance-scope-escape"
+        fake_acceptance_scope = FakeSubprocess()
+        fake_acceptance_scope.set_response("mission-control-goal-plan", CmdResult(0, f"{PLAN_APPROVED_MARKER}\n", "", 15, 0))
+        fake_acceptance_scope.set_response("mission-control-goal-code", CmdResult(0, "done\n", "", 5, 0))
+        fake_acceptance_scope.set_responses("git status", [
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00?? forbidden.txt\x00", "", 31, 0),
+        ])
+        fake_acceptance_scope.set_response("git diff --numstat", CmdResult(0, "1\t1\ttest.txt\n", "", 15, 0))
+        fake_acceptance_scope.set_response("/usr/bin/bash", CmdResult(0, "", "", 0, 0))
+        acceptance_scope_success, acceptance_scope_stages = run_goal(
+            native_root / "goals" / "running" / "acceptance-scope-escape.md",
+            acceptance_scope_goal,
+            native_root,
+            fake_acceptance_scope,
+        )
+        check("post_acceptance_scope_escape_fails", not acceptance_scope_success and acceptance_scope_stages.get("scope_check_after_acceptance", {}).get("reason") == "out-of-allow-list changes detected")
+        check("post_acceptance_scope_escape_no_ship_commands", no_shipping_mutation_commands(fake_acceptance_scope))
+
+        binary_after_acceptance = worktree_dir / "image.png"
+        binary_after_acceptance.write_bytes(b"png\x00data")
+        binary_scope_goal = parse_goal_markdown(_make_test_goal(
+            str(worktree_dir),
+            title="Acceptance Binary",
+            allowed_files=["test.txt", "image.png"],
+        ))
+        binary_scope_goal["goal_id"] = "acceptance-binary"
+        fake_acceptance_binary = FakeSubprocess()
+        fake_acceptance_binary.set_response("mission-control-goal-plan", CmdResult(0, f"{PLAN_APPROVED_MARKER}\n", "", 15, 0))
+        fake_acceptance_binary.set_response("mission-control-goal-code", CmdResult(0, "done\n", "", 5, 0))
+        fake_acceptance_binary.set_responses("git status", [
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00?? image.png\x00", "", 27, 0),
+        ])
+        fake_acceptance_binary.set_response("git diff --numstat", CmdResult(0, "1\t1\ttest.txt\n", "", 15, 0))
+        fake_acceptance_binary.set_response("/usr/bin/bash", CmdResult(0, "", "", 0, 0))
+        binary_scope_success, binary_scope_stages = run_goal(
+            native_root / "goals" / "running" / "acceptance-binary.md",
+            binary_scope_goal,
+            native_root,
+            fake_acceptance_binary,
+        )
+        check("post_acceptance_binary_fails", not binary_scope_success and "binary/NUL untracked file" in binary_scope_stages.get("scope_check_after_acceptance", {}).get("reason", ""))
+        check("post_acceptance_binary_no_ship_commands", no_shipping_mutation_commands(fake_acceptance_binary))
+        binary_after_acceptance.unlink(missing_ok=True)
+
+        # ---- Test 11c: Review-created scope escape and mutations fail read-only ----
+        print("\n  --- Test 11c: Post-review scope/read-only recheck ---")
+        review_scope_goal = parse_goal_markdown(_make_test_goal(
+            str(worktree_dir),
+            title="Review Scope Escape",
+            allowed_files=["test.txt"],
+        ))
+        review_scope_goal["goal_id"] = "review-scope-escape"
+        fake_review_scope = FakeSubprocess()
+        fake_review_scope.set_response("mission-control-goal-plan", CmdResult(0, f"{PLAN_APPROVED_MARKER}\n", "", 15, 0))
+        fake_review_scope.set_response("mission-control-goal-code", CmdResult(0, "done\n", "", 5, 0))
+        fake_review_scope.set_responses("git status", [
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00?? review-forbidden.txt\x00", "", 38, 0),
+        ])
+        fake_review_scope.set_response("git diff --numstat", CmdResult(0, "1\t1\ttest.txt\n", "", 15, 0))
+        fake_review_scope.set_response("/usr/bin/bash", CmdResult(0, "", "", 0, 0))
+        fake_review_scope.set_response("mission-control-goal-review", CmdResult(0, f"{REVIEW_PASS_MARKER}\n", "", 13, 0))
+        review_scope_success, review_scope_stages = run_goal(
+            native_root / "goals" / "running" / "review-scope-escape.md",
+            review_scope_goal,
+            native_root,
+            fake_review_scope,
+        )
+        check("post_review_scope_escape_fails", not review_scope_success and review_scope_stages.get("scope_check_after_review", {}).get("reason") == "out-of-allow-list changes detected")
+        check("post_review_scope_escape_no_ship_commands", no_shipping_mutation_commands(fake_review_scope))
+
+        review_mutation_goal = parse_goal_markdown(_make_test_goal(
+            str(worktree_dir),
+            title="Review In Scope Mutation",
+            allowed_files=["test.txt"],
+        ))
+        review_mutation_goal["goal_id"] = "review-in-scope-mutation"
+        fake_review_mutation = FakeSubprocess()
+        fake_review_mutation.set_response("mission-control-goal-plan", CmdResult(0, f"{PLAN_APPROVED_MARKER}\n", "", 15, 0))
+        fake_review_mutation.set_response("mission-control-goal-code", CmdResult(0, "done\n", "", 5, 0))
+        fake_review_mutation.set_responses("git status", [
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+            CmdResult(0, " M test.txt\x00", "", 14, 0),
+        ])
+        fake_review_mutation.set_response("git diff --numstat", CmdResult(0, "1\t1\ttest.txt\n", "", 15, 0))
+        fake_review_mutation.set_responses("git diff --binary", [
+            CmdResult(0, "diff --git a/test.txt b/test.txt\n-old\n+new\n", "", 44, 0),
+            CmdResult(0, "diff --git a/test.txt b/test.txt\n-old\n+new\n", "", 44, 0),
+            CmdResult(0, "diff --git a/test.txt b/test.txt\n-old\n+new\n", "", 44, 0),
+            CmdResult(0, "diff --git a/test.txt b/test.txt\n-old\n+review-new\n", "", 51, 0),
+        ])
+        fake_review_mutation.set_response("/usr/bin/bash", CmdResult(0, "", "", 0, 0))
+        fake_review_mutation.set_response("mission-control-goal-review", CmdResult(0, f"{REVIEW_PASS_MARKER}\n", "", 13, 0))
+        review_mutation_success, review_mutation_stages = run_goal(
+            native_root / "goals" / "running" / "review-in-scope-mutation.md",
+            review_mutation_goal,
+            native_root,
+            fake_review_mutation,
+        )
+        check("post_review_in_scope_mutation_fails", not review_mutation_success and review_mutation_stages.get("reason") == "review_mutated_diff")
+        check("post_review_in_scope_mutation_no_ship_commands", no_shipping_mutation_commands(fake_review_mutation))
+
         # ---- Test 12: Native root isolation ----
         print("\n  --- Test 12: Native root isolation ---")
         other_root = Path(tmpdir) / "other-runtime"
-        for d in ("goals/ready", "goals/running", "goals/done", "goals/failed"):
+        for d in ("goals/staged", "goals/ready", "goals/running", "goals/done", "goals/failed", f"goals/{PENDING_SURFACE_STATE}"):
             (other_root / d).mkdir(parents=True)
         (other_root / "goals" / "ready" / "goal-iso.md").write_text(
             _make_test_goal(str(worktree_dir), title="Isolation Goal")
@@ -1999,6 +4379,20 @@ def self_test() -> tuple[bool, str]:
         if runnable_path and runnable_goal:
             finalize_result(native_root, "zzz-runnable-child", False, {}, os.getpid(), get_process_start_ticks(os.getpid()))
         (native_root / "goals" / "ready" / "aaa-blocked-child.md").unlink(missing_ok=True)
+
+        # ---- Test 13c: Ready hard-stop blocks before dependency/lock/model ----
+        print("\n  --- Test 13c: Ready hard-stop fail-closed ---")
+        ready_hard_stop_goal = _make_test_goal(str(worktree_dir), title="Ready Hard Stop").replace("dependencies:\n", "dependencies: missing-parent\nhard_stop: true\n")
+        (native_root / "goals" / "ready" / "aaa-ready-hard-stop.md").write_text(ready_hard_stop_goal, encoding="utf-8")
+        ready_hard_stop_claim, ready_hard_stop_data = claim_ready_goal(native_root)
+        ready_hard_stop_events = (native_root / "runs" / "aaa-ready-hard-stop" / "events.jsonl").read_text(encoding="utf-8")
+        check("ready_hard_stop_not_claimed", ready_hard_stop_claim is None and ready_hard_stop_data is None)
+        check("ready_hard_stop_remains_ready", (native_root / "goals" / "ready" / "aaa-ready-hard-stop.md").exists())
+        check("ready_hard_stop_no_controller_lock", not (native_root / "controller.lock").exists())
+        check("ready_hard_stop_non_terminal_events", "promotion.blocked" in ready_hard_stop_events and "goal.blocked" in ready_hard_stop_events and "goal.failed" not in ready_hard_stop_events and "goal.completed" not in ready_hard_stop_events)
+        check("ready_hard_stop_before_dependency_release", "missing-parent" not in ready_hard_stop_events and '"hard_stop":true' in ready_hard_stop_events)
+        check("ready_hard_stop_zero_model_calls", "model.requested" not in ready_hard_stop_events)
+        (native_root / "goals" / "ready" / "aaa-ready-hard-stop.md").unlink(missing_ok=True)
 
         # ---- Test 14: Real untracked binary/NUL file is rejected ----
         print("\n  --- Test 14: Real untracked binary rejection ---")
@@ -2214,7 +4608,8 @@ def self_test() -> tuple[bool, str]:
         fake_contract.set_response("/usr/bin/bash", CmdResult(0, "", "", 0, 0))
         fake_contract.set_response("mission-control-goal-review", CmdResult(0, f"{REVIEW_PASS_MARKER}\n", "", 13, 0))
         run_goal(native_root / "goals" / "running" / "contract-goal.md", contract_goal, native_root, fake_contract)
-        hermes_calls = [call for call in fake_contract.calls if call["cmd"][:1] == ["hermes"]]
+        hermes_calls = [call for call in fake_contract.calls if call["cmd"][:1] == ["hermes"] and "chat" in call["cmd"]]
+        provider_resolution_calls = [call for call in fake_contract.calls if call["cmd"][:4] == ["hermes", "--profile", "default", "config"]]
         acceptance_calls = [call for call in fake_contract.calls if call["cmd"][:1] == ["/usr/bin/bash"]]
         argv_blob = json.dumps([call["cmd"] for call in hermes_calls])
         all_argv_blob = json.dumps([call["cmd"] for call in fake_contract.calls])
@@ -2222,10 +4617,11 @@ def self_test() -> tuple[bool, str]:
         env_blob = json.dumps([call["env"] for call in stage_env_calls], sort_keys=True)
         stdin_values = [call["stdin_data"] or "" for call in hermes_calls]
         check("prompt_three_hermes_calls", len(hermes_calls) == 3)
+        check("codex_authority_provider_resolved_before_code_review", len(provider_resolution_calls) == 2)
         check("prompt_absent_from_argv", sensitive_marker not in argv_blob and "HERMES_NATIVE_CANARY_OK" not in argv_blob)
         check("prompt_absent_from_env", sensitive_marker not in env_blob and "HERMES_NATIVE_CANARY_OK" not in env_blob)
         check("prompt_delivered_via_stdin", sum(sensitive_marker in value for value in stdin_values) == 3)
-        check("acceptance_one_bash_call", len(acceptance_calls) == 1)
+        check("acceptance_two_bash_calls_with_shipping_rerun", len(acceptance_calls) == 2)
         check("acceptance_full_run_argv_exact", acceptance_calls and acceptance_calls[0]["cmd"] == ["/usr/bin/bash", "-e", "-u", "-o", "pipefail", "-s"])
         check("acceptance_full_run_stdin_exact", acceptance_calls and acceptance_calls[0]["stdin_data"] == acceptance_contract_body)
         check("acceptance_marker_absent_from_all_argv", sensitive_acceptance_marker not in all_argv_blob)
@@ -2291,7 +4687,8 @@ def self_test() -> tuple[bool, str]:
                 os.environ.pop("HERMES_NATIVE_REVIEW_PROFILE", None)
             else:
                 os.environ["HERMES_NATIVE_REVIEW_PROFILE"] = previous_review_profile
-        check("forbidden_local_code_review_profiles_fail_closed", not forbidden_code["passed"] and not forbidden_review["passed"] and forbidden_profile_fake.calls == [])
+        forbidden_chat_calls = [call for call in forbidden_profile_fake.calls if call["cmd"][:1] == ["hermes"] and "chat" in call["cmd"]]
+        check("forbidden_local_code_review_profiles_fail_closed", not forbidden_code["passed"] and not forbidden_review["passed"] and forbidden_chat_calls == [])
 
         # ---- Test 20: Acceptance body preserves CRLF bytes and no file-final newline ----
         print("\n  --- Test 20: Acceptance body byte preservation ---")
@@ -2375,6 +4772,863 @@ def self_test() -> tuple[bool, str]:
         check("spaces_ppid", ppid_s == 5)
         check("spaces_starttime", st_s == 42)
 
+        # ---- Test 25: One-shot migration skips invalid and preserves historical provenance ----
+        print("\n  --- Test 25: Migration import/provenance ---")
+        legacy_root = Path(tmpdir) / "legacy-ledger"
+        legacy_root.mkdir()
+        historical_goal = _make_test_goal(str(worktree_dir), title="Historical Done", allowed_files=["test.txt"])
+        historical_goal = historical_goal.replace("dependencies:\n", "status: completed\ndepends_on:\n  - done-parent\n")
+        historical_goal += "\n## Result\n\nVerified shipped in PR #123: https://github.com/director-phil/rt-ops-v2/pull/123\nMerge SHA: abcdefabcdefabcdefabcdefabcdefabcdefabcd\n"
+        ambiguous_done_goal = historical_goal.replace("Verified shipped in PR #123: https://github.com/director-phil/rt-ops-v2/pull/123\nMerge SHA: abcdefabcdefabcdefabcdefabcdefabcdefabcd", "verified success and shipped")
+        not_verified_goal = historical_goal.replace("Verified shipped", "not verified, not shipped")
+        failed_goal = historical_goal.replace("Verified shipped", "failed and blocked")
+        raw_data_goal = historical_goal.replace("Verified shipped", "raw data hard stop shipped")
+        staged_goal = _make_test_goal(str(worktree_dir), title="Migrated Staged", allowed_files=["test.txt"]).replace("dependencies:\n", "depends_on: historical-done\n")
+        hard_stop_goal = _make_test_goal(str(worktree_dir), title="Hard Stop", allowed_files=["test.txt"]).replace("dependencies:\n", "hard_stop: true\ndependencies:\n")
+        (legacy_root / "historical-done.md").write_text(historical_goal, encoding="utf-8")
+        (legacy_root / "ambiguous-done.md").write_text(ambiguous_done_goal, encoding="utf-8")
+        (legacy_root / "not-verified.md").write_text(not_verified_goal, encoding="utf-8")
+        (legacy_root / "failed-done.md").write_text(failed_goal, encoding="utf-8")
+        (legacy_root / "raw-data-stop.md").write_text(raw_data_goal, encoding="utf-8")
+        (legacy_root / "staged-child.md").write_text(staged_goal, encoding="utf-8")
+        (legacy_root / "ringcentral-sms.md").write_text(staged_goal, encoding="utf-8")
+        (legacy_root / "hard-stop.md").write_text(hard_stop_goal, encoding="utf-8")
+        (legacy_root / "invalid-no-acceptance.md").write_text("---\ntitle: Invalid\nrepo/workdir: /x\n---\nNo acceptance\n", encoding="utf-8")
+        migration_root = Path(tmpdir) / "migration-runtime"
+        fake_migration = FakeSubprocess()
+        report = migrate_legacy_goals(
+            legacy_root,
+            migration_root,
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            exclude_regex="ringcentral|podium",
+            subprocess_adapter=fake_migration,
+            configured_canonical_repo=worktree_dir,
+        )
+        staged_text = (migration_root / "goals" / "staged" / "staged-child.md").read_text(encoding="utf-8")
+        check("migration_imports_staged", (migration_root / "goals" / "staged" / "staged-child.md").exists())
+        check("migration_renders_v2_repo_workdir", f"repo/workdir: {worktree_dir}" in staged_text)
+        check("migration_operator_excludes_ringcentral", not (migration_root / "goals" / "staged" / "ringcentral-sms.md").exists() and any(item["reason"] == "operator_excluded" for item in report["skipped"]))
+        check("migration_skips_invalid_no_acceptance", any(item["goal_id"] == "invalid-no-acceptance" for item in report["skipped"]))
+        historical_result = json.loads((migration_root / "runs" / "historical-done" / "result.json").read_text(encoding="utf-8"))
+        check("migration_historical_done_result", (migration_root / "goals" / "done" / "historical-done.md").exists() and historical_result.get("provenance") == MIGRATED_HISTORICAL_PROVENANCE)
+        check("migration_rejects_ambiguous_done", (migration_root / "goals" / "staged" / "ambiguous-done.md").exists() and not (migration_root / "goals" / "done" / "ambiguous-done.md").exists())
+        check("migration_rejects_not_verified", (migration_root / "goals" / "staged" / "not-verified.md").exists() and not (migration_root / "goals" / "done" / "not-verified.md").exists())
+        check("migration_rejects_failed_blocked", (migration_root / "goals" / "staged" / "failed-done.md").exists() and not (migration_root / "goals" / "done" / "failed-done.md").exists())
+        check("migration_rejects_raw_data_hard_stop", (migration_root / "goals" / "staged" / "raw-data-stop.md").exists() and not (migration_root / "goals" / "done" / "raw-data-stop.md").exists())
+        check("migration_hard_stop_staged", "hard_stop: true" in (migration_root / "goals" / "staged" / "hard-stop.md").read_text(encoding="utf-8"))
+        duplicate_root = Path(tmpdir) / "legacy-duplicates"
+        (duplicate_root / "a").mkdir(parents=True)
+        (duplicate_root / "b").mkdir(parents=True)
+        (duplicate_root / "a" / "duplicate.md").write_text(staged_goal, encoding="utf-8")
+        (duplicate_root / "b" / "duplicate.md").write_text(historical_goal, encoding="utf-8")
+        duplicate_migration_root = Path(tmpdir) / "migration-duplicates"
+        duplicate_report = migrate_legacy_goals(
+            duplicate_root,
+            duplicate_migration_root,
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            subprocess_adapter=fake_migration,
+            configured_canonical_repo=worktree_dir,
+        )
+        check("migration_duplicate_ids_quarantined", not (duplicate_migration_root / "goals" / "staged" / "duplicate.md").exists() and not (duplicate_migration_root / "goals" / "done" / "duplicate.md").exists() and not (duplicate_migration_root / "runs" / "duplicate").exists())
+        check("migration_duplicate_report_deterministic", duplicate_report["duplicates"] == [{"goal_id": "duplicate", "source_paths": ["a/duplicate.md", "b/duplicate.md"], "reason": "duplicate_goal_id"}])
+        for state_dir in NATIVE_GOAL_STATE_DIRS:
+            collision_legacy = Path(tmpdir) / f"legacy-collision-{state_dir}"
+            collision_legacy.mkdir()
+            (collision_legacy / "collision-goal.md").write_text(staged_goal, encoding="utf-8")
+            collision_root = Path(tmpdir) / f"migration-collision-{state_dir}"
+            (collision_root / "goals" / state_dir).mkdir(parents=True)
+            (collision_root / "runs").mkdir(parents=True)
+            (collision_root / "goals" / state_dir / "collision-goal.md").write_text(staged_goal, encoding="utf-8")
+            collision_report = migrate_legacy_goals(
+                collision_legacy,
+                collision_root,
+                worktree_dir,
+                EXPECTED_CANONICAL_REPO_URL,
+                subprocess_adapter=fake_migration,
+                configured_canonical_repo=worktree_dir,
+            )
+            check(
+                f"migration_collision_blocks_{state_dir}",
+                collision_report["collisions"] == [{
+                    "goal_id": "collision-goal",
+                    "locations": [f"goals/{state_dir}/collision-goal.md"],
+                    "reason": "native_id_collision",
+                }] and collision_report["imported"] == [] and collision_report["historical_done"] == [],
+            )
+        run_collision_legacy = Path(tmpdir) / "legacy-run-collision"
+        run_collision_legacy.mkdir()
+        (run_collision_legacy / "run-collision.md").write_text(historical_goal.replace("historical-done", "run-collision"), encoding="utf-8")
+        run_collision_root = Path(tmpdir) / "migration-run-collision"
+        (run_collision_root / "runs" / "run-collision").mkdir(parents=True)
+        run_collision_report = migrate_legacy_goals(
+            run_collision_legacy,
+            run_collision_root,
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            subprocess_adapter=fake_migration,
+            configured_canonical_repo=worktree_dir,
+        )
+        check(
+            "migration_collision_blocks_existing_run_authority",
+            run_collision_report["collisions"] == [{
+                "goal_id": "run-collision",
+                "locations": ["runs/run-collision"],
+                "reason": "native_id_collision",
+            }] and not (run_collision_root / "goals" / "done" / "run-collision.md").exists() and not (run_collision_root / "goals" / "staged" / "run-collision.md").exists(),
+        )
+        symlink_root = Path(tmpdir) / "legacy-link"
+        try:
+            symlink_root.symlink_to(legacy_root, target_is_directory=True)
+            migrate_legacy_goals(
+                symlink_root,
+                Path(tmpdir) / "migration-symlink",
+                worktree_dir,
+                EXPECTED_CANONICAL_REPO_URL,
+                subprocess_adapter=fake_migration,
+                configured_canonical_repo=worktree_dir,
+            )
+            symlink_rejected = False
+        except ValueError:
+            symlink_rejected = True
+        check("migration_symlink_root_rejected", symlink_rejected)
+        bounded_root = Path(tmpdir) / "legacy-bounded"
+        bounded_root.mkdir()
+        (bounded_root / "oversized.md").write_text("#" * (MAX_MIGRATION_FILE_BYTES + 1), encoding="utf-8")
+        try:
+            migrate_legacy_goals(
+                bounded_root,
+                Path(tmpdir) / "migration-bounded",
+                worktree_dir,
+                EXPECTED_CANONICAL_REPO_URL,
+                subprocess_adapter=fake_migration,
+                configured_canonical_repo=worktree_dir,
+            )
+            byte_bound_rejected = False
+        except ValueError:
+            byte_bound_rejected = True
+        check("migration_file_byte_bound_rejected", byte_bound_rejected)
+
+        # ---- Test 26: Staged promotion is serial, dependency-aware, and hard-stop ineligible ----
+        print("\n  --- Test 26: Staged promotion ---")
+        promote_root = Path(tmpdir) / "promote-runtime"
+        for d in ("goals/staged", "goals/ready", "goals/done", "runs"):
+            (promote_root / d).mkdir(parents=True, exist_ok=True)
+        (promote_root / "goals" / "done" / "historical-done.md").write_text(_make_test_goal(str(worktree_dir), title="Historical Done"), encoding="utf-8")
+        atomic_write_json(promote_root / "runs" / "historical-done" / "result.json", {
+            "goal_id": "historical-done",
+            "success": True,
+            "provenance": MIGRATED_HISTORICAL_PROVENANCE,
+        })
+        (promote_root / "goals" / "staged" / "aaa-hard-stop.md").write_text(hard_stop_goal, encoding="utf-8")
+        (promote_root / "goals" / "staged" / "bbb-blocked.md").write_text(staged_goal.replace("historical-done", "missing-parent"), encoding="utf-8")
+        (promote_root / "goals" / "staged" / "ccc-ready.md").write_text(staged_goal, encoding="utf-8")
+        promote_fake = FakeSubprocess()
+        promoted, promoted_goal = promote_one_staged_goal(
+            promote_root,
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            promote_fake,
+            Path(tmpdir) / "worktrees",
+            configured_canonical_repo=worktree_dir,
+        )
+        ready_text = (promote_root / "goals" / "ready" / "ccc-ready.md").read_text(encoding="utf-8")
+        promote_clone_calls = [normalized_git_cmd(call["cmd"]) for call in promote_fake.calls if normalized_git_cmd(call["cmd"])[:2] == ["git", "clone"]]
+        promote_clone_has_reference_arg = any(arg.startswith("--reference") for call in promote_clone_calls for arg in call)
+        check("promotion_exactly_one_goal", promoted and promoted_goal == "ccc-ready" and len(list((promote_root / "goals" / "ready").glob("*.md"))) == 1)
+        check("promotion_hard_stop_remains_staged", (promote_root / "goals" / "staged" / "aaa-hard-stop.md").exists())
+        check("promotion_blocked_remains_staged", (promote_root / "goals" / "staged" / "bbb-blocked.md").exists())
+        check("promotion_rewrites_checkout_path", "mission-control-worktrees" in ready_text or "worktrees" in ready_text)
+        check("promotion_clones_expected_origin_without_reference", promote_clone_calls and promote_clone_calls[0][2:5] == ["--origin", "origin", EXPECTED_CANONICAL_REPO_URL] and not promote_clone_has_reference_arg)
+        promoted_again, promoted_again_goal = promote_one_staged_goal(
+            promote_root,
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            promote_fake,
+            Path(tmpdir) / "worktrees",
+            configured_canonical_repo=worktree_dir,
+        )
+        check("promotion_ready_goal_prevents_second_promotion", not promoted_again and promoted_again_goal is None and len(list((promote_root / "goals" / "ready").glob("*.md"))) == 1)
+        crash_claim_path, crash_claim_goal = claim_ready_goal(promote_root)
+        check("promotion_restart_claims_existing_ready", crash_claim_path is not None and crash_claim_goal and crash_claim_goal.get("goal_id") == "ccc-ready" and not (promote_root / "goals" / "ready" / "ccc-ready.md").exists())
+        if crash_claim_path:
+            finalize_result(promote_root, "ccc-ready", False, {}, os.getpid(), get_process_start_ticks(os.getpid()))
+
+        duplicate_claim_root = Path(tmpdir) / "duplicate-claim-runtime"
+        for d in ("goals/staged", "goals/ready", "goals/running", "goals/done", "goals/failed", "runs"):
+            (duplicate_claim_root / d).mkdir(parents=True, exist_ok=True)
+        (duplicate_claim_root / "goals" / "ready" / "dup-claim.md").write_text(_make_test_goal(str(worktree_dir), title="Dup Claim"), encoding="utf-8")
+        (duplicate_claim_root / "goals" / "running" / "dup-claim.md").write_text(_make_test_goal(str(worktree_dir), title="Dup Claim Running"), encoding="utf-8")
+        duplicate_claim_path, duplicate_claim_goal = claim_ready_goal(duplicate_claim_root)
+        duplicate_claim_events = (duplicate_claim_root / "runs" / "dup-claim" / "events.jsonl").read_text(encoding="utf-8")
+        check("duplicate_state_blocks_claim_non_terminal", duplicate_claim_path is None and duplicate_claim_goal is None and "integrity.failed" in duplicate_claim_events and "goal.failed" not in duplicate_claim_events and not (duplicate_claim_root / "controller.lock").exists())
+
+        staged_ready_recovery_root = Path(tmpdir) / "staged-ready-recovery"
+        for d in ("goals/staged", "goals/ready", "goals/running", "goals/done", "goals/failed", "runs"):
+            (staged_ready_recovery_root / d).mkdir(parents=True, exist_ok=True)
+        (staged_ready_recovery_root / "goals" / "done" / "historical-done.md").write_text(_make_test_goal(str(worktree_dir), title="Historical Done"), encoding="utf-8")
+        atomic_write_json(staged_ready_recovery_root / "runs" / "historical-done" / "result.json", {"goal_id": "historical-done", "success": True})
+        recovery_staged = staged_goal
+        recovery_ready = replace_frontmatter_value(staged_goal, "repo/workdir", str(Path(tmpdir) / "worktrees" / "recovered"))
+        (staged_ready_recovery_root / "goals" / "staged" / "recover-me.md").write_text(recovery_staged, encoding="utf-8")
+        (staged_ready_recovery_root / "goals" / "ready" / "recover-me.md").write_text(recovery_ready, encoding="utf-8")
+        recovered_claim_path, recovered_claim_goal = claim_ready_goal(staged_ready_recovery_root)
+        recovered_events = (staged_ready_recovery_root / "runs" / "recover-me" / "events.jsonl").read_text(encoding="utf-8")
+        check("staged_ready_duplicate_recovered_to_single_ready_claim", recovered_claim_path is not None and recovered_claim_goal and recovered_claim_goal.get("goal_id") == "recover-me" and not (staged_ready_recovery_root / "goals" / "staged" / "recover-me.md").exists() and "integrity.recovered" in recovered_events)
+        if recovered_claim_path:
+            finalize_result(staged_ready_recovery_root, "recover-me", False, {}, os.getpid(), get_process_start_ticks(os.getpid()))
+
+        staged_ready_conflict_root = Path(tmpdir) / "staged-ready-conflict"
+        for d in ("goals/staged", "goals/ready", "goals/running", "goals/done", "goals/failed", "runs"):
+            (staged_ready_conflict_root / d).mkdir(parents=True, exist_ok=True)
+        (staged_ready_conflict_root / "goals" / "staged" / "conflict-me.md").write_text(staged_goal, encoding="utf-8")
+        (staged_ready_conflict_root / "goals" / "ready" / "conflict-me.md").write_text(staged_goal.replace("Migrated Staged", "Different Ready"), encoding="utf-8")
+        conflict_claim_path, conflict_claim_goal = claim_ready_goal(staged_ready_conflict_root)
+        conflict_events = (staged_ready_conflict_root / "runs" / "conflict-me" / "events.jsonl").read_text(encoding="utf-8")
+        check("staged_ready_content_conflict_quarantined", conflict_claim_path is None and conflict_claim_goal is None and not (staged_ready_conflict_root / "goals" / "staged" / "conflict-me.md").exists() and not (staged_ready_conflict_root / "goals" / "ready" / "conflict-me.md").exists() and (staged_ready_conflict_root / "goals" / "failed" / "conflict-me.staged.conflict.md").exists() and (staged_ready_conflict_root / "goals" / "failed" / "conflict-me.ready.conflict.md").exists() and "integrity.quarantined" in conflict_events and "goal.failed" not in conflict_events)
+
+        running_blocks_root = Path(tmpdir) / "promote-running-blocks"
+        for d in ("goals/staged", "goals/running", "goals/done", "runs"):
+            (running_blocks_root / d).mkdir(parents=True, exist_ok=True)
+        (running_blocks_root / "goals" / "done" / "historical-done.md").write_text(_make_test_goal(str(worktree_dir), title="Historical Done"), encoding="utf-8")
+        atomic_write_json(running_blocks_root / "runs" / "historical-done" / "result.json", {"goal_id": "historical-done", "success": True})
+        (running_blocks_root / "goals" / "running" / "already-running.md").write_text(_make_test_goal(str(worktree_dir), title="Already Running"), encoding="utf-8")
+        (running_blocks_root / "goals" / "staged" / "next-ready.md").write_text(staged_goal, encoding="utf-8")
+        running_promoted, _ = promote_one_staged_goal(
+            running_blocks_root,
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            FakeSubprocess(),
+            Path(tmpdir) / "worktrees-running-blocks",
+            configured_canonical_repo=worktree_dir,
+        )
+        check("promotion_running_goal_blocks_without_controller_lock", not running_promoted and (running_blocks_root / "goals" / "staged" / "next-ready.md").exists() and not (running_blocks_root / "goals" / "ready" / "next-ready.md").exists())
+
+        promotion_lock_root = Path(tmpdir) / "promotion-lock-runtime"
+        promotion_lock_root.mkdir(parents=True, exist_ok=True)
+        stale_promotion_lock = promotion_lock_root / "promotion.lock"
+        stale_promotion_lock.write_text(json.dumps({
+            "pid": 999999,
+            "proc_start_ticks": 123,
+            "created_at": datetime.now(UTC).isoformat(),
+            "purpose": "fixture-stale",
+        }), encoding="utf-8")
+        stale_owner = create_promotion_lock(promotion_lock_root, "fixture-recovery")
+        stale_events = (promotion_lock_root / "controller-events.jsonl").read_text(encoding="utf-8")
+        check("promotion_lock_stale_recovered", bool(stale_owner) and "Recovered stale native promotion lock" in stale_events)
+        cleanup_promotion_lock(promotion_lock_root, stale_owner)
+
+        reused_promotion_root = Path(tmpdir) / "promotion-lock-reused-runtime"
+        reused_promotion_root.mkdir(parents=True, exist_ok=True)
+        our_pid = os.getpid()
+        our_ticks = get_process_start_ticks(our_pid)
+        (reused_promotion_root / "promotion.lock").write_text(json.dumps({
+            "pid": our_pid,
+            "proc_start_ticks": (our_ticks or 0) + 99999,
+            "created_at": datetime.now(UTC).isoformat(),
+            "purpose": "fixture-reused",
+        }), encoding="utf-8")
+        reused_owner = create_promotion_lock(reused_promotion_root, "fixture-reused-recovery")
+        reused_events = (reused_promotion_root / "controller-events.jsonl").read_text(encoding="utf-8")
+        check("promotion_lock_reused_pid_recovered", bool(reused_owner) and "Recovered stale native promotion lock" in reused_events)
+        cleanup_promotion_lock(reused_promotion_root, reused_owner)
+
+        live_promotion_root = Path(tmpdir) / "promotion-lock-live-runtime"
+        live_promotion_root.mkdir(parents=True, exist_ok=True)
+        live_owner = create_promotion_lock(live_promotion_root, "fixture-live")
+        blocked_owner = create_promotion_lock(live_promotion_root, "fixture-live-blocked")
+        check("promotion_lock_live_holder_blocks", bool(live_owner) and blocked_owner is None and (live_promotion_root / "promotion.lock").exists())
+        cleanup_promotion_lock(live_promotion_root, {"pid": 1, "proc_start_ticks": 1})
+        check("promotion_lock_cleanup_requires_owner", (live_promotion_root / "promotion.lock").exists())
+        cleanup_promotion_lock(live_promotion_root, live_owner)
+        check("promotion_lock_owned_cleanup_removes", not (live_promotion_root / "promotion.lock").exists())
+
+        concurrent_root = Path(tmpdir) / "promote-concurrent"
+        for d in ("goals/staged", "goals/ready", "goals/running", "goals/done", "runs"):
+            (concurrent_root / d).mkdir(parents=True, exist_ok=True)
+        (concurrent_root / "goals" / "done" / "historical-done.md").write_text(_make_test_goal(str(worktree_dir), title="Historical Done"), encoding="utf-8")
+        atomic_write_json(concurrent_root / "runs" / "historical-done" / "result.json", {"goal_id": "historical-done", "success": True})
+        (concurrent_root / "goals" / "staged" / "aaa-concurrent.md").write_text(staged_goal, encoding="utf-8")
+        (concurrent_root / "goals" / "staged" / "bbb-concurrent.md").write_text(staged_goal.replace("Migrated Staged", "Migrated Staged B"), encoding="utf-8")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            concurrent_results = list(executor.map(
+                lambda _i: promote_one_staged_goal(
+                    concurrent_root,
+                    worktree_dir,
+                    EXPECTED_CANONICAL_REPO_URL,
+                    FakeSubprocess(),
+                    Path(tmpdir) / "worktrees-concurrent",
+                    configured_canonical_repo=worktree_dir,
+                ),
+                range(2),
+            ))
+        active_count = len(list((concurrent_root / "goals" / "ready").glob("*.md"))) + len(list((concurrent_root / "goals" / "running").glob("*.md")))
+        check("promotion_concurrent_attempts_leave_at_most_one_active", active_count <= 1 and sum(1 for promoted_result, _ in concurrent_results if promoted_result) <= 1)
+        fake_checkout = FakeSubprocess()
+        _, checkout_meta = prepare_isolated_checkout(
+            "checkout-goal",
+            "feat",
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            Path(tmpdir) / "worktrees2",
+            fake_checkout,
+            configured_canonical_repo=worktree_dir,
+        )
+        checkout_cmds = [" ".join(normalized_git_cmd(call["cmd"])) for call in fake_checkout.calls]
+        checkout_clone_calls = [normalized_git_cmd(call["cmd"]) for call in fake_checkout.calls if normalized_git_cmd(call["cmd"])[:2] == ["git", "clone"]]
+        checkout_clone_has_reference_arg = any(arg.startswith("--reference") for call in checkout_clone_calls for arg in call)
+        check("fresh_checkout_uses_clone_fetch_branch", any("git clone" in cmd for cmd in checkout_cmds) and any("git fetch origin main" in cmd for cmd in checkout_cmds) and any("git checkout -B feat/native-checkout-goal origin/main" in cmd for cmd in checkout_cmds))
+        check("fresh_checkout_clone_argv_exact_origin_no_reference", checkout_clone_calls and checkout_clone_calls[0][2:5] == ["--origin", "origin", EXPECTED_CANONICAL_REPO_URL] and not checkout_clone_has_reference_arg)
+        check("fresh_checkout_origin_remains_expected_github", any(normalized_git_cmd(call["cmd"]) == ["git", "remote", "get-url", "origin"] for call in fake_checkout.calls))
+        check("fresh_checkout_neutral_branch", checkout_meta.get("branch") == "feat/native-checkout-goal")
+        check("fresh_checkout_status_checks_untracked_and_ignored", any(normalized_git_cmd(call["cmd"]) == ["git", "status", "--porcelain=v1", "--untracked-files=all"] for call in fake_checkout.calls) and any(normalized_git_cmd(call["cmd"]) == ["git", "status", "--ignored", "--porcelain=v1"] for call in fake_checkout.calls))
+        check("fresh_checkout_has_no_reset_clean", not any(normalized_git_cmd(call["cmd"])[:2] == ["git", "reset"] or normalized_git_cmd(call["cmd"])[:2] == ["git", "clean"] for call in fake_checkout.calls))
+
+        def commands_touch_path(fake_adapter: FakeSubprocess, path_value: Path) -> bool:
+            target = os.fspath(path_value)
+            real_target = os.path.realpath(target)
+            for call in fake_adapter.calls:
+                cwd = os.fspath(call.get("cwd", ""))
+                if cwd == target or os.path.realpath(cwd) == real_target:
+                    return True
+                if any(os.fspath(arg) == target or os.path.realpath(os.fspath(arg)) == real_target for arg in call.get("cmd", [])):
+                    return True
+            return False
+
+        def sentinel_state(path_value: Path) -> tuple[bool, str | None]:
+            sentinel = path_value / ".hermes-primary-wip-sentinel"
+            try:
+                return True, hashlib.sha256(sentinel.read_bytes()).hexdigest()
+            except FileNotFoundError:
+                return False, None
+            except OSError:
+                return True, "unreadable"
+
+        primary_before = sentinel_state(PRIMARY_V2_WIP_CHECKOUT)
+        symlink_root = Path(tmpdir) / "checkout-symlink-root"
+        symlink_root.mkdir()
+        (symlink_root / "primary-link").symlink_to(PRIMARY_V2_WIP_CHECKOUT, target_is_directory=True)
+        primary_link_fake = FakeSubprocess()
+        primary_link_ok, primary_link_meta = prepare_isolated_checkout(
+            "primary-link",
+            "feat",
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            symlink_root,
+            primary_link_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        check("checkout_primary_wip_symlink_rejected", not primary_link_ok and "symlink rejected" in primary_link_meta.get("reason", ""))
+        check("checkout_primary_wip_symlink_no_git_touch", primary_link_fake.calls == [])
+        check("checkout_primary_wip_sentinel_unchanged", sentinel_state(PRIMARY_V2_WIP_CHECKOUT) == primary_before)
+
+        (symlink_root / "legacy-link").symlink_to(FORBIDDEN_WORKTREE_ROOTS[0], target_is_directory=True)
+        legacy_link_fake = FakeSubprocess()
+        legacy_link_ok, _ = prepare_isolated_checkout(
+            "legacy-link",
+            "feat",
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            symlink_root,
+            legacy_link_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        check("checkout_legacy_forbidden_symlink_rejected", not legacy_link_ok and legacy_link_fake.calls == [])
+
+        external_target = Path(tmpdir) / "external-target"
+        external_target.mkdir()
+        (symlink_root / "external-link").symlink_to(external_target, target_is_directory=True)
+        external_link_fake = FakeSubprocess()
+        external_link_ok, _ = prepare_isolated_checkout(
+            "external-link",
+            "feat",
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            symlink_root,
+            external_link_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        check("checkout_external_symlink_rejected", not external_link_ok and external_link_fake.calls == [])
+
+        original_checkout_path_for_goal = checkout_path_for_goal
+        ancestor_root = Path(tmpdir) / "checkout-ancestor-root"
+        ancestor_root.mkdir()
+        ancestor_target = Path(tmpdir) / "ancestor-external"
+        ancestor_target.mkdir()
+        (ancestor_root / "ancestor-link").symlink_to(ancestor_target, target_is_directory=True)
+        ancestor_fake = FakeSubprocess()
+        try:
+            globals()["checkout_path_for_goal"] = lambda root, goal_id: root / "ancestor-link" / bounded_identifier(goal_id.lower(), "goal", max_len=96)
+            ancestor_ok, _ = prepare_isolated_checkout(
+                "ancestor-goal",
+                "feat",
+                worktree_dir,
+                EXPECTED_CANONICAL_REPO_URL,
+                ancestor_root,
+                ancestor_fake,
+                configured_canonical_repo=worktree_dir,
+            )
+        finally:
+            globals()["checkout_path_for_goal"] = original_checkout_path_for_goal
+        check("checkout_ancestor_symlink_rejected", not ancestor_ok and ancestor_fake.calls == [])
+
+        existing_root = Path(tmpdir) / "checkout-existing-root"
+        existing_root.mkdir()
+        existing_dest = checkout_path_for_goal(existing_root, "existing-clean")
+        existing_dest.mkdir()
+        (existing_dest / "sentinel.txt").write_text("do-not-touch\n", encoding="utf-8")
+        existing_fake = FakeSubprocess()
+        existing_ok, existing_meta = prepare_isolated_checkout(
+            "existing-clean",
+            "feat",
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            existing_root,
+            existing_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        check("fresh_checkout_preexisting_clean_dir_not_reused", not existing_ok and existing_meta.get("reason") == "checkout path already exists")
+        check("fresh_checkout_preexisting_dir_no_git_touch", existing_fake.calls == [] and (existing_dest / "sentinel.txt").read_text(encoding="utf-8") == "do-not-touch\n")
+
+        leftover_root = Path(tmpdir) / "checkout-leftover-root"
+        leftover_root.mkdir()
+        (leftover_root / ".leftover-goal.tmp-crash").mkdir()
+        leftover_fake = FakeSubprocess()
+        leftover_ok, leftover_meta = prepare_isolated_checkout(
+            "leftover-goal",
+            "feat",
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            leftover_root,
+            leftover_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        check("fresh_checkout_temp_leftover_fails_closed", not leftover_ok and leftover_meta.get("reason") == "checkout temp directory already exists" and leftover_fake.calls == [])
+
+        ignored_fake = FakeSubprocess()
+        ignored_fake.set_response("git status --ignored", CmdResult(0, "!! .next/cache\n", "", 15, 0))
+        ignored_ok, ignored_meta = prepare_isolated_checkout(
+            "ignored-artifact",
+            "feat",
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            Path(tmpdir) / "checkout-ignored-root",
+            ignored_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        check("fresh_checkout_ignored_artifact_blocks", not ignored_ok and ignored_meta.get("reason") == "fresh checkout has ignored artifacts")
+        check("fresh_checkout_ignored_artifact_not_published", not checkout_path_for_goal(Path(tmpdir) / "checkout-ignored-root", "ignored-artifact").exists())
+
+        untracked_fake = FakeSubprocess()
+        untracked_fake.set_response("git status --porcelain=v1 --untracked-files=all", CmdResult(0, "?? scratch.txt\n", "", 15, 0))
+        untracked_ok, untracked_meta = prepare_isolated_checkout(
+            "untracked-artifact",
+            "feat",
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            Path(tmpdir) / "checkout-untracked-root",
+            untracked_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        check("fresh_checkout_untracked_artifact_blocks", not untracked_ok and untracked_meta.get("reason") == "fresh checkout is dirty")
+
+        class CloneRaceFake(FakeSubprocess):
+            def __init__(self, target: Path) -> None:
+                super().__init__()
+                self.target = target
+
+            def run_command(
+                self,
+                cmd: list[str],
+                cwd: str,
+                timeout: int,
+                env: dict[str, str] | None,
+                capture: bool,
+                stdin_data: str | None = None,
+            ) -> CmdResult:
+                result = super().run_command(cmd, cwd, timeout, env, capture, stdin_data)
+                if normalized_git_cmd(cmd)[:2] == ["git", "clone"]:
+                    temp_checkout = Path(normalized_git_cmd(cmd)[-1])
+                    try:
+                        shutil.rmtree(temp_checkout)
+                    except OSError:
+                        pass
+                    temp_checkout.symlink_to(self.target, target_is_directory=True)
+                return result
+
+        race_external = Path(tmpdir) / "checkout-race-external"
+        race_external.mkdir()
+        race_root = Path(tmpdir) / "checkout-race-root"
+        race_fake = CloneRaceFake(race_external)
+        race_ok, race_meta = prepare_isolated_checkout(
+            "race-after-clone",
+            "feat",
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            race_root,
+            race_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        race_cmds = [call["cmd"] for call in race_fake.calls]
+        check("fresh_checkout_post_clone_symlink_race_fails", not race_ok and (race_meta.get("reason") == "checkout temp containment failure" or "symlink rejected" in race_meta.get("reason", "")))
+        race_normalized_cmds = [normalized_git_cmd(cmd) for cmd in race_cmds]
+        check("fresh_checkout_post_clone_race_no_checkout_reset", ["git", "fetch", "origin", "main"] not in race_normalized_cmds and not any(cmd[:3] == ["git", "checkout", "-B"] or cmd[:2] == ["git", "reset"] or cmd[:2] == ["git", "clean"] for cmd in race_normalized_cmds))
+
+        concurrent_checkout_root = Path(tmpdir) / "checkout-concurrent-root"
+        concurrent_checkout_fakes = [FakeSubprocess(), FakeSubprocess()]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            concurrent_checkout_results = list(executor.map(
+                lambda fake: prepare_isolated_checkout(
+                    "same-goal",
+                    "feat",
+                    worktree_dir,
+                    EXPECTED_CANONICAL_REPO_URL,
+                    concurrent_checkout_root,
+                    fake,
+                    configured_canonical_repo=worktree_dir,
+                ),
+                concurrent_checkout_fakes,
+            ))
+        concurrent_successes = [meta for ok, meta in concurrent_checkout_results if ok]
+        concurrent_final = checkout_path_for_goal(concurrent_checkout_root, "same-goal")
+        check("fresh_checkout_concurrent_creation_one_winner", len(concurrent_successes) == 1 and concurrent_final.is_dir())
+        check("fresh_checkout_concurrent_loser_preserves_winner", concurrent_final.exists() and concurrent_final.is_dir())
+        check("fresh_checkout_concurrent_no_forbidden_touch", not any(commands_touch_path(fake, PRIMARY_V2_WIP_CHECKOUT) for fake in concurrent_checkout_fakes))
+
+        clone_retry_root = Path(tmpdir) / "checkout-clone-retry"
+        clone_retry_fake = FakeSubprocess()
+        clone_retry_fake.set_responses("git clone", [
+            CmdResult(1, "", "forced clone failure", 0, 20),
+            CmdResult(0, "", "", 0, 0),
+        ])
+        clone_first_ok, clone_first_meta = prepare_isolated_checkout(
+            "clone-retry",
+            "feat",
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            clone_retry_root,
+            clone_retry_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        clone_second_ok, _ = prepare_isolated_checkout(
+            "clone-retry",
+            "feat",
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            clone_retry_root,
+            clone_retry_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        check("fresh_checkout_clone_failure_cleans_owned_temp", not clone_first_ok and clone_first_meta.get("temp_cleanup") == "removed" and not any(p.name.startswith(".clone-retry.tmp-") for p in clone_retry_root.iterdir()))
+        check("fresh_checkout_clone_retry_same_goal_succeeds", clone_second_ok and checkout_path_for_goal(clone_retry_root, "clone-retry").exists())
+
+        fetch_retry_root = Path(tmpdir) / "checkout-fetch-retry"
+        fetch_retry_fake = FakeSubprocess()
+        fetch_retry_fake.set_responses("git fetch origin main", [
+            CmdResult(1, "", "forced fetch failure", 0, 20),
+            CmdResult(0, "", "", 0, 0),
+        ])
+        fetch_first_ok, fetch_first_meta = prepare_isolated_checkout(
+            "fetch-retry",
+            "feat",
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            fetch_retry_root,
+            fetch_retry_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        fetch_second_ok, _ = prepare_isolated_checkout(
+            "fetch-retry",
+            "feat",
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            fetch_retry_root,
+            fetch_retry_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        check("fresh_checkout_fetch_failure_cleans_owned_temp", not fetch_first_ok and fetch_first_meta.get("temp_cleanup") == "removed" and not any(p.name.startswith(".fetch-retry.tmp-") for p in fetch_retry_root.iterdir()))
+        check("fresh_checkout_fetch_retry_same_goal_succeeds", fetch_second_ok and checkout_path_for_goal(fetch_retry_root, "fetch-retry").exists())
+
+        class MaliciousTempReplacementFake(FakeSubprocess):
+            def __init__(self, victim: Path) -> None:
+                super().__init__()
+                self.victim = victim
+
+            def run_command(
+                self,
+                cmd: list[str],
+                cwd: str,
+                timeout: int,
+                env: dict[str, str] | None,
+                capture: bool,
+                stdin_data: str | None = None,
+            ) -> CmdResult:
+                result = super().run_command(cmd, cwd, timeout, env, capture, stdin_data)
+                if normalized_git_cmd(cmd)[:2] == ["git", "clone"]:
+                    temp_checkout = Path(normalized_git_cmd(cmd)[-1])
+                    shutil.rmtree(temp_checkout)
+                    temp_checkout.symlink_to(self.victim, target_is_directory=True)
+                return result
+
+        malicious_root = Path(tmpdir) / "checkout-malicious-root"
+        victim_dir = Path(tmpdir) / "checkout-malicious-victim"
+        victim_dir.mkdir()
+        (victim_dir / "sentinel.txt").write_text("preserve\n", encoding="utf-8")
+        malicious_fake = MaliciousTempReplacementFake(victim_dir)
+        malicious_ok, malicious_meta = prepare_isolated_checkout(
+            "malicious-replace",
+            "feat",
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            malicious_root,
+            malicious_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        check("fresh_checkout_malicious_temp_replacement_not_followed", not malicious_ok and malicious_meta.get("reason") == "checkout temp containment failure" and (victim_dir / "sentinel.txt").read_text(encoding="utf-8") == "preserve\n")
+        check("fresh_checkout_malicious_temp_symlink_left_for_operator", any(p.is_symlink() and p.name.startswith(".malicious-replace.tmp-") for p in malicious_root.iterdir()))
+
+        local_source = Path(tmpdir) / "local-source"
+        local_source.mkdir()
+        local_origin = str(local_source)
+        subprocess.run(["git", "init"], cwd=local_source, capture_output=True, timeout=10)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=local_source, capture_output=True, timeout=5)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=local_source, capture_output=True, timeout=5)
+        (local_source / "README.md").write_text("local clone source\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=local_source, capture_output=True, timeout=5)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=local_source, capture_output=True, timeout=5)
+        local_clone = Path(tmpdir) / "local-clone"
+        local_clone_cmd = controller_git_cmd(["clone", "--origin", "origin", local_origin, str(local_clone)])
+        local_clone_result = RealSubprocess().run_command(local_clone_cmd, str(Path(tmpdir)), 60, _controller_git_env("0"), True)
+        local_clone_normalized = normalized_git_cmd(local_clone_cmd)
+        local_clone_no_reference = not any(arg.startswith("--reference") for arg in local_clone_normalized)
+        local_clone_hooks_ok, _ = empty_hooks_dir_for_fresh_checkout(local_clone / ".git")
+        local_clone_control = collect_git_control_plane(local_clone, local_origin, RealSubprocess())
+        check("ordinary_local_clone_argv_has_no_reference", local_clone_normalized[2:5] == ["--origin", "origin", local_origin] and local_clone_no_reference)
+        check("ordinary_local_clone_has_no_alternates_file", local_clone_result.returncode == 0 and not (local_clone / ".git" / "objects" / "info" / "alternates").exists())
+        check("ordinary_local_clone_control_plane_passes_without_alternates", local_clone_result.returncode == 0 and local_clone_hooks_ok and local_clone_control.get("passed"))
+
+        mission_control_path = Path(tmpdir) / "hermes-mission-control"
+        mission_control_path.mkdir()
+        mission_ok, mission_reason, _ = validate_canonical_repo_path(
+            mission_control_path,
+            EXPECTED_CANONICAL_REPO_URL,
+            FakeSubprocess(),
+            configured_canonical_repo=worktree_dir,
+        )
+        check("mission_control_repo_mismatch_rejected", not mission_ok and mission_reason == "canonical repo path mismatch")
+        wrong_origin_fake = FakeSubprocess()
+        wrong_origin_fake.set_response("git remote", CmdResult(0, "https://github.com/director-phil/hermes-mission-control.git\n", "", 62, 0))
+        wrong_origin_ok, wrong_origin_reason, _ = validate_canonical_repo_path(
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            wrong_origin_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        check("wrong_origin_rejected", not wrong_origin_ok and wrong_origin_reason == "canonical repo origin mismatch")
+        dirty_mirror_fake = FakeSubprocess()
+        dirty_mirror_fake.set_response("git status", CmdResult(0, " M app/file.ts\n?? scratch.txt\n", "", 28, 0))
+        dirty_mirror_ok, dirty_mirror_reason, _ = validate_canonical_repo_path(
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            dirty_mirror_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        check("dirty_canonical_mirror_rejected", not dirty_mirror_ok and dirty_mirror_reason == "canonical repo dirty")
+        readonly_mirror_fake = FakeSubprocess()
+        readonly_mirror_ok, readonly_mirror_reason, _ = validate_canonical_repo_path(
+            worktree_dir,
+            EXPECTED_CANONICAL_REPO_URL,
+            readonly_mirror_fake,
+            configured_canonical_repo=worktree_dir,
+        )
+        readonly_mirror_status_calls = [call for call in readonly_mirror_fake.calls if normalized_git_cmd(call["cmd"]) == ["git", "status", "--porcelain=v1"]]
+        check("readonly_mirror_validation_passes", readonly_mirror_ok and readonly_mirror_reason == "")
+        check(
+            "readonly_mirror_status_uses_optional_locks_zero",
+            len(readonly_mirror_status_calls) == 1
+            and readonly_mirror_status_calls[0]["env"] is not None
+            and readonly_mirror_status_calls[0]["env"].get("GIT_OPTIONAL_LOCKS") == "0",
+        )
+        repo_root = Path(__file__).resolve().parent.parent
+        service_text = (repo_root / "systemd" / "hermes-native-goal-runner.service").read_text(encoding="utf-8")
+        installer_text = (repo_root / "scripts" / "install-hermes-native-goal-runner.sh").read_text(encoding="utf-8")
+        mirror_arg = "--canonical-repo %h/.hermes/mission-control-source/rt-ops-v2"
+        primary_wip_path = "Documents/GitHub/reliable-tradies-ops-v2"
+        check("default_canonical_repo_is_clean_mirror", str(DEFAULT_CANONICAL_REPO).endswith(".hermes/mission-control-source/rt-ops-v2"))
+        check("systemd_contract_carries_mirror_target", mirror_arg in service_text and f"--expected-origin {EXPECTED_CANONICAL_REPO_URL}" in service_text)
+        check("systemd_keeps_mirror_read_only", "ReadOnlyPaths=%h/.hermes/mission-control-source/rt-ops-v2" in service_text and "ReadWritePaths=%h/.hermes/mission-control-source" not in service_text)
+        check("installer_contract_checks_mirror_target", "V2_CANONICAL_ARG=\"--canonical-repo %h/.hermes/mission-control-source/rt-ops-v2\"" in installer_text and EXPECTED_CANONICAL_REPO_URL in installer_text)
+        check("installer_prepares_mirror_idempotently", "prepare_v2_canonical_mirror" in installer_text and "git clone \"$V2_EXPECTED_ORIGIN\" \"$V2_CANONICAL_REPO\"" in installer_text and "fetch origin main" in installer_text and "reset --hard origin/main" in installer_text)
+        check("installer_fails_dirty_mirror_closed", "V2 canonical mirror is dirty; refusing to reset or clean work" in installer_text)
+        check("primary_v2_checkout_is_wip_only", primary_wip_path in installer_text and f"git -C \"$V2_PRIMARY_WIP_CHECKOUT\"" not in installer_text and f"rm -rf \"$V2_PRIMARY_WIP_CHECKOUT\"" not in installer_text)
+
+        # ---- Test 27: Shipping gates define done; local review alone is never success ----
+        print("\n  --- Test 27: Shipping gates ---")
+        def prime_allowed_shipping_scope(fake_adapter: FakeSubprocess) -> None:
+            fake_adapter.set_response("git status", CmdResult(0, " M test.txt\x00", "", 14, 0))
+            fake_adapter.set_response("git diff --numstat", CmdResult(0, "1\t1\ttest.txt\n", "", 15, 0))
+
+        def create_minimal_control_repo(name: str) -> Path:
+            repo = Path(tmpdir) / name
+            repo.mkdir()
+            git_dir = repo / ".git"
+            git_dir.mkdir()
+            (git_dir / "config").write_text(
+                "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tlogallrefupdates = true\n"
+                f"[remote \"origin\"]\n\turl = {EXPECTED_CANONICAL_REPO_URL}\n\tfetch = {CONTROL_PLANE_ALLOWED_REMOTE_FETCH}\n",
+                encoding="utf-8",
+            )
+            (repo / "test.txt").write_text("control\n", encoding="utf-8")
+            return repo
+
+        class ControlPlaneMutationFake(FakeSubprocess):
+            def __init__(self, target_repo: Path, trigger: str, mutate: Callable[[], None]) -> None:
+                super().__init__()
+                self.target_repo = target_repo
+                self.trigger = trigger
+                self.mutate = mutate
+                self.mutated = False
+
+            def run_command(
+                self,
+                cmd: list[str],
+                cwd: str,
+                timeout: int,
+                env: dict[str, str] | None,
+                capture: bool,
+                stdin_data: str | None = None,
+            ) -> CmdResult:
+                result = super().run_command(cmd, cwd, timeout, env, capture, stdin_data)
+                should_mutate = (
+                    (self.trigger == "acceptance" and cmd[:1] == ["/usr/bin/bash"])
+                    or (self.trigger == "review" and "mission-control-goal-review" in " ".join(cmd))
+                )
+                if should_mutate and not self.mutated:
+                    self.mutate()
+                    self.mutated = True
+                return result
+
+        ship_goal = parse_goal_markdown(_make_test_goal(str(worktree_dir), title="Ship Goal", allowed_files=["test.txt"]))
+        ship_goal["goal_id"] = "ship-goal"
+        (worktree_dir / "test.txt").write_text("shipping\n", encoding="utf-8")
+        fake_ship = FakeSubprocess()
+        prime_allowed_shipping_scope(fake_ship)
+        ship_result = run_shipping_gates(worktree_dir, "ship-goal", "ship-goal", ship_goal, ship_goal["acceptance_body"], fake_ship)
+        check("shipping_success_passes", ship_result.get("passed") is True and ship_result.get("terminal_state") == SHIPPING_SUCCESS_STATE)
+        check("shipping_records_squash_sha_difference", ship_result.get("pull_request", {}).get("head_sha") == "0123456789abcdef0123456789abcdef01234567" and ship_result.get("merge", {}).get("merge_sha") == "abcdefabcdefabcdefabcdefabcdefabcdefabcd")
+        check("shipping_verifies_origin_main_merge_sha", any(normalized_git_cmd(call["cmd"]) == ["git", "merge-base", "--is-ancestor", "abcdefabcdefabcdefabcdefabcdefabcdefabcd", "origin/main"] for call in fake_ship.calls))
+        fake_not_merged = FakeSubprocess()
+        prime_allowed_shipping_scope(fake_not_merged)
+        fake_not_merged.set_response("state,mergedAt,mergeCommit,url", CmdResult(0, json.dumps({"state": "OPEN", "mergedAt": None, "mergeCommit": None, "url": "https://github.com/director-phil/rt-ops-v2/pull/2"}), "", 120, 0))
+        not_merged_ship = run_shipping_gates(worktree_dir, "ship-not-merged", "ship-not-merged", ship_goal, ship_goal["acceptance_body"], fake_not_merged)
+        check("shipping_failed_not_merged_pr_blocks_done", not_merged_ship.get("passed") is False and not_merged_ship.get("reason") == "pr_not_merged")
+        fake_checks_fail = FakeSubprocess()
+        prime_allowed_shipping_scope(fake_checks_fail)
+        fake_checks_fail.set_response("gh pr checks", CmdResult(1, "FAILED unit\n", "", 12, 0))
+        failed_ship = run_shipping_gates(worktree_dir, "ship-fail", "ship-fail", ship_goal, ship_goal["acceptance_body"], fake_checks_fail)
+        check("shipping_checks_failure_blocks_done", failed_ship.get("passed") is False and failed_ship.get("reason") == "checks_failed")
+        (native_root / "goals" / "running" / "no-local-done.md").write_text(_make_test_goal(str(worktree_dir), title="No Local Done"), encoding="utf-8")
+        create_controller_lock(native_root / "controller.lock", "no-local-done", os.getpid(), get_process_start_ticks(os.getpid()))
+        finalize_result(native_root, "no-local-done", False, {"shipping": failed_ship}, os.getpid(), get_process_start_ticks(os.getpid()))
+        check("no_local_done_finalizes_failed_not_done", (native_root / "goals" / "failed" / "no-local-done.md").exists() and not (native_root / "goals" / "done" / "no-local-done.md").exists())
+        vercel_goal = {**ship_goal, "vercel_impact": True, "surface_verification": False}
+        fake_unrelated_deploy = FakeSubprocess()
+        prime_allowed_shipping_scope(fake_unrelated_deploy)
+        fake_unrelated_deploy.set_response("deployments?sha=", CmdResult(0, json.dumps([{
+            "id": 2002,
+            "sha": "0123456789abcdef0123456789abcdef01234567",
+            "environment": "Production",
+            "statuses_url": "https://api.github.com/repos/director-phil/rt-ops-v2/deployments/2002/statuses",
+        }]), "", 180, 0))
+        unrelated_deploy_ship = run_shipping_gates(worktree_dir, "vercel-unrelated", "vercel-unrelated", vercel_goal, ship_goal["acceptance_body"], fake_unrelated_deploy)
+        check("vercel_unrelated_deployment_sha_cannot_satisfy", unrelated_deploy_ship.get("passed") is False and unrelated_deploy_ship.get("reason") == "successful_production_deployment_missing")
+        fake_missing_deploy = FakeSubprocess()
+        prime_allowed_shipping_scope(fake_missing_deploy)
+        fake_missing_deploy.set_response("deployments?sha=", CmdResult(0, "[]", "", 2, 0))
+        missing_deploy_ship = run_shipping_gates(worktree_dir, "vercel-missing", "vercel-missing", vercel_goal, ship_goal["acceptance_body"], fake_missing_deploy)
+        check("vercel_missing_deployment_blocks", missing_deploy_ship.get("passed") is False and missing_deploy_ship.get("reason") == "deployment_missing")
+        fake_pending = FakeSubprocess()
+        prime_allowed_shipping_scope(fake_pending)
+        pending_ship = run_shipping_gates(worktree_dir, "vercel-pending", "vercel-pending", vercel_goal, ship_goal["acceptance_body"], fake_pending)
+        check("vercel_inspects_exact_environment_url", any(call["cmd"] == ["vercel", "inspect", "https://rt-ops-v2.vercel.app", "--logs"] for call in fake_pending.calls) and not any(call["cmd"] == ["vercel", "inspect", "--logs"] for call in fake_pending.calls))
+        (native_root / "goals" / "running" / "vercel-pending.md").write_text(_make_test_goal(str(worktree_dir), title="Vercel Pending"), encoding="utf-8")
+        create_controller_lock(native_root / "controller.lock", "vercel-pending", os.getpid(), get_process_start_ticks(os.getpid()))
+        finalize_result(native_root, "vercel-pending", False, {"shipping": pending_ship}, os.getpid(), get_process_start_ticks(os.getpid()))
+        check("vercel_pending_surface_state", pending_ship.get("terminal_state") == PENDING_SURFACE_STATE and (native_root / "goals" / PENDING_SURFACE_STATE / "vercel-pending.md").exists())
+        pending_result = json.loads((native_root / "runs" / "vercel-pending" / "result.json").read_text(encoding="utf-8"))
+        check("vercel_pending_not_success", pending_result.get("success") is False and pending_result.get("terminal_state") == PENDING_SURFACE_STATE)
+        vercel_surface_true_goal = {**ship_goal, "vercel_impact": True, "surface_verification": True}
+        fake_surface_true = FakeSubprocess()
+        prime_allowed_shipping_scope(fake_surface_true)
+        surface_true_ship = run_shipping_gates(worktree_dir, "vercel-surface-true", "vercel-surface-true", vercel_surface_true_goal, ship_goal["acceptance_body"], fake_surface_true)
+        check("vercel_surface_verification_true_cannot_bypass_pending", surface_true_ship.get("terminal_state") == PENDING_SURFACE_STATE and surface_true_ship.get("passed") is False)
+        fake_shipping_scope_escape = FakeSubprocess()
+        fake_shipping_scope_escape.set_response("git status", CmdResult(0, " M test.txt\x00?? ship-forbidden.txt\x00", "", 35, 0))
+        fake_shipping_scope_escape.set_response("git diff --numstat", CmdResult(0, "1\t1\ttest.txt\n", "", 15, 0))
+        shipping_scope_escape = run_shipping_gates(
+            worktree_dir,
+            "ship-scope-escape",
+            "ship-scope-escape",
+            ship_goal,
+            ship_goal["acceptance_body"],
+            fake_shipping_scope_escape,
+        )
+        check("shipping_post_acceptance_scope_escape_fails", shipping_scope_escape.get("passed") is False and shipping_scope_escape.get("reason") == "post_acceptance_rerun_scope_failed")
+        check("shipping_post_acceptance_scope_escape_no_add_push_merge", no_shipping_mutation_commands(fake_shipping_scope_escape))
+
+        mutation_cases: list[tuple[str, Callable[[Path], Callable[[], None]]]] = [
+            ("config_alias", lambda repo: lambda: (repo / ".git" / "config").write_text((repo / ".git" / "config").read_text(encoding="utf-8") + "[alias]\n\tco = checkout\n", encoding="utf-8")),
+            ("remote_url", lambda repo: lambda: (repo / ".git" / "config").write_text((repo / ".git" / "config").read_text(encoding="utf-8").replace(EXPECTED_CANONICAL_REPO_URL, "https://github.com/evil/evil.git"), encoding="utf-8")),
+            ("hooks", lambda repo: lambda: ((repo / ".git" / "hooks").mkdir(exist_ok=True), (repo / ".git" / "hooks" / "pre-commit").write_text("exit 1\n", encoding="utf-8"))),
+            ("instead_of", lambda repo: lambda: (repo / ".git" / "config").write_text((repo / ".git" / "config").read_text(encoding="utf-8") + "[url \"ssh://evil/\"]\n\tinsteadOf = https://github.com/director-phil/\n", encoding="utf-8")),
+            ("include_if", lambda repo: lambda: (repo / ".git" / "config").write_text((repo / ".git" / "config").read_text(encoding="utf-8") + "[includeIf \"gitdir:/**\"]\n\tpath = /tmp/evil.gitconfig\n", encoding="utf-8")),
+        ]
+        for case_name, mutation_factory in mutation_cases:
+            control_repo = create_minimal_control_repo(f"control-{case_name}")
+            case_goal = {**ship_goal, "repo_worktree": str(control_repo)}
+            mutation_fake = ControlPlaneMutationFake(control_repo, "acceptance", mutation_factory(control_repo))
+            prime_allowed_shipping_scope(mutation_fake)
+            mutation_result = run_shipping_gates(control_repo, f"ship-{case_name}", f"ship-{case_name}", case_goal, ship_goal["acceptance_body"], mutation_fake)
+            check(f"shipping_acceptance_{case_name}_blocks", mutation_result.get("passed") is False and mutation_result.get("reason") == "control_plane_changed")
+            check(f"shipping_acceptance_{case_name}_no_mutation", no_shipping_mutation_commands(mutation_fake))
+
+        review_control_repo = create_minimal_control_repo("control-review-mutation")
+        review_mutates_control_goal = parse_goal_markdown(_make_test_goal(
+            str(review_control_repo),
+            title="Review Control Mutation",
+            allowed_files=["test.txt"],
+        ))
+        review_mutates_control_goal["goal_id"] = "review-control-mutation"
+        review_control_fake = ControlPlaneMutationFake(
+            review_control_repo,
+            "review",
+            lambda: (review_control_repo / ".git" / "config").write_text((review_control_repo / ".git" / "config").read_text(encoding="utf-8") + "[alias]\n\tship = push\n", encoding="utf-8"),
+        )
+        review_control_fake.set_response("mission-control-goal-plan", CmdResult(0, f"{PLAN_APPROVED_MARKER}\n", "", 15, 0))
+        review_control_fake.set_response("mission-control-goal-code", CmdResult(0, "done\n", "", 5, 0))
+        review_control_fake.set_response("mission-control-goal-review", CmdResult(0, f"{REVIEW_PASS_MARKER}\n", "", 13, 0))
+        review_control_fake.set_response("git status", CmdResult(0, " M test.txt\x00", "", 14, 0))
+        review_control_fake.set_response("git diff --numstat", CmdResult(0, "1\t1\ttest.txt\n", "", 15, 0))
+        review_control_fake.set_response("/usr/bin/bash", CmdResult(0, "", "", 0, 0))
+        review_control_success, review_control_stages = run_goal(
+            native_root / "goals" / "running" / "review-control-mutation.md",
+            review_mutates_control_goal,
+            native_root,
+            review_control_fake,
+        )
+        check("review_control_plane_mutation_blocks", not review_control_success and review_control_stages.get("reason") == "control_plane_changed")
+        check("review_control_plane_mutation_no_shipping", no_shipping_mutation_commands(review_control_fake))
+
+        fake_preview_contains = FakeSubprocess()
+        prime_allowed_shipping_scope(fake_preview_contains)
+        fake_preview_contains.set_response("git merge-base --is-ancestor", CmdResult(1, "", "", 0, 0))
+        fake_preview_contains.set_response("git branch -r --contains", CmdResult(0, "  origin/main-preview\n  origin/main-old\n", "", 35, 0))
+        preview_result = run_shipping_gates(worktree_dir, "ship-preview", "ship-preview", ship_goal, ship_goal["acceptance_body"], fake_preview_contains)
+        check("origin_main_preview_old_cannot_satisfy", preview_result.get("passed") is False and preview_result.get("reason") == "origin_main_missing_merge_commit")
+        check("origin_main_preview_old_branch_contains_unused", not any(normalized_git_cmd(call["cmd"])[:4] == ["git", "branch", "-r", "--contains"] for call in fake_preview_contains.calls))
+        check("origin_main_actual_ancestor_passes", ship_result.get("origin_main", {}).get("ancestor_exit_code") == 0 and ship_result.get("passed") is True)
+
         if old_allowed_roots is None:
             os.environ.pop("HERMES_NATIVE_ALLOWED_WORKTREE_ROOTS", None)
         else:
@@ -2404,6 +5658,14 @@ def self_test() -> tuple[bool, str]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hermes Native Goal Runtime")
     parser.add_argument("--self-test", action="store_true", help="Run synthetic self-test suite")
+    parser.add_argument("--migrate-legacy", action="store_true", help="Run one-shot bounded legacy ledger migration and exit")
+    parser.add_argument("--legacy-source-root", type=str, help="Read-only preserved legacy goal ledger root for migration")
+    parser.add_argument("--canonical-repo", type=str, default=str(DEFAULT_CANONICAL_REPO), help="Explicit canonical RT V2 repo checkout")
+    parser.add_argument("--expected-origin", type=str, default=EXPECTED_CANONICAL_REPO_URL, help="Expected origin URL for the canonical RT V2 repo")
+    parser.add_argument("--worktree-root", type=str, default=str(DEFAULT_WORKTREE_ROOT), help="Dedicated isolated checkout root")
+    parser.add_argument("--include-regex", type=str, help="Only migrate goal IDs matching this regex")
+    parser.add_argument("--exclude-regex", type=str, help="Skip goal IDs matching this regex")
+    parser.add_argument("--ids", type=str, help="Comma-separated explicit goal IDs to migrate")
     parser.add_argument(
         "--native-root",
         type=str,
@@ -2422,12 +5684,46 @@ def main() -> None:
     ensure_dir_durable(native_root)
     subprocess_adapter = RealSubprocess()
 
+    if args.migrate_legacy:
+        if not args.legacy_source_root:
+            print("ERROR: --legacy-source-root is required with --migrate-legacy", file=sys.stderr)
+            sys.exit(2)
+        explicit_ids = {item.strip() for item in args.ids.split(",") if item.strip()} if args.ids else None
+        try:
+            report = migrate_legacy_goals(
+                Path(args.legacy_source_root),
+                native_root,
+                Path(args.canonical_repo),
+                args.expected_origin,
+                include_regex=args.include_regex,
+                exclude_regex=args.exclude_regex,
+                explicit_ids=explicit_ids,
+                subprocess_adapter=subprocess_adapter,
+            )
+        except Exception as exc:
+            print(f"migration failed: {type(exc).__name__}", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps({
+            "imported": len(report.get("imported", [])),
+            "historical_done": len(report.get("historical_done", [])),
+            "skipped": len(report.get("skipped", [])),
+            "report": str(migration_report_path(native_root)),
+        }, sort_keys=True))
+        sys.exit(0)
+
     # Main loop — claim and execute one goal at a time
     while True:
         goal_id: str | None = None
         pid = os.getpid()
         start_ticks: int | None = None
         try:
+            promote_one_staged_goal(
+                native_root,
+                Path(args.canonical_repo),
+                args.expected_origin,
+                subprocess_adapter,
+                Path(args.worktree_root),
+            )
             goal_path, goal_data = claim_ready_goal(native_root)
             if goal_path is None:
                 time.sleep(1)
