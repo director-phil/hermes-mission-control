@@ -355,6 +355,212 @@ exit 0
   assert.equal(nativeEvents.some((e) => e.type === "review.passed"), true);
 });
 
+test("native-only goal does not read or warn about missing legacy run directory", async () => {
+  const files: Record<string, string> = {
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    "/native-rt/goals/done/native-only.md": nativeGoal("Native Only"),
+    "/native-rt/runs/native-only/result.json": JSON.stringify({ goal_id: "native-only", success: true }),
+    "/native-rt/runs/native-only/events.jsonl": JSON.stringify({
+      type: "goal.completed",
+      timestamp: "2026-08-05T09:20:00.000Z",
+      summary: "Native terminal evidence",
+    }),
+  };
+
+  const roots: RuntimeRoots = {
+    procRoot: "/fixture/proc",
+    chatDevRoot: "/fixture/LegacyRuntime",
+    repoRoot: "/fixture/repo",
+    nativeRuntimeRoot: "/native-rt",
+    allowedWorktreeRoots: ["/fixture/repo"],
+  };
+
+  const ada = fullAdapters(files);
+  const snapshot = await buildRuntimeSnapshot(roots, ada);
+  const timeline = await buildTimeline(roots, ada, snapshot);
+
+  assert.equal(timeline.events.some((event) => event.id === "native:native-only:events.jsonl:1"), true);
+  assert.equal(timeline.warnings.some((warning) => warning.source.includes("/fixture/LegacyRuntime/runs/native-only")), false);
+});
+
+test("runner-emitted native event types are visible with deterministic severities", async () => {
+  const runnerEventTypes = [
+    "acceptance.failed",
+    "acceptance.passed",
+    "acceptance.started",
+    "agent.started",
+    "contract.failed",
+    "control_plane.failed",
+    "controller.lock_recovered",
+    "deploy.ready",
+    "goal.blocked",
+    "goal.claimed",
+    "goal.completed",
+    "goal.failed",
+    "goal.ready",
+    "goal.shipped",
+    "implementation.failed",
+    "integrity.failed",
+    "integrity.quarantined",
+    "integrity.recovered",
+    "migration.historical_done",
+    "model.requested",
+    "planner.failed",
+    "promotion.blocked",
+    "promotion.failed",
+    "promotion.skipped",
+    "quarantine.failed",
+    "review.failed",
+    "review.passed",
+    "review.started",
+    "runner.failed",
+    "scope.failed",
+    "shipping.failed",
+    "shipping.started",
+    "terminal_move.failed",
+    "tool.completed",
+    "tool.started",
+    "worktree.failed",
+  ] as const;
+  const files: Record<string, string> = {
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    "/native-rt/goals/done/native-events.md": nativeGoal("Native Events"),
+    "/native-rt/runs/native-events/result.json": JSON.stringify({ goal_id: "native-events", success: true }),
+    "/native-rt/runs/native-events/events.jsonl": runnerEventTypes.map((type, index) => JSON.stringify({
+      type,
+      timestamp: `2026-08-05T09:${String(index).padStart(2, "0")}:00.000Z`,
+      summary: type,
+      metadata: { terminal: type === "goal.completed" },
+    })).join("\n"),
+    "/native-rt/controller-events.jsonl": JSON.stringify({
+      type: "controller.warning",
+      timestamp: "2026-08-05T10:00:00.000Z",
+      summary: "Controller warning",
+      metadata: { goal_id: "native-events", terminal: false },
+    }),
+  };
+
+  const roots: RuntimeRoots = {
+    procRoot: "/fixture/proc",
+    chatDevRoot: "/fixture/LegacyRuntime",
+    repoRoot: "/fixture/repo",
+    nativeRuntimeRoot: "/native-rt",
+    allowedWorktreeRoots: ["/fixture/repo"],
+  };
+
+  const ada = fullAdapters(files);
+  const snapshot = await buildRuntimeSnapshot(roots, ada);
+  const timeline = await buildTimeline(roots, ada, snapshot);
+  const visibleTypes = new Set(timeline.events.map((event) => event.type));
+
+  for (const type of [...runnerEventTypes, "controller.warning"] as const) {
+    assert.equal(visibleTypes.has(type), true, `missing ${type}`);
+  }
+  assert.equal(timeline.events.find((event) => event.type === "integrity.failed")?.severity, "critical");
+  assert.equal(timeline.events.find((event) => event.type === "control_plane.failed")?.severity, "critical");
+  assert.equal(timeline.events.find((event) => event.type === "promotion.failed")?.severity, "warning");
+  assert.equal(timeline.events.find((event) => event.type === "promotion.blocked")?.severity, "warning");
+  assert.equal(timeline.events.find((event) => event.type === "promotion.skipped")?.severity, "info");
+  assert.equal(timeline.events.find((event) => event.type === "integrity.recovered")?.severity, "info");
+  assert.equal(timeline.events.find((event) => event.type === "migration.historical_done")?.severity, "info");
+  assert.equal(timeline.events.find((event) => event.type === "controller.warning")?.goal_id, "native-events");
+});
+
+test("native metadata keeps operational evidence and redacts private payloads", async () => {
+  const secret = "sk-nativeMetadata123456789";
+  const privatePath = "/home/phillip_downs/Documents/GitHub/reliable-tradies-ops/private.txt";
+  const files: Record<string, string> = {
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    "/native-rt/goals/done/native-metadata.md": nativeGoal("Native Metadata"),
+    "/native-rt/runs/native-metadata/result.json": JSON.stringify({ goal_id: "native-metadata", success: true }),
+    "/native-rt/runs/native-metadata/events.jsonl": [
+      JSON.stringify({
+        type: "promotion.failed",
+        timestamp: "2026-08-05T09:10:00.000Z",
+        summary: "Fresh checkout preparation failed",
+        metadata: {
+          reason: "checkout_failed",
+          state: "staged",
+          states: ["staged", "ready"],
+          terminal: false,
+          goal_id: "native-metadata",
+          branch: "feat/native-metadata",
+          base_ref: "origin/main",
+          dependency_ids: ["parent-a", "parent-b"],
+          blocker_count: 2,
+          changed_count: 4,
+          terminal_state: "failed",
+          success: false,
+          evidence_sha256: "abc123def456",
+          commit_sha: "0123456789abcdef0123456789abcdef01234567",
+          pr_number: 12,
+          deployment_id: "dpl_123456",
+          sha256: "def456abc123",
+          worktree_path_hash: "hash-without-path",
+          prompt: `private prompt ${secret}`,
+          customer_name: "Private Customer",
+          argv: ["git", "status"],
+          url: `https://example.test/callback?token=${secret}`,
+        },
+      }),
+      JSON.stringify({
+        type: "control_plane.failed",
+        timestamp: "2026-08-05T09:11:00.000Z",
+        summary: "Git control-plane fingerprint changed",
+        metadata: {
+          reason: `token ${secret}`,
+          state: `opened ${privatePath}`,
+          terminal: false,
+        },
+      }),
+    ].join("\n"),
+  };
+
+  const roots: RuntimeRoots = {
+    procRoot: "/fixture/proc",
+    chatDevRoot: "/fixture/LegacyRuntime",
+    repoRoot: "/fixture/repo",
+    nativeRuntimeRoot: "/native-rt",
+    allowedWorktreeRoots: ["/fixture/repo"],
+  };
+
+  const ada = fullAdapters(files);
+  const snapshot = await buildRuntimeSnapshot(roots, ada);
+  const timeline = await buildTimeline(roots, ada, snapshot);
+  const promotion = timeline.events.find((event) => event.type === "promotion.failed");
+  const controlPlane = timeline.events.find((event) => event.type === "control_plane.failed");
+  assert.ok(promotion);
+  assert.ok(controlPlane);
+
+  assert.equal(promotion.metadata.reason, "checkout_failed");
+  assert.equal(promotion.metadata.state, "staged");
+  assert.equal(promotion.metadata.states, "staged,ready");
+  assert.equal(promotion.metadata.terminal, false);
+  assert.equal(promotion.metadata.goal_id, "native-metadata");
+  assert.equal(promotion.metadata.branch, "feat/native-metadata");
+  assert.equal(promotion.metadata.base_ref, "origin/main");
+  assert.equal(promotion.metadata.dependency_ids, "parent-a,parent-b");
+  assert.equal(promotion.metadata.blocker_count, 2);
+  assert.equal(promotion.metadata.changed_count, 4);
+  assert.equal(promotion.metadata.terminal_state, "failed");
+  assert.equal(promotion.metadata.success, false);
+  assert.equal(promotion.metadata.evidence_sha256, "abc123def456");
+  assert.equal(promotion.metadata.commit_sha, "0123456789abcdef0123456789abcdef01234567");
+  assert.equal(promotion.metadata.pr_number, 12);
+  assert.equal(promotion.metadata.deployment_id, "dpl_123456");
+  assert.equal(promotion.metadata.sha256, "def456abc123");
+  assert.equal(promotion.metadata.worktree_path_hash, "hash-without-path");
+  assert.equal(controlPlane.metadata.reason, "[redacted]");
+  assert.equal(controlPlane.metadata.state, "[redacted]");
+
+  const serialized = JSON.stringify(timeline);
+  assert.equal(serialized.includes(secret), false);
+  assert.equal(serialized.includes(privatePath), false);
+  assert.equal(serialized.includes("Private Customer"), false);
+  assert.equal(serialized.includes("private prompt"), false);
+  assert.equal(serialized.includes("git\",\"status"), false);
+});
+
 test("native runtime root is not treated as valid code worktree", async () => {
   const files: Record<string, string> = {
     "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",

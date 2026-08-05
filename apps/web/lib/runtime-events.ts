@@ -23,6 +23,14 @@ export type RuntimeEventType =
   | "terminal_move.failed"
   | "controller.lock_recovered"
   | "controller.warning"
+  | "integrity.recovered"
+  | "integrity.quarantined"
+  | "integrity.failed"
+  | "promotion.skipped"
+  | "promotion.blocked"
+  | "promotion.failed"
+  | "migration.historical_done"
+  | "control_plane.failed"
   | "acceptance.started"
   | "acceptance.failed"
   | "acceptance.passed"
@@ -100,6 +108,14 @@ const EVENT_MAP: Record<string, RuntimeEventType> = {
   "terminal_move.failed": "terminal_move.failed",
   "controller.lock_recovered": "controller.lock_recovered",
   "controller.warning": "controller.warning",
+  "integrity.recovered": "integrity.recovered",
+  "integrity.quarantined": "integrity.quarantined",
+  "integrity.failed": "integrity.failed",
+  "promotion.skipped": "promotion.skipped",
+  "promotion.blocked": "promotion.blocked",
+  "promotion.failed": "promotion.failed",
+  "migration.historical_done": "migration.historical_done",
+  "control_plane.failed": "control_plane.failed",
   "acceptance.started": "acceptance.started",
   "acceptance.failed": "acceptance.failed",
   "acceptance.passed": "acceptance.passed",
@@ -139,11 +155,10 @@ export async function buildRuntimeTimeline(
 
   for (const goal of runtime.goals) {
     const nativeOwned = goal.sources.some((source) => source.note === "native-runner");
-    // Read legacy run events
-    events.push(...await readGoalRunEvents(roots, adapters.fs, goal, warnings));
-    // Read native JSONL events if nativeRuntimeRoot is configured
     if (roots.nativeRuntimeRoot && nativeOwned) {
       events.push(...await readNativeRunEvents(roots.nativeRuntimeRoot, adapters.fs, goal, warnings));
+    } else {
+      events.push(...await readGoalRunEvents(roots, adapters.fs, goal, warnings));
     }
     const source = goal.sources[0];
     if (!nativeOwned && goal.status === "completed" && source) {
@@ -152,6 +167,10 @@ export async function buildRuntimeTimeline(
     if (!nativeOwned && goal.status === "failed" && source) {
       events.push(goalStateEvent(goal, "goal.failed", source.source, source.timestamp));
     }
+  }
+
+  if (roots.nativeRuntimeRoot) {
+    events.push(...await readNativeControllerEvents(roots.nativeRuntimeRoot, adapters.fs, warnings));
   }
 
   for (const process of runtime.processes.filter((item) => item.orphan)) {
@@ -304,7 +323,7 @@ async function readNativeRunEvents(
           summary: eventSummary(type, raw),
           source,
           source_timestamp: sourceTimestamp,
-          severity: type.endsWith(".failed") || type === "process.orphaned" ? "warning" : "info",
+          severity: eventSeverity(type),
           metadata: pickMetadata(raw),
         });
       } catch {
@@ -312,6 +331,55 @@ async function readNativeRunEvents(
       }
     });
   }
+  return events;
+}
+
+async function readNativeControllerEvents(
+  nativeRoot: string,
+  fsAdapter: FsAdapter,
+  warnings: TimelineResponse["warnings"],
+): Promise<RuntimeEvent[]> {
+  const source = path.join(nativeRoot, "controller-events.jsonl");
+  let body: string;
+  let sourceTimestamp: string | null = null;
+  try {
+    const [content, stat] = await Promise.all([fsAdapter.readFile(source), fsAdapter.stat(source).catch(() => null)]);
+    body = content;
+    sourceTimestamp = stat ? new Date(stat.mtimeMs).toISOString() : null;
+  } catch {
+    return [];
+  }
+  const events: RuntimeEvent[] = [];
+  body.split("\n").forEach((line, index) => {
+    if (!line.trim()) return;
+    try {
+      const raw = JSON.parse(line) as Record<string, unknown>;
+      const type = normalizeEventType(raw.type ?? raw.event ?? raw.name);
+      if (!type) {
+        warnings.push({ source, message: `controller event line ${index + 1} has unmapped type` });
+        return;
+      }
+      const timestamp = stringValue(raw.timestamp) ?? stringValue(raw.ts) ?? sourceTimestamp;
+      if (!timestamp) {
+        warnings.push({ source, message: `controller event line ${index + 1} has no timestamp` });
+        return;
+      }
+      const metadata = pickMetadata(raw);
+      events.push({
+        id: `native-controller:${index + 1}`,
+        goal_id: typeof metadata.goal_id === "string" ? metadata.goal_id : "controller",
+        type,
+        timestamp,
+        summary: eventSummary(type, raw),
+        source,
+        source_timestamp: sourceTimestamp,
+        severity: eventSeverity(type),
+        metadata,
+      });
+    } catch {
+      warnings.push({ source, message: `controller event line ${index + 1} is malformed JSON` });
+    }
+  });
   return events;
 }
 
@@ -362,7 +430,7 @@ async function readGoalRunEvents(
           summary: eventSummary(type, raw),
           source,
           source_timestamp: sourceTimestamp,
-          severity: type.endsWith(".failed") || type === "process.orphaned" ? "warning" : "info",
+          severity: eventSeverity(type),
           metadata: pickMetadata(raw),
         });
       } catch {
@@ -411,14 +479,111 @@ function eventSummary(type: RuntimeEventType, raw: Record<string, unknown>): str
   return sanitizeEventText(summary ?? type);
 }
 
+function eventSeverity(type: RuntimeEventType): RuntimeEvent["severity"] {
+  if (type === "integrity.failed" || type === "control_plane.failed") return "critical";
+  if (
+    type.endsWith(".failed")
+    || type === "process.orphaned"
+    || type === "controller.warning"
+    || type === "integrity.quarantined"
+    || type === "promotion.blocked"
+  ) {
+    return "warning";
+  }
+  return "info";
+}
+
 function pickMetadata(raw: Record<string, unknown>): RuntimeEvent["metadata"] {
   const metadata: RuntimeEvent["metadata"] = {};
-  for (const key of ["stage", "model", "provider", "pid", "status", "exit_code", "pr", "url"]) {
-    const value = raw[key];
-    if (typeof value === "string") metadata[key] = sanitizeEventText(value);
-    if (typeof value === "number" || typeof value === "boolean" || value === null) metadata[key] = value;
+  const nested = isRecord(raw.metadata) ? raw.metadata : {};
+  for (const source of [raw, nested]) {
+    for (const key of METADATA_KEYS) {
+      if (Object.keys(metadata).length >= MAX_METADATA_KEYS) return metadata;
+      if (!(key in source) || key in metadata) continue;
+      const value = sanitizeMetadataValue(key, source[key]);
+      if (value !== undefined) metadata[key] = value;
+    }
   }
   return metadata;
+}
+
+const MAX_METADATA_KEYS = 40;
+const MAX_METADATA_STRING_LENGTH = 96;
+const MAX_METADATA_LIST_LENGTH = 12;
+const METADATA_KEYS = [
+  "stage",
+  "model",
+  "provider",
+  "pid",
+  "status",
+  "exit_code",
+  "pr",
+  "pr_id",
+  "pr_number",
+  "pull_request",
+  "deployment_id",
+  "deployment",
+  "url",
+  "reason",
+  "terminal",
+  "state",
+  "states",
+  "goal_id",
+  "branch",
+  "base_ref",
+  "base_sha",
+  "commit_sha",
+  "sha256",
+  "fingerprint",
+  "dependency_id",
+  "dependency_ids",
+  "dependency_count",
+  "blocker_id",
+  "blocker_ids",
+  "blocker_count",
+  "changed_count",
+  "terminal_state",
+  "success",
+  "evidence_sha256",
+  "evidence_bytes",
+  "worktree_path_hash",
+  "dedupe_key",
+] as const;
+
+const SAFE_LIST_METADATA_KEYS = new Set<string>(["states", "dependency_ids", "blocker_ids"]);
+
+function sanitizeMetadataValue(key: string, value: unknown): RuntimeEvent["metadata"][string] | undefined {
+  if (value === null || typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value === "string") return sanitizeMetadataString(key, value);
+  if (Array.isArray(value) && SAFE_LIST_METADATA_KEYS.has(key)) {
+    const items = value
+      .filter((item): item is string | number | boolean => ["string", "number", "boolean"].includes(typeof item))
+      .slice(0, MAX_METADATA_LIST_LENGTH)
+      .map((item) => sanitizeMetadataString(key, String(item)))
+      .filter((item) => item !== "[redacted]");
+    return items.length > 0 ? items.join(",") : undefined;
+  }
+  return undefined;
+}
+
+function sanitizeMetadataString(key: string, value: string): string {
+  if (isUnsafeMetadataKey(key) || isUnsafeMetadataValue(value)) return "[redacted]";
+  return truncateText(sanitizeEventText(value), MAX_METADATA_STRING_LENGTH);
+}
+
+function isUnsafeMetadataKey(key: string): boolean {
+  if (/(_sha256|_sha|_hash)$/.test(key)) return false;
+  return /(path|prompt|response|output|stdout|stderr|argv|args|command|cmd|token|secret|password|credential|customer|client|private|email|phone|address)/i.test(key);
+}
+
+function isUnsafeMetadataValue(value: string): boolean {
+  if (/(prompt|response|tool[_ -]?body|file[_ -]?body|private[_ -]?output|stdout|stderr|env|environment|secret|password|token|api[_ -]?key|credential|customer|client|email|phone|address)/i.test(value)) return true;
+  if (/(?:\/[\w.-]+){2,}/.test(value) || /[A-Za-z]:\\(?:[^\\\s]+\\?){2,}/.test(value)) return true;
+  return false;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function sanitizeEventText(value: string): string {
