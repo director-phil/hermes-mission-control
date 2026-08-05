@@ -94,14 +94,18 @@ if ! grep -F -- "$V2_ORIGIN_ARG" "$SERVICE_DEST" >/dev/null; then
   exit 1
 fi
 
-# Create runtime directories
-mkdir -p "$HOME/.hermes/mission-control/runtime/goals/ready"
-mkdir -p "$HOME/.hermes/mission-control/runtime/goals/staged"
-mkdir -p "$HOME/.hermes/mission-control/runtime/goals/running"
-mkdir -p "$HOME/.hermes/mission-control/runtime/goals/done"
-mkdir -p "$HOME/.hermes/mission-control/runtime/goals/failed"
-mkdir -p "$HOME/.hermes/mission-control/runtime/goals/changed_pending_surface_verification"
-mkdir -p "$HOME/.hermes/mission-control/runtime/runs"
+# Create private runtime directories.
+install -d -m 700 "$HOME/.hermes"
+install -d -m 700 "$HOME/.hermes/mission-control"
+install -d -m 700 "$HOME/.hermes/mission-control/runtime"
+install -d -m 700 "$HOME/.hermes/mission-control/runtime/goals"
+install -d -m 700 "$HOME/.hermes/mission-control/runtime/goals/ready"
+install -d -m 700 "$HOME/.hermes/mission-control/runtime/goals/staged"
+install -d -m 700 "$HOME/.hermes/mission-control/runtime/goals/running"
+install -d -m 700 "$HOME/.hermes/mission-control/runtime/goals/done"
+install -d -m 700 "$HOME/.hermes/mission-control/runtime/goals/failed"
+install -d -m 700 "$HOME/.hermes/mission-control/runtime/goals/changed_pending_surface_verification"
+install -d -m 700 "$HOME/.hermes/mission-control/runtime/runs"
 mkdir -p "$HOME/.hermes/mission-control-worktrees"
 
 # Reload systemd but do NOT start the service

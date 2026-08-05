@@ -74,7 +74,7 @@ TERMINAL_DIRS = {"done", "failed", PENDING_SURFACE_STATE}
 NATIVE_GOAL_STATE_DIRS = ("staged", "ready", "running", "done", "failed", PENDING_SURFACE_STATE)
 SHIPPING_FORBIDDEN_MARKERS = ("FAILED", "NOT verified", "NOT VERIFIED")
 DEPLOYMENT_FORBIDDEN_MARKERS = ("FAILED", "ERROR", "Error:", "Command failed", "NOT verified", "NOT VERIFIED")
-CONTROLLER_GIT_DIR = Path(tempfile.gettempdir()) / "hermes-native-controller-git"
+CONTROLLER_GIT_DIR = DEFAULT_NATIVE_ROOT / "controller-git"
 CONTROL_PLANE_ALLOWED_REMOTE_FETCH = "+refs/heads/*:refs/remotes/origin/*"
 CONTROL_PLANE_FORBIDDEN_CONFIG_PREFIXES = (
     "alias.",
@@ -386,6 +386,66 @@ def exclusive_write_json(target: Path, data: dict) -> None:
 def exclusive_append_jsonl(path: Path, record: dict) -> None:
     line = json.dumps(record, separators=(",", ":")) + "\n"
     exclusive_write_bytes(path, line.encode("utf-8"))
+
+
+def _private_chain_start(path_value: Path) -> Path:
+    """Return the first component that must be private for controller state."""
+    absolute_path = path_value.absolute()
+    home_path = Path(HOME).absolute()
+    try:
+        relative = absolute_path.relative_to(home_path)
+        if relative.parts:
+            return home_path / relative.parts[0]
+    except ValueError:
+        pass
+
+    components: list[Path] = []
+    current = absolute_path
+    while current.parent != current:
+        components.append(current)
+        current = current.parent
+    for component in reversed(components):
+        try:
+            st = os.lstat(component)
+        except FileNotFoundError:
+            continue
+        if st.st_uid == os.getuid() and stat_module.S_IMODE(st.st_mode) == 0o700:
+            return component
+    return absolute_path
+
+
+def _validate_private_dir(path_value: Path) -> None:
+    st = os.lstat(path_value)
+    if stat_module.S_ISLNK(st.st_mode) or not stat_module.S_ISDIR(st.st_mode):
+        raise NotADirectoryError(errno.ENOTDIR, "controller private path is not a real directory", os.fspath(path_value))
+    if st.st_uid != os.getuid():
+        raise PermissionError(f"controller private path owner mismatch: {path_value}")
+    if stat_module.S_IMODE(st.st_mode) != 0o700:
+        raise PermissionError(f"controller private path mode must be 0700: {path_value}")
+
+
+def ensure_controller_private_dir_chain(dir_path: Path) -> None:
+    """Create and validate private controller state directories without following symlinks."""
+    target = dir_path.absolute()
+    start = _private_chain_start(target)
+    components = [start]
+    current = start
+    try:
+        relative = target.relative_to(start)
+    except ValueError as exc:
+        raise PermissionError(f"controller private path outside validated root: {target}") from exc
+    for part in relative.parts:
+        current = current / part
+        components.append(current)
+
+    for component in components:
+        try:
+            os.mkdir(component, 0o700)
+            fsync_dir(component.parent)
+        except FileExistsError:
+            pass
+        _validate_private_dir(component)
+    fsync_dir(target)
 
 
 def append_jsonl(path: Path, record: dict) -> None:
@@ -2027,22 +2087,62 @@ def _minimal_env() -> dict[str, str]:
 
 def ensure_controller_git_paths() -> tuple[Path, Path, Path]:
     """Create empty controller-owned Git config and hooks paths."""
-    ensure_dir_durable(CONTROLLER_GIT_DIR)
+    ensure_controller_private_dir_chain(CONTROLLER_GIT_DIR)
     global_config = CONTROLLER_GIT_DIR / "empty-global-config"
     system_config = CONTROLLER_GIT_DIR / "empty-system-config"
     empty_hooks = CONTROLLER_GIT_DIR / "empty-hooks"
-    for config_path in (global_config, system_config):
-        if not config_path.exists():
-            exclusive_write_bytes(config_path, b"")
-        os.chmod(config_path, 0o444)
-    if not empty_hooks.exists():
-        ensure_dir_durable(empty_hooks)
-    if not empty_hooks.is_dir() or empty_hooks.is_symlink():
-        raise ValueError("controller hooks path invalid")
-    if any(empty_hooks.iterdir()):
-        raise ValueError("controller hooks path not empty")
-    os.chmod(empty_hooks, 0o555)
+    ensure_controller_empty_config(global_config, 0o400)
+    ensure_controller_empty_config(system_config, 0o444)
+    ensure_controller_empty_hooks_dir(empty_hooks, 0o500)
     return global_config, system_config, empty_hooks
+
+
+def ensure_controller_empty_config(config_path: Path, expected_mode: int) -> None:
+    """Ensure a Git config file is empty, regular, controller-owned, and read-only."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(config_path, flags, expected_mode)
+    except FileExistsError:
+        pass
+    else:
+        try:
+            os.fchmod(fd, expected_mode)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        fsync_dir(config_path.parent)
+
+    st = os.lstat(config_path)
+    if stat_module.S_ISLNK(st.st_mode) or not stat_module.S_ISREG(st.st_mode):
+        raise ValueError(f"controller Git config invalid: {config_path}")
+    if st.st_uid != os.getuid():
+        raise PermissionError(f"controller Git config owner mismatch: {config_path}")
+    if st.st_size != 0:
+        raise ValueError(f"controller Git config not empty: {config_path}")
+    if stat_module.S_IMODE(st.st_mode) != expected_mode:
+        raise PermissionError(f"controller Git config mode invalid: {config_path}")
+
+
+def ensure_controller_empty_hooks_dir(hooks_path: Path, expected_mode: int) -> None:
+    """Ensure the controller hookspath is an empty, owned, read-only directory."""
+    try:
+        os.mkdir(hooks_path, expected_mode)
+        fsync_dir(hooks_path.parent)
+    except FileExistsError:
+        pass
+
+    st = os.lstat(hooks_path)
+    if stat_module.S_ISLNK(st.st_mode) or not stat_module.S_ISDIR(st.st_mode):
+        raise ValueError(f"controller hooks path invalid: {hooks_path}")
+    if st.st_uid != os.getuid():
+        raise PermissionError(f"controller hooks path owner mismatch: {hooks_path}")
+    if stat_module.S_IMODE(st.st_mode) != expected_mode:
+        raise PermissionError(f"controller hooks path mode invalid: {hooks_path}")
+    if any(hooks_path.iterdir()):
+        raise ValueError(f"controller hooks path not empty: {hooks_path}")
+    fsync_dir(hooks_path)
 
 
 def _controller_git_env(optional_locks: str = "0") -> dict[str, str]:
@@ -3929,6 +4029,7 @@ dependencies:
 
 def self_test() -> tuple[bool, str]:
     """Run synthetic self-test suite with full lifecycle and failure fixtures."""
+    global CONTROLLER_GIT_DIR
     results: list[tuple[str, bool, str]] = []
 
     def check(name: str, condition: bool, detail: str = "") -> None:
@@ -3938,6 +4039,7 @@ def self_test() -> tuple[bool, str]:
 
     print("[self-test] Starting synthetic canary suite...")
 
+    old_controller_git_dir = CONTROLLER_GIT_DIR
     with tempfile.TemporaryDirectory() as tmpdir:
         old_allowed_roots = os.environ.get("HERMES_NATIVE_ALLOWED_WORKTREE_ROOTS")
         old_stage_profiles = {
@@ -3949,6 +4051,8 @@ def self_test() -> tuple[bool, str]:
         os.environ["HERMES_NATIVE_CODE_PROFILE"] = DEFAULT_STAGE_PROFILES["code"]
         os.environ["HERMES_NATIVE_REVIEW_PROFILE"] = DEFAULT_STAGE_PROFILES["review"]
         native_root = Path(tmpdir) / "runtime"
+        CONTROLLER_GIT_DIR = native_root / "controller-git"
+        ensure_controller_private_dir_chain(native_root)
         for d in ("goals/staged", "goals/ready", "goals/running", "goals/done", "goals/failed", f"goals/{PENDING_SURFACE_STATE}"):
             (native_root / d).mkdir(parents=True)
 
@@ -3992,6 +4096,89 @@ def self_test() -> tuple[bool, str]:
             durable_symlink_rejected = True
         check("ensure_dir_durable_rejects_file_parent", durable_file_rejected)
         check("ensure_dir_durable_rejects_symlink_parent", durable_symlink_rejected)
+
+        controller_valid_root = Path(tmpdir) / "controller-valid" / "runtime" / "controller-git"
+        CONTROLLER_GIT_DIR = controller_valid_root
+        try:
+            global_config, system_config, empty_hooks = ensure_controller_git_paths()
+            controller_git_env = _controller_git_env()
+            controller_git_command = controller_git_cmd(["status"])
+            controller_paths = [controller_valid_root.parent.parent, controller_valid_root.parent, controller_valid_root]
+            valid_private_dir_modes = all(
+                os.lstat(path_value).st_uid == os.getuid()
+                and stat_module.S_ISDIR(os.lstat(path_value).st_mode)
+                and stat_module.S_IMODE(os.lstat(path_value).st_mode) == 0o700
+                for path_value in controller_paths
+            )
+            valid_config_modes = (
+                global_config.stat().st_size == 0
+                and system_config.stat().st_size == 0
+                and stat_module.S_IMODE(os.lstat(global_config).st_mode) == 0o400
+                and stat_module.S_IMODE(os.lstat(system_config).st_mode) == 0o444
+            )
+            valid_hooks_mode = (
+                empty_hooks.is_dir()
+                and not empty_hooks.is_symlink()
+                and not any(empty_hooks.iterdir())
+                and stat_module.S_IMODE(os.lstat(empty_hooks).st_mode) == 0o500
+            )
+            check("controller_git_valid_private_dir", valid_private_dir_modes and valid_config_modes and valid_hooks_mode)
+            check("controller_git_uses_private_runtime_not_tmp", str(controller_valid_root).startswith(str(Path(tmpdir))) and "/tmp/hermes-native-controller-git" not in str(controller_git_env) and "/tmp/hermes-native-controller-git" not in " ".join(controller_git_command))
+        except Exception as exc:
+            check("controller_git_valid_private_dir", False, f"{type(exc).__name__}: {exc}")
+            check("controller_git_uses_private_runtime_not_tmp", False, f"{type(exc).__name__}: {exc}")
+
+        symlink_case = Path(tmpdir) / "controller-symlink"
+        symlink_case.mkdir(mode=0o700)
+        symlink_target = symlink_case / "real-runtime"
+        symlink_target.mkdir(mode=0o700)
+        (symlink_case / "runtime").symlink_to(symlink_target, target_is_directory=True)
+        CONTROLLER_GIT_DIR = symlink_case / "runtime" / "controller-git"
+        try:
+            ensure_controller_git_paths()
+            symlink_rejected = False
+        except (NotADirectoryError, PermissionError, ValueError):
+            symlink_rejected = True
+        check("controller_git_symlink_component_rejected", symlink_rejected)
+
+        nonempty_config_root = Path(tmpdir) / "controller-nonempty-config" / "runtime" / "controller-git"
+        CONTROLLER_GIT_DIR = nonempty_config_root
+        ensure_controller_private_dir_chain(nonempty_config_root)
+        malicious_config = nonempty_config_root / "empty-global-config"
+        malicious_config.write_text("[url \"ssh://evil/\"]\n\tinsteadOf = https://github.com/director-phil/\n", encoding="utf-8")
+        os.chmod(malicious_config, 0o400)
+        try:
+            ensure_controller_git_paths()
+            nonempty_config_rejected = False
+        except (PermissionError, ValueError):
+            nonempty_config_rejected = True
+        check("controller_git_nonempty_insteadof_config_rejected", nonempty_config_rejected)
+
+        wrong_type_root = Path(tmpdir) / "controller-wrong-type" / "runtime"
+        ensure_controller_private_dir_chain(wrong_type_root)
+        (wrong_type_root / "controller-git").write_text("not a directory", encoding="utf-8")
+        CONTROLLER_GIT_DIR = wrong_type_root / "controller-git"
+        try:
+            ensure_controller_git_paths()
+            wrong_type_rejected = False
+        except (NotADirectoryError, PermissionError, ValueError):
+            wrong_type_rejected = True
+        check("controller_git_wrong_type_rejected", wrong_type_rejected)
+
+        nonempty_hooks_root = Path(tmpdir) / "controller-nonempty-hooks" / "runtime" / "controller-git"
+        CONTROLLER_GIT_DIR = nonempty_hooks_root
+        ensure_controller_private_dir_chain(nonempty_hooks_root)
+        seeded_hooks = nonempty_hooks_root / "empty-hooks"
+        seeded_hooks.mkdir(mode=0o700)
+        (seeded_hooks / "pre-commit").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        os.chmod(seeded_hooks, 0o500)
+        try:
+            ensure_controller_git_paths()
+            nonempty_hooks_rejected = False
+        except (PermissionError, ValueError):
+            nonempty_hooks_rejected = True
+        check("controller_git_nonempty_hooks_rejected", nonempty_hooks_rejected)
+        CONTROLLER_GIT_DIR = native_root / "controller-git"
 
         # Create git repo for worktree
         worktree_dir = Path(tmpdir) / "worktree"
@@ -6034,6 +6221,7 @@ def self_test() -> tuple[bool, str]:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        CONTROLLER_GIT_DIR = old_controller_git_dir
 
     # Summary
     failed = [r for r in results if not r[1]]
@@ -6052,6 +6240,7 @@ def self_test() -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global CONTROLLER_GIT_DIR
     parser = argparse.ArgumentParser(description="Hermes Native Goal Runtime")
     parser.add_argument("--self-test", action="store_true", help="Run synthetic self-test suite")
     parser.add_argument("--migrate-legacy", action="store_true", help="Run one-shot bounded legacy ledger migration and exit")
@@ -6076,8 +6265,9 @@ def main() -> None:
         print(f"[self-test] Result: {'PASS' if success else 'FAIL'} - {message}")
         sys.exit(0 if success else 1)
 
-    native_root = Path(args.native_root)
-    ensure_dir_durable(native_root)
+    native_root = Path(args.native_root).expanduser().absolute()
+    CONTROLLER_GIT_DIR = native_root / "controller-git"
+    ensure_controller_private_dir_chain(native_root)
     subprocess_adapter = RealSubprocess()
 
     if args.migrate_legacy:
