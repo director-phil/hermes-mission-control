@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   buildRuntimeSnapshot,
   parseProcStat,
+  readWorktree,
   redactArgv,
   type CommandAdapter,
   type FsAdapter,
@@ -134,6 +135,63 @@ test("observed worktree paths outside allowed roots are rejected before Git exec
   assert.equal(snapshot.source_warnings.some((warning) => warning.message.includes("Git was not executed")), true);
 });
 
+test("forbidden GitHub worktree roots are rejected before any Git exec", async () => {
+  const forbidden = "/home/phillip_downs/Documents/GitHub/reliable-tradies-ops";
+  const gitCwds: string[] = [];
+  const snapshot = await buildRuntimeSnapshot({
+    ...roots,
+    repoRoot: forbidden,
+    allowedWorktreeRoots: ["/home/phillip_downs/.hermes/mission-control-worktrees"],
+    forbiddenWorktreeRoots: [forbidden],
+  }, adapters({
+    files: {
+      "/fixture/ChatDev/goals/state/goal-forbidden.json": JSON.stringify({ id: "goal-forbidden", status: "ready", worktree: forbidden }),
+      "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    },
+    gitCwds,
+  }));
+  assert.deepEqual(gitCwds, []);
+  assert.equal(snapshot.worktrees.length, 0);
+  assert.equal(snapshot.goals[0]?.worktree?.dirty, null);
+  assert.equal(snapshot.source_warnings.some((warning) => warning.source === forbidden && warning.message.includes("Git was not executed")), true);
+});
+
+test("allowed-root symlink resolving to forbidden worktree is rejected before Git exec", async () => {
+  const forbidden = "/home/phillip_downs/Documents/GitHub/reliable-tradies-ops";
+  const symlink = "/home/phillip_downs/.hermes/mission-control-worktrees/link-to-forbidden";
+  const gitCwds: string[] = [];
+  const snapshot = await buildRuntimeSnapshot({
+    ...roots,
+    repoRoot: symlink,
+    allowedWorktreeRoots: ["/home/phillip_downs/.hermes/mission-control-worktrees"],
+    forbiddenWorktreeRoots: [forbidden],
+  }, adapters({
+    files: {
+      "/fixture/ChatDev/goals/state/goal-symlink.json": JSON.stringify({ id: "goal-symlink", status: "ready", worktree: symlink }),
+      "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    },
+    gitCwds,
+    realpaths: {
+      [symlink]: forbidden,
+    },
+  }));
+  assert.deepEqual(gitCwds, []);
+  assert.equal(snapshot.worktrees.length, 0);
+  assert.equal(snapshot.goals[0]?.worktree?.dirty, null);
+  assert.equal(snapshot.source_warnings.some((warning) => warning.message.includes("forbidden roots") && warning.message.includes("Git was not executed")), true);
+});
+
+test("direct worktree reader rejects controller-forbidden roots before Git exec", async () => {
+  const forbidden = "/home/phillip_downs/Documents/GitHub/reliable-tradies-ops";
+  const gitCwds: string[] = [];
+  const worktree = await readWorktree(forbidden, adapters({
+    files: {},
+    gitCwds,
+  }));
+  assert.equal(worktree, null);
+  assert.deepEqual(gitCwds, []);
+});
+
 test("systemd service ownership maps from real user-unit cgroup ancestry without keyword filtering", async () => {
   const snapshot = await buildRuntimeSnapshot(roots, adapters({
     files: {
@@ -172,6 +230,80 @@ test("redaction removes adjacent secrets, inline tokens and JWT-like values", ()
   assert.deepEqual(redactArgv(["cmd", "--token", "abc", "api_key=def", "eyJaaaaaaaaaaa.eyJbbbbbbbbbbb"]), ["cmd", "--token", "[REDACTED]", "api_key=[REDACTED]", "[REDACTED]"]);
 });
 
+test("redaction removes inline shell and interpreter payload content from snapshots and API process records", async () => {
+  const payloadMarker = "SYNTHETIC_ACCEPTANCE_PAYLOAD_MARKER";
+  const adjacentMarker = "PAYLOAD_ADJACENT_MARKER";
+  const nodePayloadMarker = "NODE_EVAL_PAYLOAD_MARKER";
+  const snapshot = await buildRuntimeSnapshot(roots, adapters({
+    files: {
+      "/fixture/proc/101/status": status("python3", 1, 1200),
+      "/fixture/proc/101/stat": stat(101, "python3", 1),
+      "/fixture/proc/101/cmdline": cmd("python3", "bridge/escalate.py", "run", "goal-inline"),
+      "/fixture/proc/102/status": status("bash", 101, 64),
+      "/fixture/proc/102/stat": stat(102, "bash", 101),
+      "/fixture/proc/102/cmdline": cmd("bash", "-lc", `echo ${payloadMarker}`, adjacentMarker),
+      "/fixture/proc/103/status": status("node", 102, 64),
+      "/fixture/proc/103/stat": stat(103, "node", 102),
+      "/fixture/proc/103/cmdline": cmd("node", "--eval", `console.log("${nodePayloadMarker}")`, adjacentMarker),
+      "/fixture/ChatDev/goals/state/goal-inline.json": JSON.stringify({ id: "goal-inline", status: "running", controller_pid: 101 }),
+      "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    },
+  }));
+  const apiRecords = snapshot.processes.map((process) => ({
+    id: String(process.pid),
+    name: process.name,
+    role: process.role,
+    argv_redacted: process.argv_redacted,
+    command_identity: process.command_identity,
+  }));
+  const serialized = JSON.stringify({ snapshot, apiRecords });
+  for (const marker of [payloadMarker, adjacentMarker, nodePayloadMarker]) {
+    assert.equal(serialized.includes(marker), false, `${marker} leaked`);
+  }
+  const shell = snapshot.processes.find((process) => process.pid === 102);
+  const node = snapshot.processes.find((process) => process.pid === 103);
+  assert.deepEqual(shell?.argv_redacted, ["bash", "-lc", "[REDACTED_INLINE_SCRIPT]", "[REDACTED_INLINE_ARG]"]);
+  assert.deepEqual(node?.argv_redacted, ["node", "--eval", "[REDACTED_INLINE_SCRIPT]", "[REDACTED_INLINE_ARG]"]);
+  assert.equal(shell?.command_identity, "bash -lc [REDACTED_INLINE_SCRIPT]");
+  assert.equal(node?.command_identity, "node --eval [REDACTED_INLINE_SCRIPT]");
+  assert.equal(snapshot.processes.find((process) => process.pid === 101)?.role, "controller");
+  assert.equal(shell?.owner_goal_id, "goal-inline");
+  assert.equal(node?.owner_goal_id, "goal-inline");
+});
+
+test("redaction handles inline-code flags without preserving payload-adjacent args", () => {
+  assert.deepEqual(redactArgv(["bash", "-lc", "echo secret payload", "payload-arg"]), ["bash", "-lc", "[REDACTED_INLINE_SCRIPT]", "[REDACTED_INLINE_ARG]"]);
+  assert.deepEqual(redactArgv(["python3", "-c", "print('secret payload')", "payload-arg"]), ["python3", "-c", "[REDACTED_INLINE_SCRIPT]", "[REDACTED_INLINE_ARG]"]);
+  assert.deepEqual(redactArgv(["node", "--eval=console.log('secret payload')", "payload-arg"]), ["node", "--eval", "[REDACTED_INLINE_SCRIPT]", "[REDACTED_INLINE_ARG]"]);
+});
+
+test("redaction handles env wrappers and env assignments before inline code", async () => {
+  const shellMarker = "ENV_WRAPPED_INLINE_MARKER";
+  const assignmentMarker = "ENV_ASSIGNMENT_INLINE_MARKER";
+  const tailMarker = "ENV_WRAPPED_TAIL_MARKER";
+  const snapshot = await buildRuntimeSnapshot(roots, adapters({
+    files: {
+      "/fixture/proc/101/status": status("python3", 1, 1200),
+      "/fixture/proc/101/stat": stat(101, "python3", 1),
+      "/fixture/proc/101/cmdline": cmd("python3", "bridge/escalate.py", "run", "goal-env-inline"),
+      "/fixture/proc/102/status": status("env", 101, 64),
+      "/fixture/proc/102/stat": stat(102, "env", 101),
+      "/fixture/proc/102/cmdline": cmd("/usr/bin/env", "bash", "-lc", `echo ${shellMarker}`, tailMarker),
+      "/fixture/proc/103/status": status("env", 101, 64),
+      "/fixture/proc/103/stat": stat(103, "env", 101),
+      "/fixture/proc/103/cmdline": cmd("/usr/bin/env", "-i", `PAYLOAD=${assignmentMarker}`, "bash", "-lc", `echo ${shellMarker}`, tailMarker),
+      "/fixture/ChatDev/goals/state/goal-env-inline.json": JSON.stringify({ id: "goal-env-inline", status: "running", controller_pid: 101 }),
+      "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    },
+  }));
+  const serialized = JSON.stringify(snapshot);
+  for (const marker of [shellMarker, assignmentMarker, tailMarker]) {
+    assert.equal(serialized.includes(marker), false, `${marker} leaked`);
+  }
+  assert.deepEqual(snapshot.processes.find((process) => process.pid === 102)?.argv_redacted, ["/usr/bin/env", "bash", "-lc", "[REDACTED_INLINE_SCRIPT]", "[REDACTED_INLINE_ARG]"]);
+  assert.deepEqual(snapshot.processes.find((process) => process.pid === 103)?.argv_redacted, ["/usr/bin/env", "-i", "PAYLOAD=[REDACTED]", "bash", "-lc", "[REDACTED_INLINE_SCRIPT]", "[REDACTED_INLINE_ARG]"]);
+});
+
 test("proc stat parser handles command names with spaces", () => {
   assert.deepEqual(parseProcStat("88 (node worker) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21"), {
     comm: "node worker",
@@ -185,24 +317,26 @@ test("proc stat parser handles command names with spaces", () => {
 function adapters({
   files,
   gitCwds,
+  realpaths,
   systemctlOk = true,
   systemctlUnits = [],
   gitOk = true,
 }: {
   files: Record<string, string>;
   gitCwds?: string[];
+  realpaths?: Record<string, string>;
   systemctlOk?: boolean;
   systemctlUnits?: string[];
   gitOk?: boolean;
 }): RuntimeAdapters {
   return {
-    fs: memfs(files),
+    fs: memfs(files, realpaths),
     command: commandAdapter({ gitCwds, systemctlOk, systemctlUnits, gitOk }),
     now: () => new Date("2026-08-04T10:00:00.000Z"),
   };
 }
 
-function memfs(files: Record<string, string>): FsAdapter {
+function memfs(files: Record<string, string>, realpaths: Record<string, string> = {}): FsAdapter {
   return {
     async readFile(filePath) {
       if (!(filePath in files)) throw new Error(`missing ${filePath}`);
@@ -219,6 +353,9 @@ function memfs(files: Record<string, string>): FsAdapter {
     async stat(filePath) {
       if (!(filePath in files) && !Object.keys(files).some((file) => file.startsWith(`${filePath}/`))) throw new Error(`missing ${filePath}`);
       return { mtimeMs: Date.parse("2026-08-04T09:59:00.000Z"), isDirectory: () => !path.extname(filePath), isFile: () => Boolean(path.extname(filePath)) };
+    },
+    async realpath(filePath) {
+      return realpaths[filePath] ?? filePath;
     },
   };
 }

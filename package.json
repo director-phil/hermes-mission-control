@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "next lint",
     "test:runtime-truth": "tsx --test apps/web/lib/__tests__/runtime-truth.fixture.ts",
-    "test:event-timeline": "tsx --test apps/web/lib/__tests__/runtime-events.fixture.ts"
+    "test:event-timeline": "tsx --test apps/web/lib/__tests__/runtime-events.fixture.ts",
+    "test:hermes-native-runtime": "tsx --test apps/web/lib/__tests__/hermes-native-runtime.fixture.ts"
   },
   "dependencies": {
     "next": "^15.1.0",

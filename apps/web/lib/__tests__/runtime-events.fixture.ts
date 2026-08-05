@@ -79,6 +79,41 @@ test("event payloads redact synthetic secrets and private content fields", async
   assert.equal(timeline.events[0]?.summary, "[redacted]");
 });
 
+test("event text redacts response output content, secrets, and filesystem paths", async () => {
+  const secret = "sk-eventSecret123456789";
+  const posixPath = "/home/phillip_downs/Documents/GitHub/reliable-tradies-ops/private.txt";
+  const windowsPath = "C:\\Users\\phil\\Documents\\data.txt";
+  const files = {
+    "/fixture/ChatDev/goals/state/goal-sensitive-event.json": JSON.stringify({ id: "goal-sensitive-event", status: "running" }),
+    "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    "/fixture/ChatDev/runs/goal-sensitive-event/attempt-1-events.jsonl": [
+      JSON.stringify({
+        type: "tool.completed",
+        timestamp: "2026-08-04T09:20:00.000Z",
+        summary: `model response included ${secret} at ${posixPath}`,
+        stage: `opened ${posixPath}`,
+        model: `local model at ${windowsPath}`,
+        url: `https://example.test/callback?token=${secret}`,
+      }),
+      JSON.stringify({
+        type: "agent.started",
+        timestamp: "2026-08-04T09:21:00.000Z",
+        summary: `Using worktree ${posixPath} and profile path ${windowsPath}`,
+      }),
+    ].join("\n"),
+  };
+  const runtime = await buildRuntimeSnapshot(roots, adapters(files));
+  const timeline = await buildRuntimeTimeline(roots, adapters(files), runtime);
+  const serialized = JSON.stringify(timeline);
+
+  assert.equal(serialized.includes(secret), false);
+  assert.equal(serialized.includes(posixPath), false);
+  assert.equal(serialized.includes(windowsPath), false);
+  assert.equal(serialized.includes("model response included"), false);
+  assert.equal(timeline.events[0]?.summary, "[redacted]");
+  assert.equal(timeline.events[1]?.summary.includes("[path]"), true);
+});
+
 test("alert payloads redact synthetic secrets from source warnings", async () => {
   const secret = "sk-alertSecret123456789";
   const runtime = await buildRuntimeSnapshot(roots, adapters({

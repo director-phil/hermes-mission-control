@@ -5,12 +5,23 @@ import { DEFAULT_ROOTS, buildRuntimeSnapshot, createNodeRuntimeAdapters } from "
 export type RuntimeEventType =
   | "goal.created"
   | "goal.ready"
+  | "goal.blocked"
   | "goal.claimed"
   | "workspace.created"
   | "agent.started"
   | "model.requested"
   | "tool.started"
   | "tool.completed"
+  | "planner.failed"
+  | "coder.failed"
+  | "scope.failed"
+  | "worktree.failed"
+  | "contract.failed"
+  | "runner.failed"
+  | "quarantine.failed"
+  | "terminal_move.failed"
+  | "controller.lock_recovered"
+  | "controller.warning"
   | "acceptance.started"
   | "acceptance.failed"
   | "acceptance.passed"
@@ -66,12 +77,23 @@ export interface AlertResponse {
 const EVENT_MAP: Record<string, RuntimeEventType> = {
   "goal.created": "goal.created",
   "goal.ready": "goal.ready",
+  "goal.blocked": "goal.blocked",
   "goal.claimed": "goal.claimed",
   "workspace.created": "workspace.created",
   "agent.started": "agent.started",
   "model.requested": "model.requested",
   "tool.started": "tool.started",
   "tool.completed": "tool.completed",
+  "planner.failed": "planner.failed",
+  "coder.failed": "coder.failed",
+  "scope.failed": "scope.failed",
+  "worktree.failed": "worktree.failed",
+  "contract.failed": "contract.failed",
+  "runner.failed": "runner.failed",
+  "quarantine.failed": "quarantine.failed",
+  "terminal_move.failed": "terminal_move.failed",
+  "controller.lock_recovered": "controller.lock_recovered",
+  "controller.warning": "controller.warning",
   "acceptance.started": "acceptance.started",
   "acceptance.failed": "acceptance.failed",
   "acceptance.passed": "acceptance.passed",
@@ -106,12 +128,18 @@ export async function buildRuntimeTimeline(
   const events: RuntimeEvent[] = [];
 
   for (const goal of runtime.goals) {
+    const nativeOwned = goal.sources.some((source) => source.note === "native-runner");
+    // Read legacy ChatDev run events
     events.push(...await readGoalRunEvents(roots, adapters.fs, goal, warnings));
+    // Read native JSONL events if nativeRuntimeRoot is configured
+    if (roots.nativeRuntimeRoot && nativeOwned) {
+      events.push(...await readNativeRunEvents(roots.nativeRuntimeRoot, adapters.fs, goal, warnings));
+    }
     const source = goal.sources[0];
-    if (goal.status === "completed" && source) {
+    if (!nativeOwned && goal.status === "completed" && source) {
       events.push(goalStateEvent(goal, "goal.completed", source.source, source.timestamp));
     }
-    if (goal.status === "failed" && source) {
+    if (!nativeOwned && goal.status === "failed" && source) {
       events.push(goalStateEvent(goal, "goal.failed", source.source, source.timestamp));
     }
   }
@@ -160,7 +188,9 @@ export function buildRuntimeAlerts(snapshot: RuntimeSnapshot, timeline: Timeline
     } else if (goal.status === "running" && goal.controller_pid && !livePids.has(goal.controller_pid)) {
       alerts.push(goalAlert(goal, "critical", "Running goal controller missing", `PID ${goal.controller_pid} is not live in /proc.`, "Stop or requeue the cited goal after confirming no live controller exists."));
     }
-    if (goal.controller_lock?.stale) {
+    if (goal.controller_lock?.invalid) {
+      alerts.push(goalAlert(goal, "critical", "Invalid controller lock", "controller.lock is malformed or unreadable; claims are blocked fail-closed.", "Inspect the lock metadata and runner events before removing it."));
+    } else if (goal.controller_lock?.stale) {
       alerts.push(goalAlert(goal, "warning", "Stale controller lock", `controller.lock references PID ${goal.controller_lock.pid ?? "unknown"} that is not live.`, "Remove only after verifying the goal is not running."));
     }
     if (goal.controller_lock?.pid && goal.controller_pid && goal.controller_lock.pid !== goal.controller_pid) {
@@ -212,6 +242,63 @@ export function buildRuntimeAlerts(snapshot: RuntimeSnapshot, timeline: Timeline
       info: alerts.filter((alert) => alert.severity === "info").length,
     },
   };
+}
+
+async function readNativeRunEvents(
+  nativeRoot: string,
+  fsAdapter: FsAdapter,
+  goal: GoalRecord,
+  warnings: TimelineResponse["warnings"],
+): Promise<RuntimeEvent[]> {
+  const runDir = path.join(nativeRoot, "runs", goal.goal_id);
+  let entries: string[];
+  try {
+    entries = await fsAdapter.readdir(runDir);
+  } catch {
+    return []; // No native events directory — normal during migration
+  }
+  const eventFiles = entries.filter((entry) => entry.endsWith(".jsonl")).sort();
+  const events: RuntimeEvent[] = [];
+  for (const file of eventFiles) {
+    const source = path.join(runDir, file);
+    let body: string;
+    let sourceTimestamp: string | null = null;
+    try {
+      const [content, stat] = await Promise.all([fsAdapter.readFile(source), fsAdapter.stat(source).catch(() => null)]);
+      body = content;
+      sourceTimestamp = stat ? new Date(stat.mtimeMs).toISOString() : null;
+    } catch {
+      warnings.push({ source, message: "native run event source unreadable" });
+      continue;
+    }
+    body.split("\n").forEach((line, index) => {
+      if (!line.trim()) return;
+      try {
+        const raw = JSON.parse(line) as Record<string, unknown>;
+        const type = normalizeEventType(raw.type ?? raw.event ?? raw.name);
+        if (!type) return;
+        const timestamp = stringValue(raw.timestamp) ?? stringValue(raw.ts) ?? sourceTimestamp;
+        if (!timestamp) {
+          warnings.push({ source, message: `native event line ${index + 1} has no timestamp` });
+          return;
+        }
+        events.push({
+          id: `native:${goal.goal_id}:${file}:${index + 1}`,
+          goal_id: goal.goal_id,
+          type,
+          timestamp,
+          summary: eventSummary(type, raw),
+          source,
+          source_timestamp: sourceTimestamp,
+          severity: type.endsWith(".failed") || type === "process.orphaned" ? "warning" : "info",
+          metadata: pickMetadata(raw),
+        });
+      } catch {
+        warnings.push({ source, message: `native event line ${index + 1} is malformed JSON` });
+      }
+    });
+  }
+  return events;
 }
 
 async function readGoalRunEvents(
@@ -322,13 +409,15 @@ function pickMetadata(raw: Record<string, unknown>): RuntimeEvent["metadata"] {
 
 export function sanitizeEventText(value: string): string {
   const lowered = value.toLowerCase();
-  if (/(prompt|tool[_ -]?body|file[_ -]?body|private[_ -]?output|stdout|stderr|env|environment|secret|password|token|api[_ -]?key|credential)/i.test(lowered)) {
+  if (/(prompt|response|tool[_ -]?body|file[_ -]?body|private[_ -]?output|output|stdout|stderr|env|environment|secret|password|token|api[_ -]?key|credential)/i.test(lowered)) {
     return "[redacted]";
   }
   return truncateText(value
     .replace(/(token|secret|password|api[_-]?key|credential)=([^&\s]+)/gi, "$1=[REDACTED]")
     .replace(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{10,})?/g, "[REDACTED]")
-    .replace(/sk-[A-Za-z0-9_-]{12,}/g, "[REDACTED]"), 180);
+    .replace(/sk-[A-Za-z0-9_-]{12,}/g, "[REDACTED]")
+    .replace(/(?:\/[\w.-]+){2,}/g, "[path]")
+    .replace(/[A-Za-z]:\\(?:[^\\\s]+\\?){2,}/g, "[path]"), 180);
 }
 
 function truncateText(value: string, max: number): string {

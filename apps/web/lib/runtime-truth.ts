@@ -14,6 +14,7 @@ export interface FsAdapter {
   readFile(filePath: string): Promise<string>;
   readdir(dirPath: string): Promise<string[]>;
   stat(filePath: string): Promise<{ mtimeMs: number; isDirectory(): boolean; isFile(): boolean }>;
+  realpath?(filePath: string): Promise<string>;
 }
 
 export interface CommandAdapter {
@@ -28,6 +29,9 @@ export interface RuntimeRoots {
   procRoot: string;
   chatDevRoot: string;
   repoRoot: string;
+  nativeRuntimeRoot?: string;
+  allowedWorktreeRoots?: string[];
+  forbiddenWorktreeRoots?: string[];
 }
 
 export interface RuntimeAdapters {
@@ -55,8 +59,10 @@ export interface ProcessRecord {
 export interface ControllerLock {
   goal_id: string;
   pid: number | null;
+  proc_start_ticks: number | null;
   live: boolean;
   stale: boolean;
+  invalid?: boolean;
   source: string;
   timestamp: string | null;
 }
@@ -110,20 +116,33 @@ export interface RuntimeSnapshot {
 }
 
 type SourceWarning = RuntimeSnapshot["source_warnings"][number];
+type NativeTerminalEvidence = {
+  status: GoalStatus;
+  sourceStatus: EvidenceStatus;
+  source: string;
+  timestamp: string | null;
+  note: string | null;
+  warning?: string;
+};
 const processArgv = new WeakMap<ProcessRecord, string[]>();
 const processCgroups = new WeakMap<ProcessRecord, string[]>();
 
 const HOME = os.homedir();
+export const DEFAULT_FORBIDDEN_WORKTREE_ROOTS = ["/home/phillip_downs/Documents/GitHub/reliable-tradies-ops"];
 export const DEFAULT_ROOTS: RuntimeRoots = {
   procRoot: "/proc",
   chatDevRoot: path.join(HOME, "ChatDev"),
   repoRoot: "/home/phillip_downs/Documents/GitHub/hermes-mission-control",
+  nativeRuntimeRoot: path.join(HOME, ".hermes", "mission-control", "runtime"),
+  allowedWorktreeRoots: [path.join(HOME, ".hermes", "mission-control-worktrees")],
+  forbiddenWorktreeRoots: DEFAULT_FORBIDDEN_WORKTREE_ROOTS,
 };
 
 export const nodeFsAdapter: FsAdapter = {
   readFile: (filePath) => fs.readFile(filePath, "utf8"),
   readdir: (dirPath) => fs.readdir(dirPath),
   stat: (filePath) => fs.stat(filePath),
+  realpath: (filePath) => fs.realpath(filePath),
 };
 
 export const nodeCommandAdapter: CommandAdapter = {
@@ -157,7 +176,7 @@ export async function buildRuntimeSnapshot(
   adapters: RuntimeAdapters = createNodeRuntimeAdapters(),
 ): Promise<RuntimeSnapshot> {
   const source_warnings: RuntimeSnapshot["source_warnings"] = [];
-  const [processesResult, queue, goalsResult, locksResult, servicesResult, repoWorktree] = await Promise.all([
+  const [processesResult, queue, goalsResult, locksResult, servicesResult, repoWorktreeResult] = await Promise.all([
     readProcesses(roots.procRoot, adapters).catch((error) => {
       source_warnings.push({ source: roots.procRoot, status: "unknown", message: String(error) });
       return { processes: [] as ProcessRecord[], warnings: [] as SourceWarning[] };
@@ -166,34 +185,92 @@ export async function buildRuntimeSnapshot(
     readGoalStates(roots, adapters),
     readControllerLocks(roots, adapters),
     readSystemdServices(adapters),
-    readWorktree(roots.repoRoot, adapters),
+    readWorktreeSource(roots.repoRoot, roots, adapters),
   ]);
+  const repoWorktree = repoWorktreeResult.worktree;
   const processes = processesResult.processes;
   const goalsFromState = goalsResult.goals;
   const locks = locksResult.locks;
   const services = servicesResult.services;
   source_warnings.push(...processesResult.warnings, ...goalsResult.warnings, ...locksResult.warnings, ...servicesResult.warnings);
-  if (!repoWorktree) {
+  if (repoWorktreeResult.warning) {
+    source_warnings.push(repoWorktreeResult.warning);
+  } else if (!repoWorktree) {
     source_warnings.push({ source: path.join(roots.repoRoot, ".git"), status: "unknown", message: "Mission Control Git source missing or unreadable" });
   }
 
   const goalsById = new Map<string, GoalRecord>();
-  for (const goal of goalsFromState) goalsById.set(goal.goal_id, goal);
+  // Label legacy goals explicitly
+  for (const goal of goalsFromState) {
+    if (!goal.sources.some((s) => s.note === "native-runner")) {
+      for (const s of goal.sources) {
+        if (!s.note) s.note = "legacy-chatdev";
+      }
+    }
+    goalsById.set(goal.goal_id, goal);
+  }
+
+  // Read native goals if nativeRuntimeRoot is configured
+  if (roots.nativeRuntimeRoot) {
+    const nativeResult = await readNativeGoals(roots, adapters, source_warnings);
+    for (const nativeGoal of nativeResult) {
+      // Native takes precedence over legacy on same goal ID
+      goalsById.set(nativeGoal.goal_id, nativeGoal);
+    }
+  }
+
   for (const lock of locks) {
+    const lockStatus: EvidenceStatus = lock.stale || lock.invalid ? "warning" : "ok";
     const existing = goalsById.get(lock.goal_id);
     if (existing) {
       existing.controller_lock = lock;
       existing.controller_pid = existing.controller_pid ?? lock.pid;
-      existing.sources.push({ source: lock.source, timestamp: lock.timestamp, status: lock.stale ? "warning" : "ok" });
+      existing.sources.push({ source: lock.source, timestamp: lock.timestamp, status: lockStatus, note: lock.invalid ? "controller-lock-invalid" : undefined });
     } else {
-      goalsById.set(lock.goal_id, unknownGoal(lock.goal_id, { source: lock.source, timestamp: lock.timestamp, status: lock.stale ? "warning" : "ok" }, lock));
+      goalsById.set(lock.goal_id, unknownGoal(lock.goal_id, { source: lock.source, timestamp: lock.timestamp, status: lockStatus, note: lock.invalid ? "controller-lock-invalid" : undefined }, lock));
+    }
+  }
+
+  // Read native controller lock if present
+  if (roots.nativeRuntimeRoot) {
+    const nativeLockResult = await readNativeControllerLock(roots, adapters);
+    if (nativeLockResult) {
+      const sourceStatus: EvidenceStatus = nativeLockResult.stale || nativeLockResult.invalid ? "warning" : "ok";
+      if (nativeLockResult.invalid) {
+        source_warnings.push({
+          source: nativeLockResult.source,
+          status: "warning",
+          message: "native controller lock invalid or unreadable; claims blocked fail-closed",
+        });
+      }
+      const existing = goalsById.get(nativeLockResult.goal_id);
+      if (existing) {
+        existing.controller_lock = nativeLockResult;
+        existing.controller_pid = existing.controller_pid ?? nativeLockResult.pid;
+        existing.sources.push({
+          source: nativeLockResult.source,
+          timestamp: nativeLockResult.timestamp,
+          status: sourceStatus,
+          note: nativeLockResult.invalid ? "controller-lock-invalid" : undefined,
+        });
+      } else {
+        goalsById.set(nativeLockResult.goal_id, unknownGoal(nativeLockResult.goal_id, {
+          source: nativeLockResult.source,
+          timestamp: nativeLockResult.timestamp,
+          status: sourceStatus,
+          note: nativeLockResult.invalid ? "controller-lock-invalid" : undefined,
+        }, nativeLockResult));
+      }
     }
   }
 
   for (const goal of goalsById.values()) {
-    goal.queue_state = queue.statusByGoal.get(goal.goal_id) ?? queue.global;
-    if (queue.focus_goal_id === goal.goal_id && goal.queue_state === "unknown") goal.queue_state = "running";
-    if (!goal.worktree && repoWorktree) goal.worktree = repoWorktree;
+    const nativeOwned = goal.sources.some((source) => source.note === "native-runner");
+    if (!nativeOwned || goal.queue_state === "unknown") {
+      goal.queue_state = queue.statusByGoal.get(goal.goal_id) ?? queue.global;
+      if (queue.focus_goal_id === goal.goal_id && goal.queue_state === "unknown") goal.queue_state = "running";
+    }
+    if (!goal.worktree && repoWorktree && !goal.sources.some((s) => s.note === "native-worktree-rejected")) goal.worktree = repoWorktree;
     goal.stall_age_ms = goal.last_event_timestamp
       ? Math.max(0, adapters.now().getTime() - Date.parse(goal.last_event_timestamp))
       : null;
@@ -251,6 +328,234 @@ export async function buildRuntimeSnapshot(
     worktrees,
     source_warnings,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Native runtime readers
+// ---------------------------------------------------------------------------
+
+async function readNativeGoals(roots: RuntimeRoots, adapters: RuntimeAdapters, warnings: SourceWarning[]): Promise<GoalRecord[]> {
+  const nativeRoot = roots.nativeRuntimeRoot;
+  if (!nativeRoot) return [];
+  const goals: GoalRecord[] = [];
+  const statusDirs = ["ready", "running", "done", "failed"] as const;
+  const queueMap: Record<string, GoalRecord["queue_state"]> = { ready: "ready", running: "running", done: "unknown", failed: "unknown" };
+  for (const dir of statusDirs) {
+    let entries: string[];
+    try {
+      entries = await adapters.fs.readdir(path.join(nativeRoot, "goals", dir));
+    } catch {
+      continue; // directory may not exist yet — soft fail during migration
+    }
+    for (const entry of entries) {
+      if (!entry.endsWith(".md")) continue;
+      const goalId = entry.replace(/\.md$/, "");
+      const goalPath = path.join(nativeRoot, "goals", dir, entry);
+      let body: string;
+      try {
+        body = await adapters.fs.readFile(goalPath);
+      } catch {
+        warnings.push({ source: goalPath, status: "warning", message: "unreadable native goal file" });
+        continue;
+      }
+      const parsed = parseNativeGoalMarkdown(body);
+      if (!parsed) {
+        warnings.push({ source: goalPath, status: "warning", message: "malformed native goal file" });
+        continue;
+      }
+      const worktreeValue = parsed.repoWorktree;
+      const worktreePreflight = worktreeValue ? await preflightWorktreeForGit(worktreeValue, roots, adapters) : null;
+      const worktreeAllowed = Boolean(worktreePreflight?.ok);
+      const worktreeRejected = Boolean(worktreeValue) && !worktreeAllowed;
+      if (worktreeRejected) {
+        warnings.push({
+          source: goalPath,
+          status: worktreePreflight?.ok === false ? worktreePreflight.status : "warning",
+          message: worktreePreflight?.ok === false
+            ? `native ${worktreePreflight.message}`
+            : "native worktree path rejected by Mission Control allowed roots; Git was not executed",
+        });
+      }
+      const blockerIds = dir === "ready"
+        ? await blockedNativeDependencies(nativeRoot, parsed.dependencies, adapters.fs)
+        : [];
+      const terminal: NativeTerminalEvidence = dir === "done" || dir === "failed"
+        ? await readNativeTerminalResult(nativeRoot, goalId, adapters.fs, dir === "done")
+        : { status: dir === "ready" ? "ready" : "running", sourceStatus: "ok", source: goalPath, timestamp: null, note: null };
+      if (terminal.warning) warnings.push({ source: terminal.source, status: "warning", message: terminal.warning });
+      goals.push({
+        goal_id: goalId,
+        title: parsed.title,
+        status: terminal.status,
+        controller_pid: null,
+        controller_lock: null,
+        queue_state: queueMap[dir] ?? "unknown",
+        stage: parsed.hasAcceptance ? "acceptance" : null,
+        last_event_timestamp: null,
+        stall_age_ms: null,
+        blocker_ids: blockerIds,
+        dependency_ids: parsed.dependencies,
+        worktree: worktreeValue && worktreeAllowed ? await readWorktree(worktreeValue, adapters, roots) : null,
+        sources: [
+          { source: goalPath, timestamp: null, status: "ok", note: "native-runner" },
+          ...(terminal.note
+            ? [{ source: terminal.source, timestamp: terminal.timestamp, status: terminal.sourceStatus, note: terminal.note }]
+            : []),
+          ...(blockerIds.length
+            ? [{ source: goalPath, timestamp: null, status: "warning" as const, note: `native-dependency-blocked:${blockerIds.join(",")}` }]
+            : []),
+          ...(worktreeRejected ? [{ source: goalPath, timestamp: null, status: "warning" as const, note: "native-worktree-rejected" }] : []),
+        ],
+      });
+    }
+  }
+  return goals;
+}
+
+async function readNativeTerminalResult(
+  nativeRoot: string,
+  goalId: string,
+  fsAdapter: FsAdapter,
+  expectSuccess: boolean,
+): Promise<NativeTerminalEvidence> {
+  const resultPath = path.join(nativeRoot, "runs", goalId, "result.json");
+  try {
+    const result = JSON.parse(await fsAdapter.readFile(resultPath)) as { goal_id?: unknown; success?: unknown };
+    const resultTimestamp = await sourceTimestamp(fsAdapter, resultPath);
+    if (terminalResultMatches(result, goalId, expectSuccess)) {
+      return {
+        status: expectSuccess ? "completed" : "failed",
+        sourceStatus: "ok",
+        source: resultPath,
+        timestamp: resultTimestamp,
+        note: "native-terminal-result",
+      };
+    }
+    return {
+      status: "unknown",
+      sourceStatus: "warning",
+      source: resultPath,
+      timestamp: resultTimestamp,
+      note: "native-terminal-result-mismatched",
+      warning: `native terminal result mismatch for ${goalId}`,
+    };
+  } catch {
+    return {
+      status: "unknown",
+      sourceStatus: "warning",
+      source: resultPath,
+      timestamp: null,
+      note: "native-terminal-result-missing-or-malformed",
+      warning: `native terminal result missing or malformed for ${goalId}`,
+    };
+  }
+}
+
+async function sourceTimestamp(fsAdapter: FsAdapter, source: string): Promise<string | null> {
+  try {
+    return new Date((await fsAdapter.stat(source)).mtimeMs).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+function parseNativeGoalMarkdown(body: string): { title: string | null; repoWorktree: string | null; dependencies: string[]; hasAcceptance: boolean } | null {
+  const lines = body.split("\n");
+  let fmFound = false;
+  const fm: Record<string, string> = {};
+  if (lines[0]?.trim() !== "---") return null;
+  for (const line of lines.slice(1)) {
+    if (line.trim() === "---") {
+      fmFound = true;
+      break;
+    }
+    if (line.includes(":")) {
+      const [k, ...v] = line.split(":");
+      fm[k.trim().toLowerCase()] = v.join(":").trim();
+    }
+  }
+  if (!fmFound) return null;
+  return {
+    title: fm.title ?? null,
+    repoWorktree: fm["repo/workdir"] ?? fm.worktree ?? null,
+    dependencies: fm.dependencies ? fm.dependencies.split(",").map((d) => d.trim()).filter(Boolean) : [],
+    hasAcceptance: body.includes("## Acceptance"),
+  };
+}
+
+async function blockedNativeDependencies(
+  nativeRoot: string,
+  dependencies: string[],
+  fsAdapter: FsAdapter,
+): Promise<string[]> {
+  const blockers: string[] = [];
+  for (const dependencyId of dependencies) {
+    try {
+      await fsAdapter.readFile(path.join(nativeRoot, "goals", "done", `${dependencyId}.md`));
+      const result = JSON.parse(await fsAdapter.readFile(path.join(nativeRoot, "runs", dependencyId, "result.json"))) as { goal_id?: unknown; success?: unknown };
+      if (!terminalResultMatches(result, dependencyId, true)) blockers.push(dependencyId);
+    } catch {
+      blockers.push(dependencyId);
+    }
+  }
+  return blockers;
+}
+
+function terminalResultMatches(result: { goal_id?: unknown; success?: unknown }, goalId: string, success: boolean): boolean {
+  return typeof result.goal_id === "string"
+    && result.goal_id.length > 0
+    && result.goal_id.length <= 128
+    && result.goal_id === goalId
+    && result.success === success;
+}
+
+async function readNativeControllerLock(roots: RuntimeRoots, adapters: RuntimeAdapters): Promise<ControllerLock | null> {
+  const nativeRoot = roots.nativeRuntimeRoot;
+  if (!nativeRoot) return null;
+  const lockPath = path.join(nativeRoot, "controller.lock");
+  const stat = await adapters.fs.stat(lockPath).catch(() => null);
+  try {
+    const body = await adapters.fs.readFile(lockPath);
+    const data = JSON.parse(body) as Record<string, unknown>;
+    const pid = numberValue(data.pid);
+    const procStartTicks = numberValue(data.proc_start_ticks);
+    const goalId = stringValue(data.goal_id);
+    if (!goalId || !pid || !procStartTicks) {
+      return {
+        goal_id: goalId ?? "unknown-lock",
+        pid,
+        proc_start_ticks: procStartTicks,
+        live: false,
+        stale: false,
+        invalid: true,
+        source: lockPath,
+        timestamp: stat ? new Date(stat.mtimeMs).toISOString() : null,
+      };
+    }
+    const actualStartTicks = pid ? await readProcStartTicks(roots.procRoot, pid, adapters) : null;
+    const live = Boolean(pid && procStartTicks && actualStartTicks === procStartTicks);
+    return {
+      goal_id: goalId,
+      pid,
+      proc_start_ticks: procStartTicks,
+      live,
+      stale: Boolean(pid && procStartTicks && !live),
+      source: lockPath,
+      timestamp: stat ? new Date(stat.mtimeMs).toISOString() : null,
+    };
+  } catch {
+    if (!stat) return null;
+    return {
+      goal_id: "unknown-lock",
+      pid: null,
+      proc_start_ticks: null,
+      live: false,
+      stale: false,
+      invalid: true,
+      source: lockPath,
+      timestamp: new Date(stat.mtimeMs).toISOString(),
+    };
+  }
 }
 
 export async function readProcesses(procRoot: string, adapters: RuntimeAdapters): Promise<{ processes: ProcessRecord[]; warnings: SourceWarning[] }> {
@@ -332,10 +637,36 @@ export function parseProcStat(stat: string): { comm: string | null; ppid: number
 export function redactArgv(argv: readonly string[]): string[] {
   const redacted: string[] = [];
   let redactNext = false;
-  for (const raw of argv) {
+  let redactInlineTail = false;
+  const interpreterIndex = inlineInterpreterIndex(argv);
+  const executable = interpreterIndex >= 0 ? argv[interpreterIndex] : (argv[0] ?? "");
+  for (let index = 0; index < argv.length; index += 1) {
+    const raw = argv[index];
+    if (redactInlineTail) {
+      redacted.push("[REDACTED_INLINE_ARG]");
+      continue;
+    }
     if (redactNext) {
       redacted.push("[REDACTED]");
       redactNext = false;
+      continue;
+    }
+    if (interpreterIndex > 0 && index < interpreterIndex && isEnvAssignment(raw)) {
+      redacted.push(redactAssignmentValue(raw));
+      continue;
+    }
+    const inlineFlag = index > interpreterIndex ? inlineCodeFlag(raw, executable) : null;
+    if (inlineFlag) {
+      const [flagName, inlineValue] = inlineFlag;
+      redacted.push(flagName);
+      if (inlineValue !== null) {
+        redacted.push("[REDACTED_INLINE_SCRIPT]");
+        redactInlineTail = true;
+      } else if (index + 1 < argv.length) {
+        redacted.push("[REDACTED_INLINE_SCRIPT]");
+        index += 1;
+        redactInlineTail = true;
+      }
       continue;
     }
     const arg = raw.replace(/(token|secret|password|api[_-]?key|credential)=([^&\s]+)/gi, "$1=[REDACTED]");
@@ -349,6 +680,54 @@ export function redactArgv(argv: readonly string[]): string[] {
     }
   }
   return redacted;
+}
+
+function inlineInterpreterIndex(argv: readonly string[]): number {
+  const firstBase = path.basename(argv[0] ?? "").toLowerCase();
+  if (firstBase !== "env") return argv.length > 0 ? 0 : -1;
+  for (let index = 1; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (isEnvAssignment(arg)) continue;
+    if (arg === "-i" || arg === "--ignore-environment" || arg === "-0" || arg === "--null") continue;
+    if (arg === "-u" || arg === "--unset" || arg === "-C" || arg === "--chdir") {
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--unset=") || arg.startsWith("--chdir=") || arg.startsWith("-u") && arg.length > 2) continue;
+    return index;
+  }
+  return 0;
+}
+
+function isEnvAssignment(arg: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(arg);
+}
+
+function redactAssignmentValue(arg: string): string {
+  const equals = arg.indexOf("=");
+  return equals > 0 ? `${arg.slice(0, equals)}=[REDACTED]` : arg;
+}
+
+function inlineCodeFlag(raw: string, executable: string): [string, string | null] | null {
+  const equals = raw.indexOf("=");
+  const flagName = equals > 0 ? raw.slice(0, equals) : raw;
+  const inlineValue = equals > 0 ? raw.slice(equals + 1) : null;
+  const base = path.basename(executable).toLowerCase();
+  const shellNames = new Set(["bash", "dash", "sh", "zsh", "fish", "ksh"]);
+  const nodeNames = new Set(["node", "nodejs", "bun", "deno"]);
+  const interpreterNames = new Set(["python", "python3", "python2", "perl", "ruby", "php"]);
+
+  if (shellNames.has(base)) {
+    if (/^-[A-Za-z]*c[A-Za-z]*$/.test(flagName) || flagName === "--command") return [flagName, inlineValue];
+  }
+  if (nodeNames.has(base)) {
+    if (flagName === "-e" || flagName === "--eval" || flagName === "-p" || flagName === "--print") return [flagName, inlineValue];
+  }
+  if (interpreterNames.has(base)) {
+    if (flagName === "-c" || flagName === "-e" || flagName === "-r") return [flagName, inlineValue];
+  }
+  if (!base || flagName === "-c" || flagName === "-e" || flagName === "--eval") return [flagName, inlineValue];
+  return null;
 }
 
 async function readGoalStates(roots: RuntimeRoots, adapters: RuntimeAdapters): Promise<{ goals: GoalRecord[]; warnings: SourceWarning[] }> {
@@ -372,7 +751,7 @@ async function readGoalState(filePath: string, roots: RuntimeRoots, adapters: Ru
     const [body, stat] = await Promise.all([adapters.fs.readFile(filePath), adapters.fs.stat(filePath).catch(() => null)]);
     const data = JSON.parse(body) as Record<string, unknown>;
     const goalId = stringValue(data.id) ?? path.basename(filePath, ".json");
-    const worktree = await worktreeFromGoal(data, roots, adapters);
+    const worktreeResult = await worktreeFromGoal(data, roots, adapters);
     return { goal: {
       goal_id: goalId,
       title: stringValue(data.title),
@@ -385,11 +764,9 @@ async function readGoalState(filePath: string, roots: RuntimeRoots, adapters: Ru
       stall_age_ms: null,
       blocker_ids: stringArray(data.blockers ?? data.blocker_ids),
       dependency_ids: stringArray(data.dependencies ?? data.dependency_ids ?? data.depends_on),
-      worktree,
+      worktree: worktreeResult.worktree,
       sources: [{ source: filePath, timestamp: stat ? new Date(stat.mtimeMs).toISOString() : null, status: "ok" }],
-    }, warning: worktree?.dirty === null && worktree.branch === null && worktree.head === null && worktree.source === worktree.path
-      ? { source: worktree.path, status: "warning", message: "observed worktree path rejected by Mission Control allowed roots; Git was not executed" }
-      : null };
+    }, warning: worktreeResult.warning };
   } catch {
     return { goal: null, warning: { source: filePath, status: "unknown", message: "goal-state file missing, unreadable, or malformed" } };
   }
@@ -404,7 +781,7 @@ async function readControllerLocks(roots: RuntimeRoots, adapters: RuntimeAdapter
     return { locks: [], warnings: [{ source: stateRoot, status: "unknown", message: "controller lock directory missing or unreadable" }] };
   }
   const warnings: SourceWarning[] = [];
-  const locks = await Promise.all(
+  const locks: Array<ControllerLock | null> = await Promise.all(
     entries.filter((entry) => entry.endsWith(".lock") || entry === "controller.lock").map(async (entry) => {
       const source = path.join(stateRoot, entry);
       const goalFromName = entry === "controller.lock" ? null : entry.replace(/\.lock$/, "");
@@ -415,6 +792,7 @@ async function readControllerLocks(roots: RuntimeRoots, adapters: RuntimeAdapter
         return {
           goal_id: parsed.goal_id,
           pid: parsed.pid,
+          proc_start_ticks: null,
           live,
           stale: Boolean(parsed.pid && !live),
           source,
@@ -426,7 +804,7 @@ async function readControllerLocks(roots: RuntimeRoots, adapters: RuntimeAdapter
       }
     }),
   );
-  return { locks: locks.filter((lock): lock is ControllerLock => Boolean(lock)), warnings };
+  return { locks: locks.filter((lock): lock is ControllerLock => lock !== null), warnings };
 }
 
 function parseLock(body: string, fallbackGoalId: string | null): { goal_id: string; pid: number | null } {
@@ -513,13 +891,16 @@ async function readSystemdUnit(unit: string, adapters: RuntimeAdapters): Promise
   };
 }
 
-export async function readWorktree(worktreePath: string, adapters: RuntimeAdapters): Promise<WorktreeRecord | null> {
+export async function readWorktree(worktreePath: string, adapters: RuntimeAdapters, roots?: RuntimeRoots): Promise<WorktreeRecord | null> {
+  const preflight = await preflightWorktreeForGit(worktreePath, roots, adapters);
+  if (!preflight.ok) return null;
+  const gitCwd = preflight.path;
   const [branch, head, dirty, remote, stat] = await Promise.all([
-    adapters.command.execFile("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: worktreePath, timeoutMs: 3_000 }),
-    adapters.command.execFile("git", ["rev-parse", "HEAD"], { cwd: worktreePath, timeoutMs: 3_000 }),
-    adapters.command.execFile("git", ["status", "--porcelain=v1"], { cwd: worktreePath, timeoutMs: 3_000 }),
-    adapters.command.execFile("git", ["remote", "get-url", "origin"], { cwd: worktreePath, timeoutMs: 3_000 }),
-    adapters.fs.stat(worktreePath).catch(() => null),
+    adapters.command.execFile("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: gitCwd, timeoutMs: 3_000 }),
+    adapters.command.execFile("git", ["rev-parse", "HEAD"], { cwd: gitCwd, timeoutMs: 3_000 }),
+    adapters.command.execFile("git", ["status", "--porcelain=v1"], { cwd: gitCwd, timeoutMs: 3_000 }),
+    adapters.command.execFile("git", ["remote", "get-url", "origin"], { cwd: gitCwd, timeoutMs: 3_000 }),
+    adapters.fs.stat(gitCwd).catch(() => null),
   ]);
   if (!branch.ok && !head.ok) return null;
   return {
@@ -531,6 +912,17 @@ export async function readWorktree(worktreePath: string, adapters: RuntimeAdapte
     source: path.join(worktreePath, ".git"),
     timestamp: stat ? new Date(stat.mtimeMs).toISOString() : null,
   };
+}
+
+async function readWorktreeSource(worktreePath: string, roots: RuntimeRoots, adapters: RuntimeAdapters): Promise<{ worktree: WorktreeRecord | null; warning: SourceWarning | null }> {
+  const preflight = await preflightWorktreeForGit(worktreePath, roots, adapters);
+  if (!preflight.ok) {
+    return {
+      worktree: null,
+      warning: { source: worktreePath, status: preflight.status, message: preflight.message },
+    };
+  }
+  return { worktree: await readWorktree(worktreePath, adapters, roots), warning: null };
 }
 
 function classifyProcess(process: ProcessRecord): ProcessRole {
@@ -552,21 +944,29 @@ function inferGoalFromArgv(argv: readonly string[], goals: readonly GoalRecord[]
   return null;
 }
 
-async function worktreeFromGoal(data: Record<string, unknown>, roots: RuntimeRoots, adapters: RuntimeAdapters): Promise<WorktreeRecord | null> {
+async function worktreeFromGoal(
+  data: Record<string, unknown>,
+  roots: RuntimeRoots,
+  adapters: RuntimeAdapters,
+): Promise<{ worktree: WorktreeRecord | null; warning: SourceWarning | null }> {
   const value = stringValue(data.worktree) ?? stringValue(data.repo) ?? stringValue(data.workspace);
-  if (!value) return null;
-  if (!isAllowedWorktree(value, roots)) {
+  if (!value) return { worktree: null, warning: null };
+  const preflight = await preflightWorktreeForGit(value, roots, adapters);
+  if (!preflight.ok) {
     return {
-      path: value,
-      branch: null,
-      head: null,
-      dirty: null,
-      remote_base: null,
-      source: value,
-      timestamp: null,
+      worktree: {
+        path: value,
+        branch: null,
+        head: null,
+        dirty: null,
+        remote_base: null,
+        source: value,
+        timestamp: null,
+      },
+      warning: { source: value, status: preflight.status, message: preflight.message },
     };
   }
-  return readWorktree(value, adapters);
+  return { worktree: await readWorktree(value, adapters, roots), warning: null };
 }
 
 function propagateOwners(processes: ProcessRecord[], ownerByPid: Map<number, string>) {
@@ -618,13 +1018,72 @@ function redactedArgv(process: ProcessRecord): string[] {
 }
 
 function commandIdentity(argv: readonly string[]): string {
-  return truncate(argv.slice(0, 3).join(" "), 160);
+  return truncate(safeCommandIdentity(argv).join(" "), 160);
 }
 
-function isAllowedWorktree(worktreePath: string, roots: RuntimeRoots): boolean {
+function safeCommandIdentity(argv: readonly string[]): string[] {
+  const identity = argv.slice(0, 4);
+  const inlineIndex = identity.findIndex((arg) => arg === "[REDACTED_INLINE_SCRIPT]");
+  if (inlineIndex >= 0) return identity.slice(0, inlineIndex + 1);
+  return identity;
+}
+
+export function isAllowedWorktree(worktreePath: string, roots: RuntimeRoots): boolean {
   const resolved = path.resolve(worktreePath);
-  const allowed = [roots.repoRoot, roots.chatDevRoot].map((root) => path.resolve(root));
+  // Use injected allowedWorktreeRoots if present, otherwise fall back to repo/chatdev roots
+  const allowed = roots.allowedWorktreeRoots
+    ? roots.allowedWorktreeRoots.map((root) => path.resolve(root))
+    : [roots.repoRoot, roots.chatDevRoot].map((root) => path.resolve(root));
+  // Never allow nativeRuntimeRoot or chatDevRoot as code worktrees
+  if (isForbiddenWorktree(resolved, roots)) return false;
   return allowed.some((root) => resolved === root || resolved.startsWith(`${root}${path.sep}`));
+}
+
+export function isForbiddenWorktree(worktreePath: string, roots?: RuntimeRoots): boolean {
+  const resolved = path.resolve(worktreePath);
+  const forbidden = [
+    roots?.nativeRuntimeRoot ? path.resolve(roots.nativeRuntimeRoot) : null,
+    ...DEFAULT_FORBIDDEN_WORKTREE_ROOTS.map((root) => path.resolve(root)),
+    ...(roots?.forbiddenWorktreeRoots ?? []).map((root) => path.resolve(root)),
+  ].filter((v): v is string => Boolean(v));
+  return forbidden.some((root) => resolved === root || resolved.startsWith(`${root}${path.sep}`));
+}
+
+type WorktreeGitPreflight =
+  | { ok: true; path: string }
+  | { ok: false; status: "unknown" | "warning"; message: string };
+
+async function preflightWorktreeForGit(
+  worktreePath: string,
+  roots: RuntimeRoots | undefined,
+  adapters: RuntimeAdapters,
+): Promise<WorktreeGitPreflight> {
+  const lexicalPath = path.resolve(worktreePath);
+  const lexicalCheck = checkWorktreePath(lexicalPath, roots);
+  if (!lexicalCheck.ok) return lexicalCheck;
+
+  let realPath = lexicalPath;
+  if (adapters.fs.realpath) {
+    try {
+      realPath = path.resolve(await adapters.fs.realpath(worktreePath));
+    } catch {
+      return { ok: false, status: "unknown", message: "worktree path could not be resolved; Git was not executed" };
+    }
+  }
+
+  const realPathCheck = checkWorktreePath(realPath, roots);
+  if (!realPathCheck.ok) return realPathCheck;
+  return { ok: true, path: realPath };
+}
+
+function checkWorktreePath(resolvedPath: string, roots: RuntimeRoots | undefined): WorktreeGitPreflight {
+  if (isForbiddenWorktree(resolvedPath, roots)) {
+    return { ok: false, status: "warning", message: "worktree path rejected by Mission Control forbidden roots; Git was not executed" };
+  }
+  if (roots && !isAllowedWorktree(resolvedPath, roots)) {
+    return { ok: false, status: "warning", message: "worktree path rejected by Mission Control allowed roots; Git was not executed" };
+  }
+  return { ok: true, path: resolvedPath };
 }
 
 function truncate(value: string, max: number): string {
@@ -687,6 +1146,15 @@ async function processExists(procRoot: string, pid: number, adapters: RuntimeAda
     return true;
   } catch {
     return false;
+  }
+}
+
+async function readProcStartTicks(procRoot: string, pid: number, adapters: RuntimeAdapters): Promise<number | null> {
+  try {
+    const stat = await adapters.fs.readFile(path.join(procRoot, String(pid), "stat"));
+    return parseProcStat(stat).starttime;
+  } catch {
+    return null;
   }
 }
 
