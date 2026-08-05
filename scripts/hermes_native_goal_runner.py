@@ -11,7 +11,7 @@ every lifecycle and failure path without real model/network calls.
 
 import argparse
 import ctypes
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import errno
 import hashlib
 import json
@@ -286,29 +286,66 @@ def get_process_start_ticks(pid: int) -> int | None:
 # ---------------------------------------------------------------------------
 
 def fsync_dir(dir_path: Path) -> None:
-    """Fsync a directory to ensure metadata durability."""
-    fd = os.open(str(dir_path), os.O_RDONLY | os.O_DIRECTORY)
+    """Fsync a real non-symlink directory after validating stable identity."""
+    path_text = os.fspath(dir_path)
+    st = os.lstat(path_text)
+    if stat_module.S_ISLNK(st.st_mode) or not stat_module.S_ISDIR(st.st_mode):
+        raise NotADirectoryError(errno.ENOTDIR, "not a real directory", path_text)
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path_text, flags)
     try:
+        opened = os.fstat(fd)
+        if not stat_module.S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+            raise OSError(errno.EIO, "directory identity mismatch", path_text)
         os.fsync(fd)
     finally:
         os.close(fd)
 
 
 def ensure_dir_durable(dir_path: Path) -> None:
-    """Create a directory tree and fsync every newly-created parent on Linux."""
+    """Create a directory tree and fsync parent/final dirs, tolerating peer creation."""
     missing: list[Path] = []
     current = dir_path
-    while not current.exists():
-        missing.append(current)
-        if current.parent == current:
-            break
-        current = current.parent
+    while True:
+        try:
+            st = os.lstat(os.fspath(current))
+        except FileNotFoundError:
+            missing.append(current)
+            if current.parent == current:
+                break
+            current = current.parent
+            continue
+        if stat_module.S_ISLNK(st.st_mode) or not stat_module.S_ISDIR(st.st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, "not a real directory", os.fspath(current))
+        break
+    if not missing:
+        fsync_dir(dir_path)
+        return
     for directory in reversed(missing):
-        directory.mkdir()
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            fsync_dir(directory.parent)
+            fsync_dir(directory)
+            continue
         fsync_dir(directory.parent)
         fsync_dir(directory)
-    if not missing:
-        dir_path.mkdir(parents=True, exist_ok=True)
+
+
+def _ensure_dir_durable_stress_worker(root: str, iterations: int) -> tuple[bool, str]:
+    """Process-pool worker for self-test directory creation stress."""
+    target = Path(root) / "durable-concurrent" / "same" / "nested" / "tree"
+    try:
+        for _ in range(iterations):
+            ensure_dir_durable(target)
+            st = os.lstat(target)
+            if stat_module.S_ISLNK(st.st_mode) or not stat_module.S_ISDIR(st.st_mode):
+                return False, "target is not a real directory"
+        return True, ""
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def atomic_write_json(target: Path, data: dict) -> None:
@@ -3915,6 +3952,47 @@ def self_test() -> tuple[bool, str]:
         for d in ("goals/staged", "goals/ready", "goals/running", "goals/done", "goals/failed", f"goals/{PENDING_SURFACE_STATE}"):
             (native_root / d).mkdir(parents=True)
 
+        durable_stress_root = Path(tmpdir) / "durable-stress"
+        durable_worker_count = 8
+        durable_iterations = 80
+        with ThreadPoolExecutor(max_workers=durable_worker_count) as executor:
+            durable_thread_results = list(executor.map(
+                lambda _: _ensure_dir_durable_stress_worker(str(durable_stress_root), durable_iterations),
+                range(durable_worker_count),
+            ))
+        with ProcessPoolExecutor(max_workers=4) as executor:
+            durable_process_results = list(executor.map(
+                _ensure_dir_durable_stress_worker,
+                [str(durable_stress_root)] * 4,
+                [durable_iterations] * 4,
+            ))
+        durable_target = durable_stress_root / "durable-concurrent" / "same" / "nested" / "tree"
+        durable_target_stat = os.lstat(durable_target)
+        check("ensure_dir_durable_thread_stress_no_exceptions", all(ok for ok, _ in durable_thread_results), "; ".join(detail for ok, detail in durable_thread_results if not ok))
+        check("ensure_dir_durable_process_stress_no_exceptions", all(ok for ok, _ in durable_process_results), "; ".join(detail for ok, detail in durable_process_results if not ok))
+        check("ensure_dir_durable_stress_target_real_directory", stat_module.S_ISDIR(durable_target_stat.st_mode) and not stat_module.S_ISLNK(durable_target_stat.st_mode))
+
+        durable_reject_root = Path(tmpdir) / "durable-reject"
+        durable_reject_root.mkdir()
+        durable_file_parent = durable_reject_root / "file-parent"
+        durable_file_parent.write_text("not a directory", encoding="utf-8")
+        try:
+            ensure_dir_durable(durable_file_parent / "child")
+            durable_file_rejected = False
+        except NotADirectoryError:
+            durable_file_rejected = True
+        durable_real_dir = durable_reject_root / "real"
+        durable_real_dir.mkdir()
+        durable_symlink_parent = durable_reject_root / "symlink-parent"
+        durable_symlink_parent.symlink_to(durable_real_dir, target_is_directory=True)
+        try:
+            ensure_dir_durable(durable_symlink_parent / "child")
+            durable_symlink_rejected = False
+        except NotADirectoryError:
+            durable_symlink_rejected = True
+        check("ensure_dir_durable_rejects_file_parent", durable_file_rejected)
+        check("ensure_dir_durable_rejects_symlink_parent", durable_symlink_rejected)
+
         # Create git repo for worktree
         worktree_dir = Path(tmpdir) / "worktree"
         worktree_dir.mkdir()
@@ -5451,26 +5529,37 @@ def self_test() -> tuple[bool, str]:
         race_normalized_cmds = [normalized_git_cmd(cmd) for cmd in race_cmds]
         check("fresh_checkout_post_clone_race_no_checkout_reset", ["git", "fetch", "origin", "main"] not in race_normalized_cmds and not any(cmd[:3] == ["git", "checkout", "-B"] or cmd[:2] == ["git", "reset"] or cmd[:2] == ["git", "clean"] for cmd in race_normalized_cmds))
 
-        concurrent_checkout_root = Path(tmpdir) / "checkout-concurrent-root"
-        concurrent_checkout_fakes = [FakeSubprocess(), FakeSubprocess()]
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            concurrent_checkout_results = list(executor.map(
-                lambda fake: prepare_isolated_checkout(
-                    "same-goal",
-                    "feat",
-                    worktree_dir,
-                    EXPECTED_CANONICAL_REPO_URL,
-                    concurrent_checkout_root,
-                    fake,
-                    configured_canonical_repo=worktree_dir,
-                ),
-                concurrent_checkout_fakes,
-            ))
-        concurrent_successes = [meta for ok, meta in concurrent_checkout_results if ok]
-        concurrent_final = checkout_path_for_goal(concurrent_checkout_root, "same-goal")
-        check("fresh_checkout_concurrent_creation_one_winner", len(concurrent_successes) == 1 and concurrent_final.is_dir())
-        check("fresh_checkout_concurrent_loser_preserves_winner", concurrent_final.exists() and concurrent_final.is_dir())
-        check("fresh_checkout_concurrent_no_forbidden_touch", not any(commands_touch_path(fake, PRIMARY_V2_WIP_CHECKOUT) for fake in concurrent_checkout_fakes))
+        concurrent_checkout_outcomes: list[tuple[bool, bool, bool, str]] = []
+        for run_index in range(12):
+            concurrent_checkout_root = Path(tmpdir) / f"checkout-concurrent-root-{run_index}"
+            concurrent_checkout_fakes = [FakeSubprocess(), FakeSubprocess()]
+            try:
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    concurrent_checkout_results = list(executor.map(
+                        lambda fake: prepare_isolated_checkout(
+                            "same-goal",
+                            "feat",
+                            worktree_dir,
+                            EXPECTED_CANONICAL_REPO_URL,
+                            concurrent_checkout_root,
+                            fake,
+                            configured_canonical_repo=worktree_dir,
+                        ),
+                        concurrent_checkout_fakes,
+                    ))
+                concurrent_successes = [meta for ok, meta in concurrent_checkout_results if ok]
+                concurrent_final = checkout_path_for_goal(concurrent_checkout_root, "same-goal")
+                one_winner = len(concurrent_successes) == 1 and concurrent_final.is_dir()
+                loser_preserved = concurrent_final.exists() and concurrent_final.is_dir() and not concurrent_final.is_symlink()
+                no_forbidden_touch = not any(commands_touch_path(fake, PRIMARY_V2_WIP_CHECKOUT) for fake in concurrent_checkout_fakes)
+                concurrent_checkout_outcomes.append((one_winner, loser_preserved, no_forbidden_touch, ""))
+            except Exception as exc:
+                concurrent_checkout_outcomes.append((False, False, False, f"run {run_index}: {type(exc).__name__}: {exc}"))
+        concurrent_checkout_details = "; ".join(detail for *_, detail in concurrent_checkout_outcomes if detail)
+        check("fresh_checkout_concurrent_creation_one_winner", all(one for one, _, _, _ in concurrent_checkout_outcomes), concurrent_checkout_details)
+        check("fresh_checkout_concurrent_loser_preserves_winner", all(preserved for _, preserved, _, _ in concurrent_checkout_outcomes), concurrent_checkout_details)
+        check("fresh_checkout_concurrent_no_forbidden_touch", all(clean for _, _, clean, _ in concurrent_checkout_outcomes), concurrent_checkout_details)
+        check("fresh_checkout_concurrent_stable_repeated_runs", len(concurrent_checkout_outcomes) == 12 and all(one and preserved and clean for one, preserved, clean, _ in concurrent_checkout_outcomes), concurrent_checkout_details)
 
         clone_retry_root = Path(tmpdir) / "checkout-clone-retry"
         clone_retry_fake = FakeSubprocess()
