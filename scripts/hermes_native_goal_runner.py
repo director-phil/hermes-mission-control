@@ -26,6 +26,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Protocol
+from urllib.parse import quote, urlencode
 
 HOME = os.path.expanduser("~")
 DEFAULT_NATIVE_ROOT = Path(HOME) / ".hermes" / "mission-control" / "runtime"
@@ -2834,8 +2835,36 @@ def valid_git_sha(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{7,40}", value) is not None
 
 
-def github_deployments_api_path(merge_sha: str) -> str:
-    return f"repos/director-phil/hermes-mission-control/deployments?sha={merge_sha}&environment=Production"
+def github_repo_slug_from_expected_origin(expected_origin: str) -> str:
+    match = re.fullmatch(r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\.git", expected_origin)
+    if not match:
+        raise ValueError("unexpected github origin url")
+    slug = f"{match.group(1)}/{match.group(2)}"
+    if expected_origin != EXPECTED_CANONICAL_REPO_URL or slug != "director-phil/rt-ops-v2":
+        raise ValueError("unexpected github repository")
+    return slug
+
+
+def github_deployments_api_path(merge_sha: str, expected_origin: str = EXPECTED_CANONICAL_REPO_URL) -> str:
+    slug = github_repo_slug_from_expected_origin(expected_origin)
+    owner, repo = slug.split("/", 1)
+    query = urlencode({"sha": merge_sha, "environment": "Production"})
+    return f"repos/{quote(owner, safe='')}/{quote(repo, safe='')}/deployments?{query}"
+
+
+def github_deployment_statuses_api_path(deployment_id: int, expected_origin: str = EXPECTED_CANONICAL_REPO_URL) -> str:
+    slug = github_repo_slug_from_expected_origin(expected_origin)
+    owner, repo = slug.split("/", 1)
+    return f"repos/{quote(owner, safe='')}/{quote(repo, safe='')}/deployments/{quote(str(deployment_id), safe='')}/statuses"
+
+
+def github_deployment_statuses_url_matches_exact_repo(value: Any, deployment_id: int, expected_origin: str = EXPECTED_CANONICAL_REPO_URL) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, str) or not value:
+        return False
+    expected_path = github_deployment_statuses_api_path(deployment_id, expected_origin)
+    return value == expected_path or value == f"https://api.github.com/{expected_path}"
 
 
 def github_timestamp(value: Any) -> datetime | None:
@@ -2915,10 +2944,16 @@ def verify_exact_production_deployment(
     worktree: Path,
     merge_sha: str,
     subprocess_adapter: SubprocessAdapter,
+    expected_origin: str = EXPECTED_CANONICAL_REPO_URL,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {"passed": False, "merge_sha": merge_sha}
+    try:
+        deployments_path = github_deployments_api_path(merge_sha, expected_origin)
+    except ValueError:
+        result["reason"] = "unexpected_github_repository"
+        return result
     deployments_cmd = subprocess_adapter.run_command(
-        ["gh", "api", github_deployments_api_path(merge_sha)],
+        ["gh", "api", deployments_path],
         str(worktree),
         120,
         None,
@@ -2948,10 +2983,19 @@ def verify_exact_production_deployment(
             continue
         if deployment.get("environment") != "Production":
             continue
-        statuses_url = deployment.get("statuses_url")
-        if not isinstance(statuses_url, str) or not statuses_url:
-            continue
-        statuses_cmd = subprocess_adapter.run_command(["gh", "api", statuses_url], str(worktree), 120, None, True)
+        deployment_id = deployment.get("id")
+        if not isinstance(deployment_id, int):
+            result["reason"] = "deployment_id_missing"
+            return result
+        try:
+            if not github_deployment_statuses_url_matches_exact_repo(deployment.get("statuses_url"), deployment_id, expected_origin):
+                result["reason"] = "deployment_status_url_mismatch"
+                return result
+            statuses_path = github_deployment_statuses_api_path(deployment_id, expected_origin)
+        except ValueError:
+            result["reason"] = "unexpected_github_repository"
+            return result
+        statuses_cmd = subprocess_adapter.run_command(["gh", "api", statuses_path], str(worktree), 120, None, True)
         result["statuses"] = {
             "exit_code": statuses_cmd.returncode,
             "stdout_bytes": statuses_cmd.stdout_bytes,
@@ -2993,7 +3037,7 @@ def verify_exact_production_deployment(
             return result
         result["passed"] = True
         result["environment_url_hash"] = hashlib.sha256(environment_url.encode()).hexdigest()
-        result["deployment_id"] = deployment.get("id") if isinstance(deployment.get("id"), int) else None
+        result["deployment_id"] = deployment_id
         return result
 
     result["reason"] = "successful_production_deployment_missing"
@@ -3247,7 +3291,7 @@ def run_shipping_gates(
         return stages
 
     if goal_data.get("vercel_impact"):
-        deploy = verify_exact_production_deployment(worktree, merge_sha, subprocess_adapter)
+        deploy = verify_exact_production_deployment(worktree, merge_sha, subprocess_adapter, expected_origin)
         stages["deployment"] = deploy
         if not deploy.get("passed"):
             stages["reason"] = deploy.get("reason", "deployment_verification_failed")
@@ -5764,9 +5808,24 @@ def self_test() -> tuple[bool, str]:
         fake_missing_deploy.set_response("deployments?sha=", CmdResult(0, "[]", "", 2, 0))
         missing_deploy_ship = run_shipping_gates(worktree_dir, "vercel-missing", "vercel-missing", vercel_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_missing_deploy), fake_missing_deploy)
         check("vercel_missing_deployment_blocks", missing_deploy_ship.get("passed") is False and missing_deploy_ship.get("reason") == "deployment_missing")
+        rejected_github_origins = []
+        for origin in ("git@github.com:director-phil/rt-ops-v2.git", "https://github.com/director-phil/hermes-mission-control.git", "https://github.com/evil/rt-ops-v2.git"):
+            try:
+                github_deployments_api_path("abcdefabcdefabcdefabcdefabcdefabcdefabcd", origin)
+                rejected_github_origins.append(False)
+            except ValueError:
+                rejected_github_origins.append(True)
+        check("vercel_deployment_slug_rejects_unexpected_origins", all(rejected_github_origins))
         fake_pending = FakeSubprocess()
         prime_allowed_shipping_scope(fake_pending)
         pending_ship = run_shipping_gates(worktree_dir, "vercel-pending", "vercel-pending", vercel_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_pending), fake_pending)
+        expected_deployments_path = github_deployments_api_path("abcdefabcdefabcdefabcdefabcdefabcdefabcd")
+        expected_statuses_path = github_deployment_statuses_api_path(1001)
+        deployment_api_paths = [call["cmd"][2] for call in fake_pending.calls if call["cmd"][:2] == ["gh", "api"] and len(call["cmd"]) > 2 and ("deployments" in call["cmd"][2] or "statuses" in call["cmd"][2])]
+        check("vercel_queries_exact_rt_ops_deployments_path", expected_deployments_path in deployment_api_paths and "repos/director-phil/rt-ops-v2/deployments?sha=abcdefabcdefabcdefabcdefabcdefabcdefabcd&environment=Production" in deployment_api_paths)
+        check("vercel_queries_exact_rt_ops_statuses_path", expected_statuses_path in deployment_api_paths and "repos/director-phil/rt-ops-v2/deployments/1001/statuses" in deployment_api_paths)
+        check("vercel_never_queries_mission_control_deployments", all("repos/director-phil/hermes-mission-control/deployments" not in path for path in deployment_api_paths))
+        check("vercel_deployment_queries_stay_in_rt_ops_repo", all(path.startswith("repos/director-phil/rt-ops-v2/deployments") for path in deployment_api_paths))
         check("vercel_inspects_exact_environment_url", any(call["cmd"] == ["vercel", "inspect", "https://rt-ops-v2.vercel.app", "--logs"] for call in fake_pending.calls) and not any(call["cmd"] == ["vercel", "inspect", "--logs"] for call in fake_pending.calls))
         (native_root / "goals" / "running" / "vercel-pending.md").write_text(_make_test_goal(str(worktree_dir), title="Vercel Pending"), encoding="utf-8")
         create_controller_lock(native_root / "controller.lock", "vercel-pending", os.getpid(), get_process_start_ticks(os.getpid()))
@@ -5774,6 +5833,18 @@ def self_test() -> tuple[bool, str]:
         check("vercel_pending_surface_state", pending_ship.get("terminal_state") == PENDING_SURFACE_STATE and (native_root / "goals" / PENDING_SURFACE_STATE / "vercel-pending.md").exists())
         pending_result = json.loads((native_root / "runs" / "vercel-pending" / "result.json").read_text(encoding="utf-8"))
         check("vercel_pending_not_success", pending_result.get("success") is False and pending_result.get("terminal_state") == PENDING_SURFACE_STATE)
+        fake_foreign_statuses_url = FakeSubprocess()
+        prime_allowed_shipping_scope(fake_foreign_statuses_url)
+        fake_foreign_statuses_url.set_response("deployments?sha=", CmdResult(0, json.dumps([{
+            "id": 3003,
+            "sha": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "environment": "Production",
+            "statuses_url": "https://api.github.com/repos/evil/evil/deployments/3003/statuses",
+        }]), "", 180, 0))
+        foreign_statuses_ship = run_shipping_gates(worktree_dir, "vercel-foreign-statuses", "vercel-foreign-statuses", vercel_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_foreign_statuses_url), fake_foreign_statuses_url)
+        foreign_statuses_paths = [call["cmd"][2] for call in fake_foreign_statuses_url.calls if call["cmd"][:2] == ["gh", "api"] and len(call["cmd"]) > 2]
+        check("vercel_foreign_statuses_url_rejected", foreign_statuses_ship.get("passed") is False and foreign_statuses_ship.get("reason") == "deployment_status_url_mismatch")
+        check("vercel_foreign_statuses_url_not_queried", all("evil/evil" not in path for path in foreign_statuses_paths) and "repos/director-phil/rt-ops-v2/deployments/3003/statuses" not in foreign_statuses_paths)
         fake_success_then_failure = FakeSubprocess()
         prime_allowed_shipping_scope(fake_success_then_failure)
         fake_success_then_failure.set_response("/statuses", CmdResult(0, json.dumps([
