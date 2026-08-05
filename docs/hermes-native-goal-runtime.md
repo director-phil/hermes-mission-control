@@ -72,7 +72,7 @@ python3 scripts/example.py --self-test
 ```
 
 The acceptance body is preserved byte-for-byte and executed with
-`/usr/bin/bash -e -u -o pipefail -s` in a minimal environment, with the
+`/usr/bin/bash -e -u -o pipefail -s` in a fixed minimal environment, with the
 acceptance body supplied on stdin rather than argv or environment.
 
 ### Allowed Files (required)
@@ -124,13 +124,14 @@ heading followed by `- path` or ``- `path` `` bullets. Other prose is ignored.
 2. **Lock**: Create controller lock with `O_EXCL`.
 3. **Claim**: Atomically move goal from `ready/` to `running/` via `os.replace()`.
 4. **Plan**: Run `hermes --profile "${HERMES_NATIVE_PLAN_PROFILE:-architect}" chat --query-file - --source mission-control-goal-plan` with the prompt supplied on stdin.
+   Goal markdown is treated as untrusted data. The model prompt separates controller authority/stage instructions from a bounded serialized goal-data envelope. The envelope preserves title, worktree, allowed files, model-visible requirements, and the acceptance SHA-256, but excludes the raw Acceptance section and shell body.
    Before invocation, the controller captures a full worktree fingerprint covering staged, unstaged, untracked, and ignored state plus a Git control-plane fingerprint. Immediately after the planner returns, both fingerprints must match and origin/control-plane validation must still pass before `PLAN_APPROVED` can be accepted. Any planner mutation fails closed as `planner_mutated_worktree` or `planner_mutated_control_plane`, and no implementation, review, or shipping stage is invoked.
    Requires bounded stdout, stripped of surrounding whitespace, to equal exactly `PLAN_APPROVED`.
 5. **Code**: Run `hermes --profile "${HERMES_NATIVE_CODE_PROFILE:-default}" chat --query-file - --source mission-control-goal-code` with the prompt supplied on stdin.
    The prompt states Codex-only production implementation authority, names the exact controller markers, and reserves those markers for plan/final review.
    Requires exit 0 and substantive git diff within allowed files.
 6. **Scope Check**: Verify all staged, unstaged, and untracked changed files are in the allowed list. Reject binary/NUL diffs, including direct NUL inspection of every untracked allowed path because untracked files are absent from `git diff --numstat`.
-7. **Acceptance**: Execute the bash acceptance block with minimal env, passing the byte-preserved body on stdin.
+7. **Acceptance**: Execute the bash acceptance block with minimal env, passing the byte-preserved body on stdin. The raw acceptance shell is controller-only: it is hashed for model-visible evidence and execution records, but is never sent to planner, code, or review prompts.
 8. **Post-acceptance Scope Check**: Re-run the full scope check immediately after acceptance and before review. Any staged, unstaged, untracked, or binary/NUL violation fails closed.
 9. **Review**: Run `hermes --profile "${HERMES_NATIVE_REVIEW_PROFILE:-default}" chat --query-file - --source mission-control-goal-review` with the prompt supplied on stdin.
    The prompt states Codex-only final code review authority and the exact required marker.
@@ -326,6 +327,33 @@ the exact origin and clean status, fetches `origin main`, then checks out and
 resets the mirror to `origin/main`. A dirty or wrong-origin mirror fails closed;
 the installer does not clean, reset, or delete local work. It never touches the
 primary WIP checkout under `~/Documents/GitHub/reliable-tradies-ops-v2`.
+
+All installer Git operations run through a controller-private Git environment
+under `~/.hermes/mission-control/runtime/controller-git`. The installer rejects
+symlinks, wrong owners, wrong modes, non-empty private config files, and non-empty
+hooks directories; uses empty system/global config files and an empty hooks path;
+disables prompts and askpass; invokes only verified absolute `git`/`gh`
+executables from the controller allow-list; uses a fixed child `PATH`; strips
+ambient Git/SSH/proxy/credential environment; rejects local `http.*` and
+`https.*` transport config; and revalidates the exact HTTPS origin and local Git
+control-plane settings around mirror refresh operations. Any invalid
+pre-existing private path or Git config state fails closed.
+
+The native runner applies the same fixed external-command environment to
+production `git`, `hermes`, `gh`, and `vercel` invocations. Managed command names
+are resolved to verified absolute executables before execution; missing,
+symlinked, wrong-owner, or otherwise untrusted binaries fail closed.
+
+For the host Hermes editable install, user-owned group-writable files and
+directories are trusted only under the explicit private-primary-group contract:
+owner UID must be the current UID, group GID must be the current primary GID,
+no other passwd account may use that primary GID, the primary group must have no
+supplementary members, and other-write must be absent. The runner validates the
+wrapper, resolved symlink parents and targets, venv entrypoint, interpreter,
+editable `site-packages` marker/finder metadata, and `hermes_cli` source
+package chain. The installer runs the same runner preflight before mirror
+refresh or unit copy, so an installer pass implies stage command resolution can
+find a trusted Hermes executable.
 
 The checked-in systemd unit invokes the runner with:
 
