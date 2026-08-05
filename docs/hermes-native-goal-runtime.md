@@ -6,13 +6,13 @@ orchestrated by a single-process controller with atomic state transitions.
 
 Default stage profiles are safe and configurable:
 
-- Plan: `architect`, a local read-only planner.
-- Code implementation: `default`, a cloud Codex-backed orchestrator.
-- Final review: `default`, a cloud Codex-backed orchestrator.
+- Plan: `default`, a Codex-backed profile.
+- Code implementation: `default`, a Codex-backed profile.
+- Final review: `default`, a Codex-backed profile.
 
 The `HERMES_NATIVE_PLAN_PROFILE`, `HERMES_NATIVE_CODE_PROFILE`, and
 `HERMES_NATIVE_REVIEW_PROFILE` environment variables can pin compatible
-profiles. Code and final review resolve the configured Hermes profile provider
+profiles. Plan, code, and final review resolve the configured Hermes profile provider
 with `hermes --profile <profile> config get model.provider` before work starts
 and fail closed unless the provider is exactly `openai-codex`.
 
@@ -123,7 +123,7 @@ heading followed by `- path` or ``- `path` `` bullets. Other prose is ignored.
 1. **Ready block checks**: Parse the next `ready/` goal. If `hard_stop: true`, leave it in `ready/`, emit non-terminal `promotion.blocked` and `goal.blocked` evidence, and continue without dependency release, controller lock creation, or model calls.
 2. **Lock**: Create controller lock with `O_EXCL`.
 3. **Claim**: Atomically move goal from `ready/` to `running/` via `os.replace()`.
-4. **Plan**: Run `hermes --profile "${HERMES_NATIVE_PLAN_PROFILE:-architect}" chat --query-file - --source mission-control-goal-plan` with the prompt supplied on stdin.
+4. **Plan**: Run `hermes --profile "${HERMES_NATIVE_PLAN_PROFILE:-default}" chat --query-file - --source mission-control-goal-plan` with the prompt supplied on stdin.
    Goal markdown is treated as untrusted data. The model prompt separates controller authority/stage instructions from a bounded serialized goal-data envelope. The envelope preserves title, worktree, allowed files, model-visible requirements, and the acceptance SHA-256, but excludes the raw Acceptance section and shell body.
    Before invocation, the controller captures a full worktree fingerprint covering staged, unstaged, untracked, and ignored state plus a Git control-plane fingerprint. Immediately after the planner returns, both fingerprints must match and origin/control-plane validation must still pass before `PLAN_APPROVED` can be accepted. Any planner mutation fails closed as `planner_mutated_worktree` or `planner_mutated_control_plane`, and no implementation, review, or shipping stage is invoked.
    Requires bounded stdout, stripped of surrounding whitespace, to equal exactly `PLAN_APPROVED`.
