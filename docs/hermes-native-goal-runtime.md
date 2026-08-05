@@ -6,9 +6,9 @@ orchestrated by a single-process controller with atomic state transitions.
 
 Default stage profiles are safe and configurable:
 
-- Plan: `default`, a cloud Codex-backed read-only planner.
-- Code implementation: `default`, a cloud Codex-backed orchestrator.
-- Final review: `default`, a cloud Codex-backed orchestrator.
+- Plan: `default`, a Codex-backed read-only planner profile.
+- Code implementation: `default`, a Codex-backed implementation profile.
+- Final review: `default`, a Codex-backed read-only reviewer profile.
 
 The `HERMES_NATIVE_PLAN_PROFILE`, `HERMES_NATIVE_CODE_PROFILE`, and
 `HERMES_NATIVE_REVIEW_PROFILE` environment variables can pin compatible
