@@ -3,7 +3,7 @@
 Hermes Native Goal Runtime - Controller for native goal execution.
 
 Implements atomic claim, PID/start-tick lock, deterministic acceptance,
-and Hermes reviewer/coder subprocess orchestration per the approved canary contract.
+and Hermes stage subprocess orchestration per the approved canary contract.
 
 All subprocess interaction uses injectable adapters so --self-test can prove
 every lifecycle and failure path without real model/network calls.
@@ -34,6 +34,24 @@ MAX_MARKER_STDOUT_BYTES = 4_096
 # Contract markers - exact strings required by controller
 PLAN_APPROVED_MARKER = "PLAN_APPROVED"
 REVIEW_PASS_MARKER = "REVIEW_PASS"
+
+DEFAULT_STAGE_PROFILES = {
+    "plan": "architect",
+    "code": "default",
+    "review": "default",
+    "acceptance": "controller",
+}
+STAGE_PROFILE_ENV = {
+    "plan": "HERMES_NATIVE_PLAN_PROFILE",
+    "code": "HERMES_NATIVE_CODE_PROFILE",
+    "review": "HERMES_NATIVE_REVIEW_PROFILE",
+}
+STAGE_SOURCES = {
+    "plan": "mission-control-goal-plan",
+    "code": "mission-control-goal-code",
+    "review": "mission-control-goal-review",
+}
+LOCAL_IMPLEMENTATION_FORBIDDEN_PROFILES = {"coder", "reviewer"}
 
 
 class TerminalMoveError(RuntimeError):
@@ -626,15 +644,32 @@ def build_prompt(
         f"Acceptance command:\n{acceptance_body}\n"
     )
     if prompt_kind == "plan":
-        prompt = base + "\nRespond with exactly PLAN_APPROVED if you approve the plan."
+        prompt = (
+            base
+            + "\nAuthority: local read-only planner. Inspect, plan, and triage only. "
+            + "Do not edit files, run mutating commands, install, start services, or push.\n"
+            + f"Respond with exactly {PLAN_APPROVED_MARKER} if you approve the plan."
+        )
     elif prompt_kind == "code":
-        prompt = base + "\nImplement the goal."
+        prompt = (
+            base
+            + "\nAuthority: Codex-only production implementation. This stage may modify "
+            + "production code only within Allowed files. Local model profiles may inspect, "
+            + "plan, and triage only; they must not implement production code.\n"
+            + "Do not install packages, start services, or push.\n"
+            + f"Controller markers are exact strings: {PLAN_APPROVED_MARKER} is plan-only; "
+            + f"{REVIEW_PASS_MARKER} is final-review-only. Do not emit controller markers "
+            + "from the implementation stage.\n"
+            + "Implement the goal."
+        )
     elif prompt_kind == "review":
         prompt = (
             base
             + f"\nChanged files: {changed_count}\n"
             + f"Acceptance exit: {acceptance_exit if acceptance_exit is not None else 'unknown'}\n"
-            + "Respond with exactly REVIEW_PASS if the review passes."
+            + "Authority: Codex-only final code review. Local model profiles may inspect, "
+            + "plan, and triage only; they must not perform final review.\n"
+            + f"Respond with exactly {REVIEW_PASS_MARKER} if the final review passes."
         )
     else:
         raise ValueError(f"unknown prompt kind: {prompt_kind}")
@@ -833,6 +868,31 @@ def _stage_env(goal_id: str, run_id: str, stage: str, profile: str) -> dict[str,
     return env
 
 
+def stage_profile(stage: str) -> str:
+    default = DEFAULT_STAGE_PROFILES[stage]
+    env_key = STAGE_PROFILE_ENV.get(stage)
+    configured = os.environ.get(env_key, "") if env_key else ""
+    profile = bounded_identifier(configured, default, max_len=64)
+    if stage in ("code", "review") and profile in LOCAL_IMPLEMENTATION_FORBIDDEN_PROFILES:
+        raise ValueError(f"{stage} stage profile {profile!r} is forbidden for Codex-only authority")
+    return profile
+
+
+def stage_config_error(stage: str, reason: str, marker_found: bool = False) -> dict:
+    result = {
+        "exit_code": -1,
+        "duration_sec": 0,
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+        "marker_found": marker_found,
+        "profile": "",
+        "source": STAGE_SOURCES.get(stage, ""),
+        "passed": False,
+        "config_error": reason,
+    }
+    return result
+
+
 def run_hermes_planner(
     worktree: Path,
     goal_id: str,
@@ -841,18 +901,20 @@ def run_hermes_planner(
     subprocess_adapter: SubprocessAdapter,
 ) -> dict:
     """
-    Run planner via `hermes --profile reviewer chat --query-file - --source mission-control-goal-plan`.
+    Run planner via the configured plan profile and mission-control-goal-plan source.
     Returns metadata-only dict with exit, duration, marker_found, output byte counts.
     """
+    profile = stage_profile("plan")
+    source = STAGE_SOURCES["plan"]
     cmd = [
-        "hermes", "--profile", "reviewer",
+        "hermes", "--profile", profile,
         "chat", "--query-file", "-",
-        "--source", "mission-control-goal-plan",
+        "--source", source,
     ]
     t0 = time.monotonic()
     result = subprocess_adapter.run_command(
         cmd=cmd, cwd=str(worktree), timeout=300,
-        env=_stage_env(goal_id, run_id, "plan", "reviewer"), capture=True,
+        env=_stage_env(goal_id, run_id, "plan", profile), capture=True,
         stdin_data=goal_prompt,
     )
     duration = time.monotonic() - t0
@@ -863,11 +925,13 @@ def run_hermes_planner(
         "stdout_bytes": result.stdout_bytes,
         "stderr_bytes": result.stderr_bytes,
         "marker_found": marker_found,
+        "profile": profile,
+        "source": source,
         "passed": result.returncode == 0 and marker_found and result.stdout_bytes > 0,
     }
 
 
-def run_hermes_coder(
+def run_hermes_implementation(
     worktree: Path,
     goal_id: str,
     run_id: str,
@@ -875,18 +939,23 @@ def run_hermes_coder(
     subprocess_adapter: SubprocessAdapter,
 ) -> dict:
     """
-    Run coder via `hermes --profile coder chat --query-file - --source mission-control-goal-code`.
-    Coder requires exit 0 only — no marker.
+    Run implementation via the configured code profile and mission-control-goal-code source.
+    Implementation requires exit 0 only — no marker.
     """
+    try:
+        profile = stage_profile("code")
+    except ValueError as exc:
+        return stage_config_error("code", str(exc), marker_found=True)
+    source = STAGE_SOURCES["code"]
     cmd = [
-        "hermes", "--profile", "coder",
+        "hermes", "--profile", profile,
         "chat", "--query-file", "-",
-        "--source", "mission-control-goal-code",
+        "--source", source,
     ]
     t0 = time.monotonic()
     result = subprocess_adapter.run_command(
         cmd=cmd, cwd=str(worktree), timeout=600,
-        env=_stage_env(goal_id, run_id, "code", "coder"), capture=True,
+        env=_stage_env(goal_id, run_id, "code", profile), capture=True,
         stdin_data=goal_prompt,
     )
     duration = time.monotonic() - t0
@@ -895,7 +964,9 @@ def run_hermes_coder(
         "duration_sec": round(duration, 2),
         "stdout_bytes": result.stdout_bytes,
         "stderr_bytes": result.stderr_bytes,
-        "marker_found": True,  # Coder has no marker requirement
+        "marker_found": True,  # Implementation has no marker requirement
+        "profile": profile,
+        "source": source,
         "passed": result.returncode == 0,
     }
 
@@ -908,18 +979,23 @@ def run_hermes_reviewer(
     subprocess_adapter: SubprocessAdapter,
 ) -> dict:
     """
-    Run reviewer via `hermes --profile reviewer chat --query-file - --source mission-control-goal-review`.
-    Reviewer requires REVIEW_PASS in stdout.
+    Run final review via the configured review profile and mission-control-goal-review source.
+    Final review requires REVIEW_PASS in stdout.
     """
+    try:
+        profile = stage_profile("review")
+    except ValueError as exc:
+        return stage_config_error("review", str(exc))
+    source = STAGE_SOURCES["review"]
     cmd = [
-        "hermes", "--profile", "reviewer",
+        "hermes", "--profile", profile,
         "chat", "--query-file", "-",
-        "--source", "mission-control-goal-review",
+        "--source", source,
     ]
     t0 = time.monotonic()
     result = subprocess_adapter.run_command(
         cmd=cmd, cwd=str(worktree), timeout=300,
-        env=_stage_env(goal_id, run_id, "review", "reviewer"), capture=True,
+        env=_stage_env(goal_id, run_id, "review", profile), capture=True,
         stdin_data=review_prompt,
     )
     duration = time.monotonic() - t0
@@ -930,6 +1006,8 @@ def run_hermes_reviewer(
         "stdout_bytes": result.stdout_bytes,
         "stderr_bytes": result.stderr_bytes,
         "marker_found": marker_found,
+        "profile": profile,
+        "source": source,
         "passed": result.returncode == 0 and marker_found and result.stdout_bytes > 0,
     }
 
@@ -1272,7 +1350,8 @@ def run_goal(
         return False, stages
 
     # Step 1: Planner
-    log_event(events_path, "model.requested", "Running planner (reviewer)", {})
+    plan_profile = stage_profile("plan")
+    log_event(events_path, "model.requested", "Running read-only planner", {"profile": plan_profile, "source": STAGE_SOURCES["plan"]})
     planner_result = run_hermes_planner(worktree, goal_id, run_id, plan_prompt, subprocess_adapter)
     stages["planner"] = {
         "exit_code": planner_result["exit_code"],
@@ -1280,24 +1359,28 @@ def run_goal(
         "stdout_bytes": planner_result["stdout_bytes"],
         "stderr_bytes": planner_result["stderr_bytes"],
         "marker_found": planner_result["marker_found"],
+        "profile": planner_result["profile"],
+        "source": planner_result["source"],
     }
     if not planner_result["passed"]:
         log_event(events_path, "planner.failed", "Planner did not approve", {})
         return False, stages
 
-    log_event(events_path, "agent.started", "Planner approved", {"profile": "reviewer"})
+    log_event(events_path, "agent.started", "Planner approved", {"profile": planner_result["profile"]})
 
-    # Step 2: Coder
-    log_event(events_path, "tool.started", "Running coder implementation", {})
-    coder_result = run_hermes_coder(worktree, goal_id, run_id, code_prompt, subprocess_adapter)
-    stages["coder"] = {
-        "exit_code": coder_result["exit_code"],
-        "duration_sec": coder_result["duration_sec"],
-        "stdout_bytes": coder_result["stdout_bytes"],
-        "stderr_bytes": coder_result["stderr_bytes"],
+    # Step 2: Codex implementation
+    log_event(events_path, "tool.started", "Running Codex implementation", {"source": STAGE_SOURCES["code"]})
+    implementation_result = run_hermes_implementation(worktree, goal_id, run_id, code_prompt, subprocess_adapter)
+    stages["implementation"] = {
+        "exit_code": implementation_result["exit_code"],
+        "duration_sec": implementation_result["duration_sec"],
+        "stdout_bytes": implementation_result["stdout_bytes"],
+        "stderr_bytes": implementation_result["stderr_bytes"],
+        "profile": implementation_result["profile"],
+        "source": implementation_result["source"],
     }
-    if not coder_result["passed"]:
-        log_event(events_path, "coder.failed", "Coder failed", {})
+    if not implementation_result["passed"]:
+        log_event(events_path, "implementation.failed", "Codex implementation failed", {})
         return False, stages
 
     # Step 3: Verify diff scope
@@ -1310,7 +1393,7 @@ def run_goal(
         log_event(events_path, "scope.failed", f"Scope check failed: {scope_result.get('reason', 'unknown')}", {})
         return False, stages
 
-    log_event(events_path, "tool.completed", "Coder produced valid diff", {"changed_count": scope_result["changed_count"]})
+    log_event(events_path, "tool.completed", "Implementation produced valid diff", {"changed_count": scope_result["changed_count"]})
 
     # Step 4: Acceptance
     acceptance_body = goal_data.get("acceptance_body", "")
@@ -1343,7 +1426,7 @@ def run_goal(
         stages["contract"] = {"passed": False, "reason": str(exc)}
         log_event(events_path, "contract.failed", "Goal contract exceeded prompt bounds", {})
         return False, stages
-    log_event(events_path, "review.started", "Running final reviewer", {})
+    log_event(events_path, "review.started", "Running Codex final review", {"source": STAGE_SOURCES["review"]})
     reviewer_result = run_hermes_reviewer(worktree, goal_id, run_id, review_prompt, subprocess_adapter)
     stages["reviewer"] = {
         "exit_code": reviewer_result["exit_code"],
@@ -1351,12 +1434,14 @@ def run_goal(
         "stdout_bytes": reviewer_result["stdout_bytes"],
         "stderr_bytes": reviewer_result["stderr_bytes"],
         "marker_found": reviewer_result["marker_found"],
+        "profile": reviewer_result["profile"],
+        "source": reviewer_result["source"],
     }
     if not reviewer_result["passed"]:
         log_event(events_path, "review.failed", "Final review did not pass", {})
         return False, stages
 
-    log_event(events_path, "review.passed", "Final review passed", {"profile": "reviewer"})
+    log_event(events_path, "review.passed", "Final review passed", {"profile": reviewer_result["profile"]})
     return True, stages
 
 
@@ -1441,7 +1526,14 @@ def self_test() -> tuple[bool, str]:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         old_allowed_roots = os.environ.get("HERMES_NATIVE_ALLOWED_WORKTREE_ROOTS")
+        old_stage_profiles = {
+            key: os.environ.get(key)
+            for key in STAGE_PROFILE_ENV.values()
+        }
         os.environ["HERMES_NATIVE_ALLOWED_WORKTREE_ROOTS"] = tmpdir
+        os.environ["HERMES_NATIVE_PLAN_PROFILE"] = DEFAULT_STAGE_PROFILES["plan"]
+        os.environ["HERMES_NATIVE_CODE_PROFILE"] = DEFAULT_STAGE_PROFILES["code"]
+        os.environ["HERMES_NATIVE_REVIEW_PROFILE"] = DEFAULT_STAGE_PROFILES["review"]
         native_root = Path(tmpdir) / "runtime"
         for d in ("goals/ready", "goals/running", "goals/done", "goals/failed"):
             (native_root / d).mkdir(parents=True)
@@ -2139,6 +2231,16 @@ def self_test() -> tuple[bool, str]:
         check("acceptance_marker_absent_from_all_argv", sensitive_acceptance_marker not in all_argv_blob)
         check("acceptance_marker_absent_from_env", sensitive_acceptance_marker not in env_blob)
         check("query_file_argv_contract", all("--query-file" in call["cmd"] and "-" in call["cmd"] and "-q" not in call["cmd"] for call in hermes_calls))
+        expected_stage_argv = {
+            "plan": ["hermes", "--profile", "architect", "chat", "--query-file", "-", "--source", "mission-control-goal-plan"],
+            "code": ["hermes", "--profile", "default", "chat", "--query-file", "-", "--source", "mission-control-goal-code"],
+            "review": ["hermes", "--profile", "default", "chat", "--query-file", "-", "--source", "mission-control-goal-review"],
+        }
+        observed_stage_argv = {
+            (call["env"] or {}).get("HERMES_MISSION_STAGE"): call["cmd"]
+            for call in hermes_calls
+        }
+        check("stage_argv_profile_source_contract", observed_stage_argv == expected_stage_argv)
         stage_profiles = {
             (
                 (call["env"] or {}).get("HERMES_MISSION_STAGE"),
@@ -2149,16 +2251,47 @@ def self_test() -> tuple[bool, str]:
             for call in stage_env_calls
         }
         check("correlation_env_stage_profile", stage_profiles == {
-            ("plan", "reviewer", "contract-goal", "contract-goal"),
-            ("code", "coder", "contract-goal", "contract-goal"),
+            ("plan", "architect", "contract-goal", "contract-goal"),
+            ("code", "default", "contract-goal", "contract-goal"),
             ("acceptance", "controller", "contract-goal", "contract-goal"),
-            ("review", "reviewer", "contract-goal", "contract-goal"),
+            ("review", "default", "contract-goal", "contract-goal"),
         })
+        stage_sources = {
+            stage: source
+            for stage, source in (
+                (call["env"] and call["env"].get("HERMES_MISSION_STAGE"), call["cmd"][call["cmd"].index("--source") + 1])
+                for call in hermes_calls
+                if "--source" in call["cmd"]
+            )
+        }
+        check("stage_source_contract", stage_sources == STAGE_SOURCES)
         contract_events = (native_root / "runs" / "contract-goal" / "events.jsonl").read_text(encoding="utf-8")
         contract_result_path = native_root / "runs" / "contract-goal" / "result.json"
         contract_result_text = contract_result_path.read_text(encoding="utf-8") if contract_result_path.exists() else ""
         check("prompt_absent_from_events_results", sensitive_marker not in contract_events and sensitive_marker not in contract_result_text)
         check("acceptance_marker_absent_from_events_results", sensitive_acceptance_marker not in contract_events and sensitive_acceptance_marker not in contract_result_text)
+        check("prompt_codex_authority_packets", "Codex-only production implementation" in stdin_values[1] and "Codex-only final code review" in stdin_values[2])
+        check("prompt_exact_markers_packets", PLAN_APPROVED_MARKER in stdin_values[1] and REVIEW_PASS_MARKER in stdin_values[1] and REVIEW_PASS_MARKER in stdin_values[2])
+
+        forbidden_profile_fake = FakeSubprocess()
+        previous_code_profile = os.environ.get("HERMES_NATIVE_CODE_PROFILE")
+        previous_review_profile = os.environ.get("HERMES_NATIVE_REVIEW_PROFILE")
+        try:
+            os.environ["HERMES_NATIVE_CODE_PROFILE"] = "coder"
+            forbidden_code = run_hermes_implementation(worktree_dir, "forbidden-code", "forbidden-code", "prompt", forbidden_profile_fake)
+            os.environ["HERMES_NATIVE_CODE_PROFILE"] = "default"
+            os.environ["HERMES_NATIVE_REVIEW_PROFILE"] = "reviewer"
+            forbidden_review = run_hermes_reviewer(worktree_dir, "forbidden-review", "forbidden-review", "prompt", forbidden_profile_fake)
+        finally:
+            if previous_code_profile is None:
+                os.environ.pop("HERMES_NATIVE_CODE_PROFILE", None)
+            else:
+                os.environ["HERMES_NATIVE_CODE_PROFILE"] = previous_code_profile
+            if previous_review_profile is None:
+                os.environ.pop("HERMES_NATIVE_REVIEW_PROFILE", None)
+            else:
+                os.environ["HERMES_NATIVE_REVIEW_PROFILE"] = previous_review_profile
+        check("forbidden_local_code_review_profiles_fail_closed", not forbidden_code["passed"] and not forbidden_review["passed"] and forbidden_profile_fake.calls == [])
 
         # ---- Test 20: Acceptance body preserves CRLF bytes and no file-final newline ----
         print("\n  --- Test 20: Acceptance body byte preservation ---")
@@ -2246,6 +2379,11 @@ def self_test() -> tuple[bool, str]:
             os.environ.pop("HERMES_NATIVE_ALLOWED_WORKTREE_ROOTS", None)
         else:
             os.environ["HERMES_NATIVE_ALLOWED_WORKTREE_ROOTS"] = old_allowed_roots
+        for key, value in old_stage_profiles.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     # Summary
     failed = [r for r in results if not r[1]]

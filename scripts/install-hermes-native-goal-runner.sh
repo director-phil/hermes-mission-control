@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Install hermes-native-goal-runner systemd user service.
-# Does NOT stop/disable ChatDev services.
+# Does NOT stop/disable old execution services.
 # Does NOT automatically start the new runner before canary acceptance.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

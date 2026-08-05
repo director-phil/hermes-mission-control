@@ -17,7 +17,7 @@ import { isAllowedWorktree, isForbiddenWorktree } from "./runtime-truth";
  */
 
 export interface NativeGoalRecord extends GoalRecord {
-  source_type: "native" | "chatdev";
+  source_type: "native" | "legacy";
 }
 
 export async function readNativeGoalState(

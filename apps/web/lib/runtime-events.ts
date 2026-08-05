@@ -13,6 +13,7 @@ export type RuntimeEventType =
   | "tool.started"
   | "tool.completed"
   | "planner.failed"
+  | "implementation.failed"
   | "coder.failed"
   | "scope.failed"
   | "worktree.failed"
@@ -85,6 +86,7 @@ const EVENT_MAP: Record<string, RuntimeEventType> = {
   "tool.started": "tool.started",
   "tool.completed": "tool.completed",
   "planner.failed": "planner.failed",
+  "implementation.failed": "implementation.failed",
   "coder.failed": "coder.failed",
   "scope.failed": "scope.failed",
   "worktree.failed": "worktree.failed",
@@ -129,7 +131,7 @@ export async function buildRuntimeTimeline(
 
   for (const goal of runtime.goals) {
     const nativeOwned = goal.sources.some((source) => source.note === "native-runner");
-    // Read legacy ChatDev run events
+    // Read legacy run events
     events.push(...await readGoalRunEvents(roots, adapters.fs, goal, warnings));
     // Read native JSONL events if nativeRuntimeRoot is configured
     if (roots.nativeRuntimeRoot && nativeOwned) {

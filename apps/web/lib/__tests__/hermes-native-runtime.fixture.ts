@@ -72,7 +72,7 @@ Mismatched goal.
 
   const roots: RuntimeRoots = {
     procRoot: "/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/runtime",
     allowedWorktreeRoots: ["/fixture/repo"],
@@ -134,7 +134,7 @@ test("reads native events from JSONL files", async () => {
 
   const roots: RuntimeRoots = {
     procRoot: "/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/runtime",
   };
@@ -166,7 +166,7 @@ test("standalone native events redact prompts responses secrets and paths", asyn
 
   const roots: RuntimeRoots = {
     procRoot: "/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/runtime",
   };
@@ -185,7 +185,7 @@ test("standalone native events redact prompts responses secrets and paths", asyn
 test("handles missing native runtime root gracefully", async () => {
   const roots: RuntimeRoots = {
     procRoot: "/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/nonexistent/runtime",
   };
@@ -206,11 +206,11 @@ test("handles missing native runtime root gracefully", async () => {
 
 // --- buildRuntimeSnapshot native integration tests ---
 
-test("native goals take precedence over legacy ChatDev goals with same ID", async () => {
+test("native goals take precedence over legacy runtime goals with same ID", async () => {
   const files: Record<string, string> = {
-    // Legacy ChatDev goal
-    "/fixture/ChatDev/goals/state/shared-goal.json": JSON.stringify({ id: "shared-goal", title: "Legacy Title", status: "running", controller_pid: 100 }),
-    "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    // Legacy runtime goal
+    "/fixture/LegacyRuntime/goals/state/shared-goal.json": JSON.stringify({ id: "shared-goal", title: "Legacy Title", status: "running", controller_pid: 100 }),
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     // Native goal with same ID
     "/native-rt/goals/done/shared-goal.md": `---
 title: Native Title
@@ -231,7 +231,7 @@ exit 0
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
     allowedWorktreeRoots: ["/fixture/repo"],
@@ -249,13 +249,13 @@ exit 0
 
 test("legacy goals are explicitly labelled when no native override exists", async () => {
   const files: Record<string, string> = {
-    "/fixture/ChatDev/goals/state/legacy-only.json": JSON.stringify({ id: "legacy-only", title: "Legacy", status: "ready" }),
-    "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    "/fixture/LegacyRuntime/goals/state/legacy-only.json": JSON.stringify({ id: "legacy-only", title: "Legacy", status: "ready" }),
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
   };
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
   };
@@ -263,12 +263,12 @@ test("legacy goals are explicitly labelled when no native override exists", asyn
   const snapshot = await buildRuntimeSnapshot(roots, fullAdapters(files));
   const goal = snapshot.goals.find((g) => g.goal_id === "legacy-only");
   assert.ok(goal);
-  assert.equal(goal?.sources.some((s) => s.note === "legacy-chatdev"), true);
+  assert.equal(goal?.sources.some((s) => s.note === "legacy-runtime"), true);
 });
 
 test("native events appear in buildRuntimeTimeline", async () => {
   const files: Record<string, string> = {
-    "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     "/native-rt/goals/done/native-goal.md": `---
 title: Native Event Goal
 repo/workdir: /fixture/repo
@@ -293,7 +293,7 @@ exit 0
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
     allowedWorktreeRoots: ["/fixture/repo"],
@@ -313,7 +313,7 @@ exit 0
 
 test("native runtime root is not treated as valid code worktree", async () => {
   const files: Record<string, string> = {
-    "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     "/native-rt/goals/ready/root-worktree-goal.md": `---
 title: Bad Worktree Goal
 repo/workdir: /native-rt
@@ -332,7 +332,7 @@ exit 0
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
     allowedWorktreeRoots: ["/fixture/repo"],
@@ -360,7 +360,7 @@ Goal pointing to forbidden repo.
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
     allowedWorktreeRoots: ["/home/phillip_downs/.hermes/mission-control-worktrees"],
@@ -391,7 +391,7 @@ Goal pointing through an allowed symlink to a forbidden repo.
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
     allowedWorktreeRoots: ["/home/phillip_downs/.hermes/mission-control-worktrees"],
@@ -431,7 +431,7 @@ Goal pointing through an allowed symlink to a forbidden repo.
 test("native rejected worktree marker is absent from snapshot evidence and timeline", async () => {
   const sensitive = "/fixture/SECRET_REJECTED_WORKTREE_MARKER";
   const files: Record<string, string> = {
-    "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     "/native-rt/goals/ready/sensitive-worktree.md": `---
 title: Sensitive Worktree
 repo/workdir: ${sensitive}
@@ -444,7 +444,7 @@ Goal pointing to rejected worktree.
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
     allowedWorktreeRoots: ["/fixture/repo"],
@@ -459,13 +459,13 @@ Goal pointing to rejected worktree.
 
 test("malformed native goal file surfaces explicit warning", async () => {
   const files: Record<string, string> = {
-    "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     "/native-rt/goals/ready/bad-goal.md": "not yaml at all --- just garbage",
   };
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
   };
@@ -481,7 +481,7 @@ test("malformed native goal file surfaces explicit warning", async () => {
 
 test("unclosed native frontmatter is malformed even with plausible fields", async () => {
   const files: Record<string, string> = {
-    "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     "/native-rt/goals/ready/unclosed-frontmatter.md": `---
 title: Plausible Goal
 repo/workdir: /fixture/repo
@@ -503,7 +503,7 @@ exit 0
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
     allowedWorktreeRoots: ["/fixture/repo"],
@@ -520,7 +520,7 @@ exit 0
 
 test("ready native dependency blockers remain non-terminal and visible", async () => {
   const files: Record<string, string> = {
-    "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     "/native-rt/goals/ready/aaa-blocked.md": `---
 title: Blocked Native
 repo/workdir: /fixture/repo
@@ -562,7 +562,7 @@ exit 0
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
     allowedWorktreeRoots: ["/fixture/repo"],
@@ -594,7 +594,7 @@ exit 0
 
 test("native lock PID is surfaced in snapshot", async () => {
   const files: Record<string, string> = {
-    "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     "/native-rt/goals/running/locked-goal.md": `---
 title: Locked Goal
 repo/workdir: /fixture/repo
@@ -614,7 +614,7 @@ exit 0
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
     allowedWorktreeRoots: ["/fixture/repo"],
@@ -629,14 +629,14 @@ exit 0
 
 test("native ready and running queue state is not overwritten by legacy queue global", async () => {
   const files: Record<string, string> = {
-    "/fixture/ChatDev/goals/state/queue-runner-status.json": JSON.stringify({ status: "paused" }),
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": JSON.stringify({ status: "paused" }),
     "/native-rt/goals/ready/native-ready.md": nativeGoal("Native Ready"),
     "/native-rt/goals/running/native-running.md": nativeGoal("Native Running"),
   };
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
     allowedWorktreeRoots: ["/fixture/repo"],
@@ -649,8 +649,8 @@ test("native ready and running queue state is not overwritten by legacy queue gl
 
 test("legacy-only goal cannot acquire native events by matching ID alone", async () => {
   const files: Record<string, string> = {
-    "/fixture/ChatDev/goals/state/legacy-only.json": JSON.stringify({ id: "legacy-only", title: "Legacy", status: "ready" }),
-    "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    "/fixture/LegacyRuntime/goals/state/legacy-only.json": JSON.stringify({ id: "legacy-only", title: "Legacy", status: "ready" }),
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     "/native-rt/runs/legacy-only/events.jsonl": [
       JSON.stringify({ type: "goal.completed", timestamp: "2026-08-05T09:20:00.000Z", summary: "Native event should not attach" }),
     ].join("\n"),
@@ -658,7 +658,7 @@ test("legacy-only goal cannot acquire native events by matching ID alone", async
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
   };
@@ -671,7 +671,7 @@ test("legacy-only goal cannot acquire native events by matching ID alone", async
 
 test("native terminal markdown without matching result is unknown and non-synthetic", async () => {
   const files: Record<string, string> = {
-    "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     "/native-rt/goals/done/done-without-result.md": nativeGoal("Done Without Result"),
     "/native-rt/goals/failed/failed-without-result.md": nativeGoal("Failed Without Result"),
     "/native-rt/goals/done/mismatched-result.md": nativeGoal("Mismatched Result"),
@@ -682,7 +682,7 @@ test("native terminal markdown without matching result is unknown and non-synthe
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
     allowedWorktreeRoots: ["/fixture/repo"],
@@ -707,7 +707,7 @@ test("native terminal markdown without matching result is unknown and non-synthe
 
 test("valid native terminal results are cited as terminal evidence", async () => {
   const files: Record<string, string> = {
-    "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     "/native-rt/goals/done/done-with-result.md": nativeGoal("Done With Result"),
     "/native-rt/goals/failed/failed-with-result.md": nativeGoal("Failed With Result"),
     "/native-rt/runs/done-with-result/result.json": JSON.stringify({ goal_id: "done-with-result", success: true }),
@@ -716,7 +716,7 @@ test("valid native terminal results are cited as terminal evidence", async () =>
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
     allowedWorktreeRoots: ["/fixture/repo"],
@@ -739,13 +739,13 @@ test("valid native terminal results are cited as terminal evidence", async () =>
 
 test("malformed native controller lock is visible warning evidence", async () => {
   const files: Record<string, string> = {
-    "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     "/native-rt/controller.lock": "{not json",
   };
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
     allowedWorktreeRoots: ["/fixture/repo"],
@@ -762,7 +762,7 @@ test("malformed native controller lock is visible warning evidence", async () =>
 
 test("native controller lock rejects PID reuse via proc start ticks", async () => {
   const files: Record<string, string> = {
-    "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     "/fixture/proc/42/stat": procStat(42, "python3", 1, 2000),
     "/native-rt/goals/running/reused-pid.md": nativeGoal("Reused PID"),
     "/native-rt/controller.lock": JSON.stringify({ goal_id: "reused-pid", pid: 42, proc_start_ticks: 1000 }),
@@ -770,7 +770,7 @@ test("native controller lock rejects PID reuse via proc start ticks", async () =
 
   const roots: RuntimeRoots = {
     procRoot: "/fixture/proc",
-    chatDevRoot: "/fixture/ChatDev",
+    chatDevRoot: "/fixture/LegacyRuntime",
     repoRoot: "/fixture/repo",
     nativeRuntimeRoot: "/native-rt",
     allowedWorktreeRoots: ["/fixture/repo"],

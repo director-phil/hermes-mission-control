@@ -12,7 +12,7 @@ import {
   type RuntimeRoots,
 } from "../runtime-truth";
 
-const roots: RuntimeRoots = { procRoot: "/fixture/proc", chatDevRoot: "/fixture/ChatDev", repoRoot: "/fixture/repo" };
+const roots: RuntimeRoots = { procRoot: "/fixture/proc", chatDevRoot: "/fixture/LegacyRuntime", repoRoot: "/fixture/repo" };
 
 test("live goal maps controller PID, queue state and git worktree evidence", async () => {
   const snapshot = await buildRuntimeSnapshot(roots, adapters({
@@ -20,9 +20,9 @@ test("live goal maps controller PID, queue state and git worktree evidence", asy
       "/fixture/proc/101/status": status("python3", 1, 1200),
       "/fixture/proc/101/stat": stat(101, "python3", 1),
       "/fixture/proc/101/cmdline": cmd("python3", "bridge/escalate.py", "run", "goal-live"),
-      "/fixture/ChatDev/goals/state/goal-live.json": JSON.stringify({ id: "goal-live", title: "Live", status: "running", controller_pid: 101, worktree: "/fixture/repo" }),
-      "/fixture/ChatDev/goals/state/goal-live.lock": "101",
-      "/fixture/ChatDev/goals/state/queue-runner-status.json": JSON.stringify({ focus_goal_id: "goal-live", status: "running" }),
+      "/fixture/LegacyRuntime/goals/state/goal-live.json": JSON.stringify({ id: "goal-live", title: "Live", status: "running", controller_pid: 101, worktree: "/fixture/repo" }),
+      "/fixture/LegacyRuntime/goals/state/goal-live.lock": "101",
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": JSON.stringify({ focus_goal_id: "goal-live", status: "running" }),
     },
   }));
   assert.equal(snapshot.goals[0]?.status, "running");
@@ -36,9 +36,9 @@ test("live goal maps controller PID, queue state and git worktree evidence", asy
 test("stale running goal and stale controller lock stay warning evidence", async () => {
   const snapshot = await buildRuntimeSnapshot(roots, adapters({
     files: {
-      "/fixture/ChatDev/goals/state/goal-stale.json": JSON.stringify({ id: "goal-stale", status: "running", controller_pid: 404 }),
-      "/fixture/ChatDev/goals/state/goal-stale.lock": "404",
-      "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+      "/fixture/LegacyRuntime/goals/state/goal-stale.json": JSON.stringify({ id: "goal-stale", status: "running", controller_pid: 404 }),
+      "/fixture/LegacyRuntime/goals/state/goal-stale.lock": "404",
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     },
   }));
   const goal = snapshot.goals[0];
@@ -52,7 +52,7 @@ test("orphan wrapper is detected when no goal or systemd owner exists", async ()
       "/fixture/proc/222/status": status("fastmcp", 1, 64),
       "/fixture/proc/222/stat": stat(222, "fastmcp", 1),
       "/fixture/proc/222/cmdline": cmd("fastmcp", "--token", "secret-value"),
-      "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     },
   }));
   assert.equal(snapshot.processes[0]?.role, "wrapper");
@@ -65,7 +65,7 @@ test("runtime snapshot never serializes raw argv secrets across API boundary", a
       "/fixture/proc/222/status": status("fastmcp", 1, 64),
       "/fixture/proc/222/stat": stat(222, "fastmcp", 1),
       "/fixture/proc/222/cmdline": cmd("fastmcp", "--token", "secret-value"),
-      "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     },
   }));
   const payload = JSON.stringify(snapshot);
@@ -87,8 +87,8 @@ test("goal ownership propagates through grandchild and deeper PID ancestry", asy
       "/fixture/proc/103/status": status("fastmcp", 102, 64),
       "/fixture/proc/103/stat": stat(103, "fastmcp", 102),
       "/fixture/proc/103/cmdline": cmd("fastmcp"),
-      "/fixture/ChatDev/goals/state/goal-deep.json": JSON.stringify({ id: "goal-deep", status: "running", controller_pid: 101 }),
-      "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+      "/fixture/LegacyRuntime/goals/state/goal-deep.json": JSON.stringify({ id: "goal-deep", status: "running", controller_pid: 101 }),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     },
   }));
   const grandchild = snapshot.processes.find((process) => process.pid === 103);
@@ -99,7 +99,7 @@ test("goal ownership propagates through grandchild and deeper PID ancestry", asy
 test("missing queue source remains unknown instead of healthy", async () => {
   const snapshot = await buildRuntimeSnapshot(roots, adapters({
     files: {
-      "/fixture/ChatDev/goals/state/goal-missing.json": JSON.stringify({ id: "goal-missing", status: "ready" }),
+      "/fixture/LegacyRuntime/goals/state/goal-missing.json": JSON.stringify({ id: "goal-missing", status: "ready" }),
     },
   }));
   assert.equal(snapshot.goals[0]?.queue_state, "unknown");
@@ -125,8 +125,8 @@ test("observed worktree paths outside allowed roots are rejected before Git exec
   const gitCwds: string[] = [];
   const snapshot = await buildRuntimeSnapshot(roots, adapters({
     files: {
-      "/fixture/ChatDev/goals/state/goal-outside.json": JSON.stringify({ id: "goal-outside", status: "ready", worktree: "/home/phillip_downs/Documents/GitHub/reliable-tradies-ops" }),
-      "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+      "/fixture/LegacyRuntime/goals/state/goal-outside.json": JSON.stringify({ id: "goal-outside", status: "ready", worktree: "/home/phillip_downs/Documents/GitHub/reliable-tradies-ops" }),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     },
     gitCwds,
   }));
@@ -145,8 +145,8 @@ test("forbidden GitHub worktree roots are rejected before any Git exec", async (
     forbiddenWorktreeRoots: [forbidden],
   }, adapters({
     files: {
-      "/fixture/ChatDev/goals/state/goal-forbidden.json": JSON.stringify({ id: "goal-forbidden", status: "ready", worktree: forbidden }),
-      "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+      "/fixture/LegacyRuntime/goals/state/goal-forbidden.json": JSON.stringify({ id: "goal-forbidden", status: "ready", worktree: forbidden }),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     },
     gitCwds,
   }));
@@ -167,8 +167,8 @@ test("allowed-root symlink resolving to forbidden worktree is rejected before Gi
     forbiddenWorktreeRoots: [forbidden],
   }, adapters({
     files: {
-      "/fixture/ChatDev/goals/state/goal-symlink.json": JSON.stringify({ id: "goal-symlink", status: "ready", worktree: symlink }),
-      "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+      "/fixture/LegacyRuntime/goals/state/goal-symlink.json": JSON.stringify({ id: "goal-symlink", status: "ready", worktree: symlink }),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     },
     gitCwds,
     realpaths: {
@@ -199,7 +199,7 @@ test("systemd service ownership maps from real user-unit cgroup ancestry without
       "/fixture/proc/500/stat": stat(500, "custom-worker", 1),
       "/fixture/proc/500/cmdline": cmd("custom-worker"),
       "/fixture/proc/500/cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/custom-worker.service/runtime\n",
-      "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     },
     systemctlUnits: ["custom-worker.service"],
   }));
@@ -218,9 +218,9 @@ test("source disagreement between goal state and lock is surfaced", async () => 
       "/fixture/proc/301/status": status("python3", 1, 1200),
       "/fixture/proc/301/stat": stat(301, "python3", 1),
       "/fixture/proc/301/cmdline": cmd("python3", "bridge/escalate.py", "run", "goal-disagree"),
-      "/fixture/ChatDev/goals/state/goal-disagree.json": JSON.stringify({ id: "goal-disagree", status: "running", controller_pid: 300 }),
-      "/fixture/ChatDev/goals/state/goal-disagree.lock": "301",
-      "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+      "/fixture/LegacyRuntime/goals/state/goal-disagree.json": JSON.stringify({ id: "goal-disagree", status: "running", controller_pid: 300 }),
+      "/fixture/LegacyRuntime/goals/state/goal-disagree.lock": "301",
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     },
   }));
   assert.equal(snapshot.goals[0]?.sources.some((source) => source.note?.includes("disagree")), true);
@@ -245,8 +245,8 @@ test("redaction removes inline shell and interpreter payload content from snapsh
       "/fixture/proc/103/status": status("node", 102, 64),
       "/fixture/proc/103/stat": stat(103, "node", 102),
       "/fixture/proc/103/cmdline": cmd("node", "--eval", `console.log("${nodePayloadMarker}")`, adjacentMarker),
-      "/fixture/ChatDev/goals/state/goal-inline.json": JSON.stringify({ id: "goal-inline", status: "running", controller_pid: 101 }),
-      "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+      "/fixture/LegacyRuntime/goals/state/goal-inline.json": JSON.stringify({ id: "goal-inline", status: "running", controller_pid: 101 }),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     },
   }));
   const apiRecords = snapshot.processes.map((process) => ({
@@ -292,8 +292,8 @@ test("redaction handles env wrappers and env assignments before inline code", as
       "/fixture/proc/103/status": status("env", 101, 64),
       "/fixture/proc/103/stat": stat(103, "env", 101),
       "/fixture/proc/103/cmdline": cmd("/usr/bin/env", "-i", `PAYLOAD=${assignmentMarker}`, "bash", "-lc", `echo ${shellMarker}`, tailMarker),
-      "/fixture/ChatDev/goals/state/goal-env-inline.json": JSON.stringify({ id: "goal-env-inline", status: "running", controller_pid: 101 }),
-      "/fixture/ChatDev/goals/state/queue-runner-status.json": "{}",
+      "/fixture/LegacyRuntime/goals/state/goal-env-inline.json": JSON.stringify({ id: "goal-env-inline", status: "running", controller_pid: 101 }),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
     },
   }));
   const serialized = JSON.stringify(snapshot);

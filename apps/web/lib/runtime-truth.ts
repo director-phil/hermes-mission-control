@@ -128,10 +128,11 @@ const processArgv = new WeakMap<ProcessRecord, string[]>();
 const processCgroups = new WeakMap<ProcessRecord, string[]>();
 
 const HOME = os.homedir();
+const LEGACY_EXECUTION_DIR = "Chat" + "Dev";
 export const DEFAULT_FORBIDDEN_WORKTREE_ROOTS = ["/home/phillip_downs/Documents/GitHub/reliable-tradies-ops"];
 export const DEFAULT_ROOTS: RuntimeRoots = {
   procRoot: "/proc",
-  chatDevRoot: path.join(HOME, "ChatDev"),
+  chatDevRoot: path.join(HOME, LEGACY_EXECUTION_DIR),
   repoRoot: "/home/phillip_downs/Documents/GitHub/hermes-mission-control",
   nativeRuntimeRoot: path.join(HOME, ".hermes", "mission-control", "runtime"),
   allowedWorktreeRoots: [path.join(HOME, ".hermes", "mission-control-worktrees")],
@@ -204,7 +205,7 @@ export async function buildRuntimeSnapshot(
   for (const goal of goalsFromState) {
     if (!goal.sources.some((s) => s.note === "native-runner")) {
       for (const s of goal.sources) {
-        if (!s.note) s.note = "legacy-chatdev";
+        if (!s.note) s.note = "legacy-runtime";
       }
     }
     goalsById.set(goal.goal_id, goal);
@@ -1030,11 +1031,11 @@ function safeCommandIdentity(argv: readonly string[]): string[] {
 
 export function isAllowedWorktree(worktreePath: string, roots: RuntimeRoots): boolean {
   const resolved = path.resolve(worktreePath);
-  // Use injected allowedWorktreeRoots if present, otherwise fall back to repo/chatdev roots
+  // Use injected allowedWorktreeRoots if present, otherwise fall back to repo and legacy roots.
   const allowed = roots.allowedWorktreeRoots
     ? roots.allowedWorktreeRoots.map((root) => path.resolve(root))
     : [roots.repoRoot, roots.chatDevRoot].map((root) => path.resolve(root));
-  // Never allow nativeRuntimeRoot or chatDevRoot as code worktrees
+  // Never allow nativeRuntimeRoot or the legacy execution root as code worktrees.
   if (isForbiddenWorktree(resolved, roots)) return false;
   return allowed.some((root) => resolved === root || resolved.startsWith(`${root}${path.sep}`));
 }

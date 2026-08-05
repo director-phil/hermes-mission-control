@@ -1,9 +1,19 @@
 # Hermes Native Goal Runtime
 
-The Hermes Native Goal Runtime replaces ChatDev as the execution substrate for
-autonomous goal dispatch in Mission Control. It uses native Hermes profiles
-(`reviewer` for planning/review, `coder` for implementation) orchestrated by a
-single-process controller with atomic state transitions.
+The Hermes Native Goal Runtime is the execution substrate for autonomous goal
+dispatch in Mission Control. It uses explicit native Hermes stage profiles
+orchestrated by a single-process controller with atomic state transitions.
+
+Default stage profiles are safe and configurable:
+
+- Plan: `architect`, a local read-only planner.
+- Code implementation: `default`, a cloud Codex-backed orchestrator.
+- Final review: `default`, a cloud Codex-backed orchestrator.
+
+The `HERMES_NATIVE_PLAN_PROFILE`, `HERMES_NATIVE_CODE_PROFILE`, and
+`HERMES_NATIVE_REVIEW_PROFILE` environment variables can pin compatible
+profiles. The old local implementation/review profile names are rejected for
+code and final review.
 
 ## Goal Schema
 
@@ -93,13 +103,15 @@ heading followed by `- path` or ``- `path` `` bullets. Other prose is ignored.
 
 1. **Lock**: Create controller lock with `O_EXCL`.
 2. **Claim**: Atomically move goal from `ready/` to `running/` via `os.replace()`.
-3. **Plan**: Run `hermes --profile reviewer chat --query-file - --source mission-control-goal-plan` with the prompt supplied on stdin.
+3. **Plan**: Run `hermes --profile "${HERMES_NATIVE_PLAN_PROFILE:-architect}" chat --query-file - --source mission-control-goal-plan` with the prompt supplied on stdin.
    Requires bounded stdout, stripped of surrounding whitespace, to equal exactly `PLAN_APPROVED`.
-4. **Code**: Run `hermes --profile coder chat --query-file - --source mission-control-goal-code` with the prompt supplied on stdin.
+4. **Code**: Run `hermes --profile "${HERMES_NATIVE_CODE_PROFILE:-default}" chat --query-file - --source mission-control-goal-code` with the prompt supplied on stdin.
+   The prompt states Codex-only production implementation authority, names the exact controller markers, and reserves those markers for plan/final review.
    Requires exit 0 and substantive git diff within allowed files.
 5. **Scope Check**: Verify all changed files are in the allowed list. Reject binary/NUL diffs, including direct NUL inspection of every untracked allowed path because untracked files are absent from `git diff --numstat`.
 6. **Acceptance**: Execute the bash acceptance block with minimal env, passing the byte-preserved body on stdin.
-7. **Review**: Run `hermes --profile reviewer chat --query-file - --source mission-control-goal-review` with the prompt supplied on stdin.
+7. **Review**: Run `hermes --profile "${HERMES_NATIVE_REVIEW_PROFILE:-default}" chat --query-file - --source mission-control-goal-review` with the prompt supplied on stdin.
+   The prompt states Codex-only final code review authority and the exact required marker.
    Requires bounded stdout, stripped of surrounding whitespace, to equal exactly `REVIEW_PASS`.
 8. **Finalize**: Move to `done/` or `failed/`, write terminal result JSON, emit the terminal event, then clean the owned lock. If the terminal move fails, the runner records non-terminal recovery evidence, preserves the lock/running file, and does not emit a false terminal event.
 
@@ -145,7 +157,7 @@ systemctl --user stop hermes-native-goal-runner.service
    systemctl --user stop hermes-native-goal-runner.service
    systemctl --user disable hermes-native-goal-runner.service
    ```
-2. ChatDev services remain untouched and continue operating.
+2. Old execution services stay stopped and disabled; do not re-enable or start them.
 3. Native state in `~/.hermes/mission-control/runtime/` is preserved read-only.
 
 ## Evidence Paths
