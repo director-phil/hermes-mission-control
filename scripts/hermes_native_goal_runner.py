@@ -111,6 +111,25 @@ TRUSTED_COMMAND_ALLOWLIST: dict[str, tuple[Path, ...]] = {
     "hermes": (Path("/usr/bin/hermes"), Path("/usr/local/bin/hermes"), Path(HOME) / ".local" / "bin" / "hermes", Path(HOME) / ".hermes" / "bin" / "hermes"),
 }
 USER_OWNED_TRUSTED_COMMAND_DIRS = (Path(HOME) / ".local" / "bin", Path(HOME) / ".hermes" / "bin")
+OVERFLOW_ROOT_UID = 65534
+TRUSTED_SYSTEM_EXECUTABLE_DIRS = (Path("/usr/bin"), Path("/bin"), Path("/usr/local/bin"))
+TRUSTED_FIXED_SYSTEM_HELPERS = (Path("/usr/bin/env"), Path("/usr/bin/bash"), Path("/bin/bash"))
+TRUSTED_FIXED_SYSTEM_OVERFLOW_EXECUTABLES = frozenset(
+    {
+        Path("/usr/bin/env"),
+        Path("/usr/bin/bash"),
+        Path("/bin/bash"),
+        Path("/usr/bin/git"),
+        Path("/usr/bin/gh"),
+        Path("/usr/local/bin/gh"),
+    }
+)
+TRUSTED_HERMES_USER_ROOTS = (
+    Path(HOME) / ".local" / "bin",
+    Path(HOME) / ".hermes" / "bin",
+    Path(HOME) / ".hermes" / "hermes-agent",
+    Path(HOME) / ".local" / "share" / "uv" / "python",
+)
 CONTROL_PLANE_FORBIDDEN_CONFIG_PREFIXES = (
     "alias.",
     "credential.",
@@ -221,10 +240,78 @@ def _path_mode_from_stat(st: os.stat_result) -> int:
     return stat_module.S_IMODE(st.st_mode)
 
 
-def _stat_trusted(path_value: Path, st: os.stat_result, primary_group: PrimaryGroupTrust, *, allow_symlink: bool = False) -> tuple[bool, str]:
+def _normalized_absolute_path(path_value: Path) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(path_value))))
+
+
+def _path_is_under(path_value: Path, roots: tuple[Path, ...]) -> bool:
+    absolute = _normalized_absolute_path(path_value)
+    for root in roots:
+        try:
+            absolute.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _path_components(path_value: Path) -> list[Path]:
+    absolute = _normalized_absolute_path(path_value)
+    components = [Path(absolute.anchor)]
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        components.append(current)
+    return components
+
+
+def _trusted_overflow_system_components(path_value: Path, enabled: bool) -> set[Path]:
+    if not enabled:
+        return set()
+    absolute = _normalized_absolute_path(path_value)
+    if not _path_is_under(absolute, TRUSTED_SYSTEM_EXECUTABLE_DIRS):
+        return set()
+    components = set(_path_components(absolute))
+    resolved = _normalized_absolute_path(Path(os.path.realpath(absolute)))
+    if _path_is_under(resolved, TRUSTED_SYSTEM_EXECUTABLE_DIRS):
+        components.update(_path_components(resolved))
+    return components
+
+
+def _trusted_overflow_user_home_ancestor_components(path_value: Path, enabled: bool) -> set[Path]:
+    if not enabled:
+        return set()
+    absolute = _normalized_absolute_path(path_value)
+    if not _path_is_under(absolute, TRUSTED_HERMES_USER_ROOTS):
+        return set()
+    home = _normalized_absolute_path(Path(HOME))
+    try:
+        absolute.relative_to(home)
+    except ValueError:
+        return set()
+    components: set[Path] = set()
+    for component in _path_components(absolute):
+        if component == home:
+            break
+        components.add(component)
+    return components
+
+
+def _stat_trusted(
+    path_value: Path,
+    st: os.stat_result,
+    primary_group: PrimaryGroupTrust,
+    *,
+    allow_symlink: bool = False,
+    overflow_system_components: set[Path] | None = None,
+    require_system_owned: bool = False,
+) -> tuple[bool, str]:
     mode = _path_mode_from_stat(st)
     if stat_module.S_ISLNK(st.st_mode):
-        if allow_symlink and st.st_uid in {0, primary_group.uid}:
+        symlink_allowed_uids = {0} if require_system_owned else {0, primary_group.uid}
+        if allow_symlink and st.st_uid in symlink_allowed_uids:
+            return True, ""
+        if allow_symlink and st.st_uid == OVERFLOW_ROOT_UID and overflow_system_components and path_value in overflow_system_components:
             return True, ""
         return False, f"symlink rejected: {path_value}"
     if mode & 0o002:
@@ -233,6 +320,12 @@ def _stat_trusted(path_value: Path, st: os.stat_result, primary_group: PrimaryGr
         if mode & 0o020:
             return False, f"root-owned group-writable path rejected: {path_value}"
         return True, ""
+    if st.st_uid == OVERFLOW_ROOT_UID and overflow_system_components and path_value in overflow_system_components:
+        if mode & 0o020:
+            return False, f"overflow-root system path group-writable rejected: {path_value}"
+        return True, ""
+    if require_system_owned:
+        return False, f"fixed system path owner is neither root nor reviewed overflow root: {path_value}"
     if st.st_uid != primary_group.uid:
         return False, f"path owner is neither root nor current uid: {path_value}"
     if mode & 0o020:
@@ -243,27 +336,22 @@ def _stat_trusted(path_value: Path, st: os.stat_result, primary_group: PrimaryGr
     return True, ""
 
 
-def _path_components(path_value: Path) -> list[Path]:
-    absolute = Path(os.path.abspath(os.path.expanduser(os.fspath(path_value))))
-    components = [Path(absolute.anchor)]
-    current = Path(absolute.anchor)
-    for part in absolute.parts[1:]:
-        current = current / part
-        components.append(current)
-    return components
-
-
 def trust_path_chain(
     path_value: Path,
     *,
     final_kind: str,
     executable: bool = False,
     primary_group: PrimaryGroupTrust | None = None,
+    allow_system_overflow_root: bool = False,
+    allow_user_home_ancestor_overflow_root: bool = False,
+    require_system_owned: bool = False,
 ) -> tuple[bool, str, Path | None]:
     """Validate every existing component, resolving symlinks with a bounded final target pass."""
     trust = primary_group or load_primary_group_trust()
-    source = Path(os.path.abspath(os.path.expanduser(os.fspath(path_value))))
+    source = _normalized_absolute_path(path_value)
     resolved_before = Path(os.path.realpath(source))
+    overflow_system_components = _trusted_overflow_system_components(source, allow_system_overflow_root)
+    overflow_system_components.update(_trusted_overflow_user_home_ancestor_components(source, allow_user_home_ancestor_overflow_root))
     seen: set[Path] = set()
     current_source = source
     for _ in range(16):
@@ -276,7 +364,14 @@ def trust_path_chain(
             for index, component in enumerate(components):
                 st = os.lstat(component)
                 is_final = index == len(components) - 1
-                ok, reason = _stat_trusted(component, st, trust, allow_symlink=True)
+                ok, reason = _stat_trusted(
+                    component,
+                    st,
+                    trust,
+                    allow_symlink=True,
+                    overflow_system_components=overflow_system_components,
+                    require_system_owned=require_system_owned,
+                )
                 if not ok:
                     return False, reason, None
                 if stat_module.S_ISLNK(st.st_mode):
@@ -311,8 +406,23 @@ def trust_path_chain(
     return False, f"too many symlinks rejected: {source}", None
 
 
-def trusted_generic_executable_path(path_value: Path, primary_group: PrimaryGroupTrust | None = None) -> tuple[bool, str, Path | None]:
-    return trust_path_chain(path_value, final_kind="file", executable=True, primary_group=primary_group)
+def trusted_generic_executable_path(
+    path_value: Path,
+    primary_group: PrimaryGroupTrust | None = None,
+    *,
+    allow_system_overflow_root: bool = False,
+    allow_user_home_ancestor_overflow_root: bool = False,
+    require_system_owned: bool = False,
+) -> tuple[bool, str, Path | None]:
+    return trust_path_chain(
+        path_value,
+        final_kind="file",
+        executable=True,
+        primary_group=primary_group,
+        allow_system_overflow_root=allow_system_overflow_root,
+        allow_user_home_ancestor_overflow_root=allow_user_home_ancestor_overflow_root,
+        require_system_owned=require_system_owned,
+    )
 
 
 def _read_text_bounded(path_value: Path, max_bytes: int = 256_000) -> str:
@@ -377,10 +487,31 @@ def _editable_source_from_direct_url(path_value: Path) -> Path:
     return Path(unquote(parsed.path))
 
 
+def _fixed_system_executable_overflow_allowed(path_value: Path) -> bool:
+    absolute = _normalized_absolute_path(path_value)
+    return absolute in TRUSTED_FIXED_SYSTEM_OVERFLOW_EXECUTABLES
+
+
+def trusted_fixed_system_executable_path(path_value: Path, primary_group: PrimaryGroupTrust | None = None) -> tuple[bool, str, Path | None]:
+    if _normalized_absolute_path(path_value) not in TRUSTED_FIXED_SYSTEM_OVERFLOW_EXECUTABLES:
+        return False, f"fixed system executable is not reviewed: {path_value}", None
+    return trusted_generic_executable_path(
+        path_value,
+        primary_group,
+        allow_system_overflow_root=_fixed_system_executable_overflow_allowed(path_value),
+        require_system_owned=True,
+    )
+
+
 def validate_hermes_entrypoint_chain(wrapper_path: Path, primary_group: PrimaryGroupTrust | None = None) -> tuple[bool, str, Path | None]:
     """Validate the host Hermes wrapper, venv entrypoint/interpreter, editable marker, and source package chain."""
     trust = primary_group or load_primary_group_trust()
-    ok, reason, resolved_wrapper = trusted_generic_executable_path(wrapper_path, trust)
+    wrapper_allows_home_ancestor_overflow = _path_is_under(wrapper_path, USER_OWNED_TRUSTED_COMMAND_DIRS)
+    ok, reason, resolved_wrapper = trusted_generic_executable_path(
+        wrapper_path,
+        trust,
+        allow_user_home_ancestor_overflow_root=wrapper_allows_home_ancestor_overflow,
+    )
     if not ok or resolved_wrapper is None:
         return False, f"Hermes wrapper trust failed: {reason}", None
     try:
@@ -390,47 +521,55 @@ def validate_hermes_entrypoint_chain(wrapper_path: Path, primary_group: PrimaryG
             env_target = _parse_env_shebang_target(shebang)
             if env_target is None:
                 return False, "Hermes wrapper env shebang is not bounded to bash", None
-            ok, reason, _ = trusted_generic_executable_path(Path("/usr/bin/env"), trust)
+            ok, reason, _ = trusted_fixed_system_executable_path(Path("/usr/bin/env"), trust)
             if not ok:
                 return False, f"Hermes wrapper env trust failed: {reason}", None
-            ok, reason, _ = trusted_generic_executable_path(env_target, trust)
+            ok, reason, _ = trusted_fixed_system_executable_path(env_target, trust)
             if not ok:
                 return False, f"Hermes wrapper bash trust failed: {reason}", None
         exec_target = _parse_wrapper_exec_target(wrapper_text)
         if exec_target is None:
             return False, "Hermes wrapper exec target could not be resolved", None
 
-        ok, reason, resolved_entrypoint = trusted_generic_executable_path(exec_target, trust)
+        ok, reason, resolved_entrypoint = trusted_generic_executable_path(
+            exec_target,
+            trust,
+            allow_user_home_ancestor_overflow_root=wrapper_allows_home_ancestor_overflow,
+        )
         if not ok or resolved_entrypoint is None:
             return False, f"Hermes venv entrypoint trust failed: {reason}", None
         entrypoint_text = _read_text_bounded(resolved_entrypoint, 65_536)
         interpreter = _parse_entrypoint_shebang(entrypoint_text)
         if interpreter is None:
             return False, "Hermes venv entrypoint shebang is not an absolute interpreter", None
-        ok, reason, _ = trusted_generic_executable_path(interpreter, trust)
+        ok, reason, _ = trusted_generic_executable_path(
+            interpreter,
+            trust,
+            allow_user_home_ancestor_overflow_root=wrapper_allows_home_ancestor_overflow,
+        )
         if not ok:
             return False, f"Hermes venv interpreter trust failed: {reason}", None
 
         venv_root = resolved_entrypoint.parent.parent
-        ok, reason, _ = trust_path_chain(venv_root, final_kind="dir", primary_group=trust)
+        ok, reason, _ = trust_path_chain(venv_root, final_kind="dir", primary_group=trust, allow_user_home_ancestor_overflow_root=wrapper_allows_home_ancestor_overflow)
         if not ok:
             return False, f"Hermes venv root trust failed: {reason}", None
         site_packages_candidates = sorted((venv_root / "lib").glob("python*/site-packages"))
         if not site_packages_candidates:
             return False, "Hermes venv site-packages directory not found", None
         site_packages = site_packages_candidates[0]
-        ok, reason, _ = trust_path_chain(site_packages, final_kind="dir", primary_group=trust)
+        ok, reason, _ = trust_path_chain(site_packages, final_kind="dir", primary_group=trust, allow_user_home_ancestor_overflow_root=wrapper_allows_home_ancestor_overflow)
         if not ok:
             return False, f"Hermes site-packages trust failed: {reason}", None
         pth_candidates = sorted(site_packages.glob("__editable__.hermes_agent-*.pth"))
         if not pth_candidates:
             return False, "Hermes editable pth not found", None
         pth_path = pth_candidates[-1]
-        ok, reason, _ = trust_path_chain(pth_path, final_kind="file", primary_group=trust)
+        ok, reason, _ = trust_path_chain(pth_path, final_kind="file", primary_group=trust, allow_user_home_ancestor_overflow_root=wrapper_allows_home_ancestor_overflow)
         if not ok:
             return False, f"Hermes editable pth trust failed: {reason}", None
         finder_path = _editable_finder_from_pth(site_packages, pth_path)
-        ok, reason, _ = trust_path_chain(finder_path, final_kind="file", primary_group=trust)
+        ok, reason, _ = trust_path_chain(finder_path, final_kind="file", primary_group=trust, allow_user_home_ancestor_overflow_root=wrapper_allows_home_ancestor_overflow)
         if not ok:
             return False, f"Hermes editable finder trust failed: {reason}", None
         finder_text = _read_text_bounded(finder_path)
@@ -442,11 +581,11 @@ def validate_hermes_entrypoint_chain(wrapper_path: Path, primary_group: PrimaryG
         if not direct_url_candidates:
             return False, "Hermes editable direct_url metadata not found", None
         direct_url_path = direct_url_candidates[-1]
-        ok, reason, _ = trust_path_chain(direct_url_path, final_kind="file", primary_group=trust)
+        ok, reason, _ = trust_path_chain(direct_url_path, final_kind="file", primary_group=trust, allow_user_home_ancestor_overflow_root=wrapper_allows_home_ancestor_overflow)
         if not ok:
             return False, f"Hermes editable direct_url trust failed: {reason}", None
         source_root = _editable_source_from_direct_url(direct_url_path)
-        ok, reason, _ = trust_path_chain(source_root, final_kind="dir", primary_group=trust)
+        ok, reason, _ = trust_path_chain(source_root, final_kind="dir", primary_group=trust, allow_user_home_ancestor_overflow_root=wrapper_allows_home_ancestor_overflow)
         if not ok:
             return False, f"Hermes editable source root trust failed: {reason}", None
         try:
@@ -459,7 +598,7 @@ def validate_hermes_entrypoint_chain(wrapper_path: Path, primary_group: PrimaryG
             (hermes_cli_source / "__init__.py", "file"),
             (hermes_cli_source / "main.py", "file"),
         ):
-            ok, reason, _ = trust_path_chain(source_path, final_kind=kind, primary_group=trust)
+            ok, reason, _ = trust_path_chain(source_path, final_kind=kind, primary_group=trust, allow_user_home_ancestor_overflow_root=wrapper_allows_home_ancestor_overflow)
             if not ok:
                 return False, f"Hermes editable source trust failed: {reason}", None
         return True, "", resolved_wrapper
@@ -544,6 +683,9 @@ def trusted_executable_path(path_value: Path) -> bool:
         return ok
     if Path(path_value).name == "vercel":
         ok, _, _ = validate_vercel_entrypoint_chain(path_value)
+        return ok
+    if _path_is_under(path_value, TRUSTED_SYSTEM_EXECUTABLE_DIRS):
+        ok, _, _ = trusted_fixed_system_executable_path(path_value)
         return ok
     ok, _, _ = trusted_generic_executable_path(path_value)
     return ok
@@ -4630,6 +4772,9 @@ class MutatingPlannerSubprocess:
         stdin_data: str | None = None,
     ) -> CmdResult:
         cmd_str = " ".join(cmd)
+        if len(cmd) >= 6 and cmd[:2] == ["hermes", "--profile"] and cmd[3:6] == ["config", "get", "model.provider"]:
+            provider = "openai-codex" if cmd[2] == "default" else cmd[2]
+            return CmdResult(0, f"{provider}\n", "", len(provider) + 1, 0)
         if "mission-control-goal-plan" in cmd_str:
             self.mutation(Path(cwd))
             return CmdResult(0, f"{PLAN_APPROVED_MARKER}\n", "", len(PLAN_APPROVED_MARKER) + 1, 0)
@@ -5926,6 +6071,33 @@ def self_test() -> tuple[bool, str]:
         old_allowlist = dict(TRUSTED_COMMAND_ALLOWLIST)
         old_user_dirs = USER_OWNED_TRUSTED_COMMAND_DIRS
         trust_tmp_root = Path(tempfile.mkdtemp(prefix=".hermes-trust-self-test-", dir=os.getcwd()))
+
+        def stat_with(st: os.stat_result, *, uid: int | None = None, mode: int | None = None) -> os.stat_result:
+            values = list(st)
+            if uid is not None:
+                values[stat_module.ST_UID] = uid
+            if mode is not None:
+                values[stat_module.ST_MODE] = mode
+            return os.stat_result(values)
+
+        def run_with_lstat_overrides(overrides: dict[Path, Callable[[os.stat_result], os.stat_result]], assertion: Callable[[], bool]) -> bool:
+            real_lstat = os.lstat
+
+            def fake_lstat(path_value: str | bytes | os.PathLike[str] | os.PathLike[bytes]) -> os.stat_result:
+                st = real_lstat(path_value)
+                if isinstance(path_value, bytes):
+                    absolute = Path(os.path.abspath(os.fsdecode(path_value)))
+                else:
+                    absolute = _normalized_absolute_path(Path(os.fspath(path_value)))
+                override = overrides.get(absolute)
+                return override(st) if override is not None else st
+
+            os.lstat = fake_lstat
+            try:
+                return assertion()
+            finally:
+                os.lstat = real_lstat
+
         try:
             trusted_tool = make_fake_editable_hermes(trust_tmp_root / "private-primary-group-hermes")
             trusted_vercel_wrapper, trusted_vercel_node, trusted_vercel_vc_js, trusted_vercel_package = make_fake_vercel_install(trust_tmp_root / "private-primary-group-vercel")
@@ -5953,6 +6125,88 @@ def self_test() -> tuple[bool, str]:
                 prepare_production_command([str(bad_ancestor_tool), "--version"])
             except PermissionError:
                 rejected_bad_ancestor_generic = True
+            overflow_system_paths = [Path("/"), Path("/usr"), Path("/usr/bin"), Path("/usr/bin/git")]
+            overflow_system_overrides = {
+                path_value: (lambda st: stat_with(st, uid=OVERFLOW_ROOT_UID))
+                for path_value in overflow_system_paths
+            }
+            overflow_root_system_git_accepted = run_with_lstat_overrides(
+                overflow_system_overrides,
+                lambda: resolve_trusted_command("git") == Path("/usr/bin/git"),
+            )
+            arbitrary_overflow_tool = trust_tmp_root / "arbitrary-overflow-tool"
+            arbitrary_overflow_tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            arbitrary_overflow_tool.chmod(0o700)
+            overflow_root_arbitrary_rejected = run_with_lstat_overrides(
+                {
+                    arbitrary_overflow_tool: (lambda st: stat_with(st, uid=OVERFLOW_ROOT_UID)),
+                },
+                lambda: trusted_generic_executable_path(arbitrary_overflow_tool)[0] is False,
+            )
+            overflow_root_system_group_write_rejected = run_with_lstat_overrides(
+                {
+                    **overflow_system_overrides,
+                    Path("/usr/bin"): (lambda st: stat_with(st, uid=OVERFLOW_ROOT_UID, mode=st.st_mode | 0o020)),
+                },
+                lambda: trusted_executable_path(Path("/usr/bin/git")) is False,
+            )
+            overflow_root_system_world_write_rejected = run_with_lstat_overrides(
+                {
+                    **overflow_system_overrides,
+                    Path("/usr/bin/git"): (lambda st: stat_with(st, uid=OVERFLOW_ROOT_UID, mode=st.st_mode | 0o002)),
+                },
+                lambda: trusted_executable_path(Path("/usr/bin/git")) is False,
+            )
+            reviewed_system_paths_are_exact = all(
+                _fixed_system_executable_overflow_allowed(path_value)
+                for path_value in TRUSTED_FIXED_SYSTEM_OVERFLOW_EXECUTABLES
+            )
+            mutable_allowlist_candidate = next(
+                (candidate for candidate in (Path("/usr/bin/python3"), Path("/usr/bin/false"), Path("/usr/bin/true")) if candidate.exists()),
+                None,
+            )
+            if mutable_allowlist_candidate is None:
+                mutable_allowlist_cannot_broaden_overflow = True
+            else:
+                original_git_candidates = TRUSTED_COMMAND_ALLOWLIST.get("git", ())
+                TRUSTED_COMMAND_ALLOWLIST["git"] = (mutable_allowlist_candidate,)
+                mutable_candidate_overrides = {
+                    path_value: (lambda st: stat_with(st, uid=OVERFLOW_ROOT_UID))
+                    for path_value in _path_components(mutable_allowlist_candidate)
+                }
+                mutable_allowlist_cannot_broaden_overflow = (
+                    _fixed_system_executable_overflow_allowed(mutable_allowlist_candidate) is False
+                    and run_with_lstat_overrides(
+                        mutable_candidate_overrides,
+                        lambda: trusted_executable_path(mutable_allowlist_candidate) is False,
+                    )
+                )
+                TRUSTED_COMMAND_ALLOWLIST["git"] = original_git_candidates
+            fixed_system_user_owned_component_rejected = run_with_lstat_overrides(
+                {
+                    Path("/usr/bin"): (lambda st: stat_with(st, uid=os.getuid())),
+                },
+                lambda: trusted_fixed_system_executable_path(Path("/usr/bin/git"))[0] is False,
+            )
+            exact_overflow_git_bash_gh_accepted = all(
+                run_with_lstat_overrides(
+                    {component: (lambda st: stat_with(st, uid=OVERFLOW_ROOT_UID)) for component in _path_components(system_path)},
+                    lambda system_path=system_path: trusted_fixed_system_executable_path(system_path)[0] is True,
+                )
+                for system_path in (Path("/usr/bin/git"), Path("/usr/bin/bash"), Path("/usr/bin/gh"), Path("/usr/local/bin/gh"))
+                if system_path.exists()
+            )
+            bin_bash_overflow_symlink_ancestry_accepted = (
+                not Path("/bin/bash").exists()
+                or run_with_lstat_overrides(
+                    {
+                        component: (lambda st: stat_with(st, uid=OVERFLOW_ROOT_UID))
+                        for candidate_path in {Path("/bin/bash"), Path(os.path.realpath("/bin/bash"))}
+                        for component in _path_components(candidate_path)
+                    },
+                    lambda: trusted_fixed_system_executable_path(Path("/bin/bash"))[0] is True,
+                )
+            )
             hostile_dir = trust_tmp_root / "hostile-bin"
             hostile_dir.mkdir(mode=0o700)
             hostile_tool = make_fake_editable_hermes(hostile_dir / "lookalike")
@@ -5986,6 +6240,29 @@ def self_test() -> tuple[bool, str]:
             trusted_tool.chmod(0o775)
             real_host_hermes = Path(HOME) / ".local" / "bin" / "hermes"
             real_host_resolves = validate_hermes_entrypoint_chain(real_host_hermes)[0] if real_host_hermes.exists() else False
+            hermes_pre_home_components = _trusted_overflow_user_home_ancestor_components(real_host_hermes, real_host_hermes.exists())
+            real_host_hermes_overflow_pre_home_resolves = (
+                real_host_hermes.exists()
+                and run_with_lstat_overrides(
+                    {component: (lambda st: stat_with(st, uid=OVERFLOW_ROOT_UID)) for component in hermes_pre_home_components},
+                    lambda: validate_hermes_entrypoint_chain(real_host_hermes)[0] is True,
+                )
+            )
+            home_path = _normalized_absolute_path(Path(HOME))
+            real_host_hermes_overflow_home_rejected = (
+                real_host_hermes.exists()
+                and run_with_lstat_overrides(
+                    {home_path: (lambda st: stat_with(st, uid=OVERFLOW_ROOT_UID))},
+                    lambda: validate_hermes_entrypoint_chain(real_host_hermes)[0] is False,
+                )
+            )
+            real_host_hermes_overflow_below_home_rejected = (
+                real_host_hermes.exists()
+                and run_with_lstat_overrides(
+                    {Path(HOME) / ".local": (lambda st: stat_with(st, uid=OVERFLOW_ROOT_UID))},
+                    lambda: validate_hermes_entrypoint_chain(real_host_hermes)[0] is False,
+                )
+            )
             real_host_vercel = Path(HOME) / ".local" / "bin" / "vercel"
             real_host_vercel_resolves = validate_vercel_entrypoint_chain(real_host_vercel)[0] if real_host_vercel.exists() else False
 
@@ -6053,6 +6330,15 @@ def self_test() -> tuple[bool, str]:
         check("production_command_accepts_managed_usr_bin_bash", prepared_bash[0] == "/usr/bin/bash")
         check("production_command_rejects_hostile_generic_absolute", rejected_hostile_generic)
         check("production_command_rejects_untrusted_generic_ancestor", rejected_bad_ancestor_generic)
+        check("fixed_system_overflow_reviewed_paths_are_exact", reviewed_system_paths_are_exact)
+        check("trusted_allowlist_mutation_cannot_broaden_overflow", mutable_allowlist_cannot_broaden_overflow)
+        check("fixed_system_rejects_current_user_owned_components", fixed_system_user_owned_component_rejected)
+        check("overflow_root_exact_git_bash_gh_accepted", exact_overflow_git_bash_gh_accepted)
+        check("overflow_root_bin_bash_symlink_ancestry_accepted", bin_bash_overflow_symlink_ancestry_accepted)
+        check("overflow_root_system_git_accepted", overflow_root_system_git_accepted)
+        check("overflow_root_arbitrary_path_rejected", overflow_root_arbitrary_rejected)
+        check("overflow_root_system_group_writable_rejected", overflow_root_system_group_write_rejected)
+        check("overflow_root_system_world_writable_rejected", overflow_root_system_world_write_rejected)
         check("production_command_rejects_untrusted_absolute", rejected_hostile)
         check("production_command_rejects_relative_managed_path", rejected_relative)
         check("private_primary_group_group_writable_hermes_passes", current_private_group_ok)
@@ -6062,6 +6348,9 @@ def self_test() -> tuple[bool, str]:
         check("private_primary_group_other_write_rejected", other_write_rejected)
         check("private_primary_group_untrusted_ancestor_rejected", rejected_allowlisted_hostile)
         check("real_host_hermes_chain_resolves", real_host_resolves)
+        check("real_host_hermes_overflow_pre_home_resolves", real_host_hermes_overflow_pre_home_resolves)
+        check("real_host_hermes_overflow_home_rejected", real_host_hermes_overflow_home_rejected)
+        check("real_host_hermes_overflow_below_home_rejected", real_host_hermes_overflow_below_home_rejected)
         check("sanitize_env_none_drops_ambient_injection", sanitized_none.get("PATH") == TRUSTED_CHILD_PATH and not (forbidden_env_keys & set(sanitized_none.keys())))
 
         def parse_rejected(goal_text: str) -> bool:
