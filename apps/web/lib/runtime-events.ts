@@ -1,6 +1,6 @@
 import path from "node:path";
 import type { FsAdapter, GoalRecord, RuntimeAdapters, RuntimeRoots, RuntimeSnapshot } from "./runtime-truth";
-import { DEFAULT_ROOTS, buildRuntimeSnapshot, createNodeRuntimeAdapters } from "./runtime-truth";
+import { DEFAULT_ROOTS, buildRuntimeSnapshot, createNodeRuntimeAdapters, isProvenHermesAgent } from "./runtime-truth";
 
 export type RuntimeEventType =
   | "goal.created"
@@ -75,10 +75,28 @@ export interface RuntimeAlert {
   action: string;
 }
 
+export interface TimelineMetadata {
+  goals_scanned: number;
+  goals_available: number;
+  events_scanned: number;
+  events_returned: number;
+  has_more_goals: boolean;
+  has_more_events: boolean;
+}
+
+export interface TimelineBuildOptions {
+  maxGoals?: number;
+  maxEventFilesPerGoal?: number;
+  maxRowsPerFile?: number;
+  maxTotalEvents?: number;
+  maxWarnings?: number;
+}
+
 export interface TimelineResponse {
   timestamp: string;
   events: RuntimeEvent[];
   warnings: Array<{ source: string; message: string }>;
+  metadata?: TimelineMetadata;
 }
 
 export interface AlertResponse {
@@ -148,18 +166,21 @@ export async function buildRuntimeTimeline(
   roots: RuntimeRoots = DEFAULT_ROOTS,
   adapters: RuntimeAdapters = createNodeRuntimeAdapters(),
   snapshot?: RuntimeSnapshot,
+  options: TimelineBuildOptions = {},
 ): Promise<TimelineResponse> {
   const runtime = snapshot ?? await buildRuntimeSnapshot(roots, adapters);
   const warnings: TimelineResponse["warnings"] = [];
   const events: RuntimeEvent[] = [];
+  const bounds = normalizeTimelineOptions(options);
+  const selectedGoals = selectTimelineGoals(runtime.goals, bounds.maxGoals);
+  const truncation = { value: selectedGoals.length < runtime.goals.length };
 
-  for (const goal of runtime.goals) {
+  for (const goal of selectedGoals) {
     const nativeOwned = goal.sources.some((source) => source.note === "native-runner");
-    if (roots.nativeRuntimeRoot && nativeOwned) {
-      events.push(...await readNativeRunEvents(roots.nativeRuntimeRoot, adapters.fs, goal, warnings));
-    } else {
-      events.push(...await readGoalRunEvents(roots, adapters.fs, goal, warnings));
-    }
+    const goalEvents = roots.nativeRuntimeRoot && nativeOwned
+      ? await readNativeRunEvents(roots.nativeRuntimeRoot, adapters.fs, goal, warnings, bounds, truncation)
+      : await readGoalRunEvents(roots, adapters.fs, goal, warnings, bounds, truncation);
+    events.push(...goalEvents);
     const source = goal.sources[0];
     if (!nativeOwned && goal.status === "completed" && source) {
       events.push(goalStateEvent(goal, "goal.completed", source.source, source.timestamp));
@@ -170,7 +191,13 @@ export async function buildRuntimeTimeline(
   }
 
   if (roots.nativeRuntimeRoot) {
-    events.push(...await readNativeControllerEvents(roots.nativeRuntimeRoot, adapters.fs, warnings));
+    events.push(...await readNativeControllerEvents(
+      roots.nativeRuntimeRoot,
+      adapters.fs,
+      warnings,
+      bounds.maxRowsPerFile,
+      truncation,
+    ));
   }
 
   for (const process of runtime.processes.filter((item) => item.orphan)) {
@@ -187,11 +214,66 @@ export async function buildRuntimeTimeline(
     });
   }
 
+  const sorted = dedupeEvents(events).sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+  const returned = Number.isFinite(bounds.maxTotalEvents)
+    ? sorted.slice(-bounds.maxTotalEvents)
+    : sorted;
+  if (returned.length < sorted.length) truncation.value = true;
+  const returnedWarnings = Number.isFinite(bounds.maxWarnings)
+    ? warnings.slice(0, bounds.maxWarnings)
+    : warnings;
+  if (returnedWarnings.length < warnings.length) truncation.value = true;
+
   return {
     timestamp: runtime.timestamp,
-    events: dedupeEvents(events).sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp)),
-    warnings,
+    events: returned,
+    warnings: returnedWarnings,
+    metadata: {
+      goals_scanned: selectedGoals.length,
+      goals_available: runtime.goals.length,
+      events_scanned: sorted.length,
+      events_returned: returned.length,
+      has_more_goals: selectedGoals.length < runtime.goals.length,
+      has_more_events: truncation.value,
+    },
   };
+}
+
+const UNBOUNDED_TIMELINE_OPTIONS = {
+  maxGoals: Number.POSITIVE_INFINITY,
+  maxEventFilesPerGoal: Number.POSITIVE_INFINITY,
+  maxRowsPerFile: Number.POSITIVE_INFINITY,
+  maxTotalEvents: Number.POSITIVE_INFINITY,
+  maxWarnings: Number.POSITIVE_INFINITY,
+};
+
+function normalizeTimelineOptions(options: TimelineBuildOptions) {
+  const bounded = (value: number | undefined, fallback: number) =>
+    value === undefined ? fallback : Math.max(1, Math.floor(value));
+  return {
+    maxGoals: bounded(options.maxGoals, UNBOUNDED_TIMELINE_OPTIONS.maxGoals),
+    maxEventFilesPerGoal: bounded(options.maxEventFilesPerGoal, UNBOUNDED_TIMELINE_OPTIONS.maxEventFilesPerGoal),
+    maxRowsPerFile: bounded(options.maxRowsPerFile, UNBOUNDED_TIMELINE_OPTIONS.maxRowsPerFile),
+    maxTotalEvents: bounded(options.maxTotalEvents, UNBOUNDED_TIMELINE_OPTIONS.maxTotalEvents),
+    maxWarnings: bounded(options.maxWarnings, UNBOUNDED_TIMELINE_OPTIONS.maxWarnings),
+  };
+}
+
+export function selectTimelineGoals(goals: GoalRecord[], maxGoals: number): GoalRecord[] {
+  if (!Number.isFinite(maxGoals) || goals.length <= maxGoals) return [...goals];
+  const priority = (goal: GoalRecord) => {
+    if (goal.status === "running") return 4;
+    if (goal.status === "ready") return 3;
+    if (goal.blocker_ids.length > 0 || goal.queue_state === "blocked") return 2;
+    return 1;
+  };
+  const timestamp = (goal: GoalRecord) => Math.max(
+    0,
+    ...goal.sources.map((source) => source.timestamp ? Date.parse(source.timestamp) || 0 : 0),
+  );
+  return [...goals]
+    .sort((a, b) => priority(b) - priority(a) || timestamp(b) - timestamp(a) || a.goal_id.localeCompare(b.goal_id))
+    .slice(0, maxGoals);
 }
 
 export function buildRuntimeAlerts(snapshot: RuntimeSnapshot, timeline: TimelineResponse): AlertResponse {
@@ -238,7 +320,7 @@ export function buildRuntimeAlerts(snapshot: RuntimeSnapshot, timeline: Timeline
   }
 
   for (const process of snapshot.processes) {
-    if (process.role !== "unrelated" && !process.owner_goal_id && !process.service_unit) {
+    if (isProvenHermesAgent(process) && !process.owner_goal_id && !process.service_unit) {
       alerts.push({
         id: `process-owner:${process.pid}`,
         goal_id: null,
@@ -265,14 +347,15 @@ export function buildRuntimeAlerts(snapshot: RuntimeSnapshot, timeline: Timeline
     });
   }
 
+  const deduped = dedupeAlerts(alerts);
   return {
     timestamp: snapshot.timestamp,
-    alerts: dedupeAlerts(alerts),
+    alerts: deduped,
     summary: {
-      total: alerts.length,
-      critical: alerts.filter((alert) => alert.severity === "critical").length,
-      warning: alerts.filter((alert) => alert.severity === "warning").length,
-      info: alerts.filter((alert) => alert.severity === "info").length,
+      total: deduped.length,
+      critical: deduped.filter((alert) => alert.severity === "critical").length,
+      warning: deduped.filter((alert) => alert.severity === "warning").length,
+      info: deduped.filter((alert) => alert.severity === "info").length,
     },
   };
 }
@@ -282,6 +365,8 @@ async function readNativeRunEvents(
   fsAdapter: FsAdapter,
   goal: GoalRecord,
   warnings: TimelineResponse["warnings"],
+  bounds: ReturnType<typeof normalizeTimelineOptions>,
+  truncation: { value: boolean },
 ): Promise<RuntimeEvent[]> {
   const runDir = path.join(nativeRoot, "runs", goal.goal_id);
   let entries: string[];
@@ -290,7 +375,11 @@ async function readNativeRunEvents(
   } catch {
     return []; // No native events directory — normal during migration
   }
-  const eventFiles = entries.filter((entry) => entry.endsWith(".jsonl")).sort();
+  const allEventFiles = entries.filter((entry) => entry.endsWith(".jsonl")).sort(compareEventFileNames);
+  const eventFiles = Number.isFinite(bounds.maxEventFilesPerGoal)
+    ? allEventFiles.slice(-bounds.maxEventFilesPerGoal)
+    : allEventFiles;
+  if (eventFiles.length < allEventFiles.length) truncation.value = true;
   const events: RuntimeEvent[] = [];
   for (const file of eventFiles) {
     const source = path.join(runDir, file);
@@ -304,8 +393,10 @@ async function readNativeRunEvents(
       warnings.push({ source, message: "native run event source unreadable" });
       continue;
     }
-    body.split("\n").forEach((line, index) => {
-      if (!line.trim()) return;
+    const allLines = body.split("\n").filter((line) => line.trim());
+    const lines = Number.isFinite(bounds.maxRowsPerFile) ? allLines.slice(-bounds.maxRowsPerFile) : allLines;
+    if (lines.length < allLines.length) truncation.value = true;
+    lines.forEach((line, index) => {
       try {
         const raw = JSON.parse(line) as Record<string, unknown>;
         const type = normalizeEventType(raw.type ?? raw.event ?? raw.name);
@@ -338,6 +429,8 @@ async function readNativeControllerEvents(
   nativeRoot: string,
   fsAdapter: FsAdapter,
   warnings: TimelineResponse["warnings"],
+  maxRows: number = Number.POSITIVE_INFINITY,
+  truncation: { value: boolean } = { value: false },
 ): Promise<RuntimeEvent[]> {
   const source = path.join(nativeRoot, "controller-events.jsonl");
   let body: string;
@@ -350,8 +443,10 @@ async function readNativeControllerEvents(
     return [];
   }
   const events: RuntimeEvent[] = [];
-  body.split("\n").forEach((line, index) => {
-    if (!line.trim()) return;
+  const allLines = body.split("\n").filter((line) => line.trim());
+  const lines = Number.isFinite(maxRows) ? allLines.slice(-maxRows) : allLines;
+  if (lines.length < allLines.length) truncation.value = true;
+  lines.forEach((line, index) => {
     try {
       const raw = JSON.parse(line) as Record<string, unknown>;
       const type = normalizeEventType(raw.type ?? raw.event ?? raw.name);
@@ -388,6 +483,8 @@ async function readGoalRunEvents(
   fsAdapter: FsAdapter,
   goal: GoalRecord,
   warnings: TimelineResponse["warnings"],
+  bounds: ReturnType<typeof normalizeTimelineOptions>,
+  truncation: { value: boolean },
 ): Promise<RuntimeEvent[]> {
   const runRoot = path.join(roots.chatDevRoot, "runs", goal.goal_id);
   let entries: string[];
@@ -397,7 +494,11 @@ async function readGoalRunEvents(
     warnings.push({ source: runRoot, message: "run event directory missing or unreadable" });
     return [];
   }
-  const eventFiles = entries.filter((entry) => entry.endsWith("-events.jsonl") || entry.endsWith("events.jsonl")).sort();
+  const allEventFiles = entries.filter((entry) => entry.endsWith("-events.jsonl") || entry.endsWith("events.jsonl")).sort(compareEventFileNames);
+  const eventFiles = Number.isFinite(bounds.maxEventFilesPerGoal)
+    ? allEventFiles.slice(-bounds.maxEventFilesPerGoal)
+    : allEventFiles;
+  if (eventFiles.length < allEventFiles.length) truncation.value = true;
   const events: RuntimeEvent[] = [];
   for (const file of eventFiles) {
     const source = path.join(runRoot, file);
@@ -411,8 +512,10 @@ async function readGoalRunEvents(
       warnings.push({ source, message: "run event source unreadable" });
       continue;
     }
-    body.split("\n").forEach((line, index) => {
-      if (!line.trim()) return;
+    const allLines = body.split("\n").filter((line) => line.trim());
+    const lines = Number.isFinite(bounds.maxRowsPerFile) ? allLines.slice(-bounds.maxRowsPerFile) : allLines;
+    if (lines.length < allLines.length) truncation.value = true;
+    lines.forEach((line, index) => {
       try {
         const raw = JSON.parse(line) as Record<string, unknown>;
         const type = normalizeEventType(raw.type ?? raw.event ?? raw.name);
@@ -439,6 +542,16 @@ async function readGoalRunEvents(
     });
   }
   return events;
+}
+
+function compareEventFileNames(a: string, b: string): number {
+  const attempt = (name: string) => Number.parseInt(name.match(/attempt-(\d+)/)?.[1] ?? "", 10);
+  const aAttempt = attempt(a);
+  const bAttempt = attempt(b);
+  if (Number.isFinite(aAttempt) && Number.isFinite(bAttempt) && aAttempt !== bAttempt) {
+    return aAttempt - bAttempt;
+  }
+  return a.localeCompare(b);
 }
 
 function goalStateEvent(goal: GoalRecord, type: "goal.completed" | "goal.failed", source: string, sourceTimestamp: string | null): RuntimeEvent {

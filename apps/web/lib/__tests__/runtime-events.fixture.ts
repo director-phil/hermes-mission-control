@@ -23,9 +23,9 @@ test("normalises immutable run JSONL events with source timestamps", async () =>
 
 test("alerts cite stale locks, missing controllers, dirty terminal worktrees and orphan processes", async () => {
   const runtime = await buildRuntimeSnapshot(roots, adapters({
-    "/fixture/proc/222/status": "Name:\tfastmcp\nPPid:\t1\nVmRSS:\t100 kB\n",
-    "/fixture/proc/222/stat": "222 (fastmcp) S 1 0 0 0 0 0 0 0 0 0 1 1 0 0 20 0 1 0 1000 0 0",
-    "/fixture/proc/222/cmdline": "fastmcp\0",
+    "/fixture/proc/222/status": "Name:\tpython3\nPPid:\t1\nVmRSS:\t100 kB\n",
+    "/fixture/proc/222/stat": "222 (python3) S 1 0 0 0 0 0 0 0 0 0 1 1 0 0 20 0 1 0 1000 0 0",
+    "/fixture/proc/222/cmdline": "python3\0bridge/escalate.py\0run\0orphan-goal\0",
     "/fixture/LegacyRuntime/goals/state/goal-b.json": JSON.stringify({ id: "goal-b", status: "running", controller_pid: 999, worktree: "/fixture/repo" }),
     "/fixture/LegacyRuntime/goals/state/goal-b.lock": "999",
     "/fixture/LegacyRuntime/goals/state/goal-c.json": JSON.stringify({ id: "goal-c", status: "failed", worktree: "/fixture/LegacyRuntime/dirty" }),
@@ -127,6 +127,38 @@ test("alert payloads redact synthetic secrets from source warnings", async () =>
   assert.equal(serialized.includes(secret), false);
   assert.equal(serialized.includes("private-output"), false);
   assert.equal(serialized.includes("TOKEN"), false);
+});
+
+
+test("bounded timeline limits goal and event reads before returning data", async () => {
+  const files = {
+    "/fixture/LegacyRuntime/goals/state/goal-complete.json": JSON.stringify({ id: "goal-complete", status: "completed" }),
+    "/fixture/LegacyRuntime/goals/state/goal-running.json": JSON.stringify({ id: "goal-running", status: "running" }),
+    "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    "/fixture/LegacyRuntime/runs/goal-complete/attempt-1-events.jsonl": JSON.stringify({ type: "goal.completed", timestamp: "2026-08-04T09:00:00.000Z" }),
+    "/fixture/LegacyRuntime/runs/goal-running/attempt-1-events.jsonl": JSON.stringify({ type: "agent.started", timestamp: "2026-08-04T09:10:00.000Z" }),
+    "/fixture/LegacyRuntime/runs/goal-running/attempt-2-events.jsonl": JSON.stringify({ type: "acceptance.started", timestamp: "2026-08-04T09:20:00.000Z" }),
+    "/fixture/LegacyRuntime/runs/goal-running/attempt-10-events.jsonl": [
+      JSON.stringify({ type: "acceptance.started", timestamp: "2026-08-04T09:25:00.000Z" }),
+      JSON.stringify({ type: "review.passed", timestamp: "2026-08-04T09:30:00.000Z" }),
+    ].join("\n"),
+  };
+  const runtime = await buildRuntimeSnapshot(roots, adapters(files));
+  const timeline = await buildRuntimeTimeline(roots, adapters(files), runtime, {
+    maxGoals: 1,
+    maxEventFilesPerGoal: 1,
+    maxRowsPerFile: 1,
+    maxTotalEvents: 1,
+    maxWarnings: 10,
+  });
+
+  assert.ok((timeline.metadata?.goals_available ?? 0) >= 2);
+  assert.equal(timeline.metadata?.goals_scanned, 1);
+  assert.equal(timeline.metadata?.has_more_goals, true);
+  assert.equal(timeline.metadata?.events_returned, 1);
+  assert.equal(timeline.metadata?.has_more_events, true);
+  assert.deepEqual(timeline.events.map((event) => event.goal_id), ["goal-running"]);
+  assert.deepEqual(timeline.events.map((event) => event.type), ["review.passed"]);
 });
 
 function adapters(files: Record<string, string>, dirty = false): RuntimeAdapters {

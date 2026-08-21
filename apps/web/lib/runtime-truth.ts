@@ -299,7 +299,7 @@ export async function buildRuntimeSnapshot(
     process.owner_goal_id = ownerByPid.get(process.pid) ?? inferGoalFromArgv(redactedArgv(process), goals);
     process.service_unit = serviceByPid.get(process.pid) ?? serviceFromCgroup(process, services);
     process.role = classifyProcess(process);
-    process.orphan = process.role !== "unrelated" && !process.owner_goal_id && !process.service_unit;
+    process.orphan = isProvenHermesAgent(process) && !process.owner_goal_id && !process.service_unit;
   }
 
   for (const goal of goals) {
@@ -875,14 +875,49 @@ async function readQueueStatus(roots: RuntimeRoots, adapters: RuntimeAdapters): 
     const body = await adapters.fs.readFile(source);
     const data = JSON.parse(body) as Record<string, unknown>;
     const statusByGoal = new Map<string, GoalRecord["queue_state"]>();
+
+    // Legacy shape support: { goals: { <id>: <state> } }
     const goals = data.goals;
     if (goals && typeof goals === "object") {
       for (const [goalId, state] of Object.entries(goals as Record<string, unknown>)) {
         statusByGoal.set(goalId, normalizeQueueState(stringValue(state) ?? stringValue((state as Record<string, unknown>)?.status)));
       }
     }
+
+    // Current queue-runner shape support: active[], controller_pids[], up_next[], blocked[], counts{}
+    const active = Array.isArray(data.active) ? data.active : [];
+    for (const value of active) {
+      const goalId = stringValue(value);
+      if (goalId) statusByGoal.set(goalId, "running");
+    }
+
+    const controllerPids = Array.isArray(data.controller_pids) ? data.controller_pids : [];
+    const upNext = Array.isArray(data.up_next) ? data.up_next : [];
+
+    const counts = (data.counts && typeof data.counts === "object")
+      ? (data.counts as Record<string, unknown>)
+      : null;
+    const blockedCount = counts ? numberValue(counts.blocked) ?? 0 : 0;
+    const heldCount = counts ? numberValue(counts.held) ?? 0 : 0;
+    const hardStopCount = counts ? numberValue(counts.hard_stop) ?? 0 : 0;
+    const invalidCount = counts ? numberValue(counts.invalid) ?? 0 : 0;
+    const blockingTotal = blockedCount + heldCount + hardStopCount + invalidCount;
+
+    const explicitStatus = normalizeQueueState(stringValue(data.status));
+    const global: GoalRecord["queue_state"] = data.paused === true
+      ? "paused"
+      : active.length > 0 || controllerPids.length > 0
+        ? "running"
+        : explicitStatus !== "unknown"
+          ? explicitStatus
+          : blockingTotal > 0
+            ? "blocked"
+            : upNext.length > 0
+              ? "ready"
+              : "unknown";
+
     return {
-      global: data.paused === true ? "paused" : normalizeQueueState(stringValue(data.status)),
+      global,
       focus_goal_id: stringValue(data.focus_goal_id) ?? stringValue(data.focus),
       statusByGoal,
       warning: null,
@@ -965,15 +1000,52 @@ async function readWorktreeSource(worktreePath: string, roots: RuntimeRoots, ada
   return { worktree: await readWorktree(worktreePath, adapters, roots), warning: null };
 }
 
-function classifyProcess(process: ProcessRecord): ProcessRole {
+// Known Hermes systemd services that should be counted as agents
+const HERMES_SYSTEMD_UNITS = new Set<string>([
+  "hermes-native-goal-runner.service",
+]);
+
+export function isProvenHermesAgent(process: ProcessRecord): boolean {
+  const role = process.role;
+
+  if (role === "controller") return true;
+
+  // Wrappers, children, and model servers are agents only with explicit goal or
+  // dedicated Hermes service ownership. Executable-name similarity is not proof.
+  if (role === "wrapper" || role === "child" || role === "model_server") {
+    return Boolean(process.owner_goal_id)
+      || (process.service_unit ? HERMES_SYSTEMD_UNITS.has(process.service_unit) : false);
+  }
+
+  if (role === "systemd_service") {
+    return process.service_unit ? HERMES_SYSTEMD_UNITS.has(process.service_unit) : false;
+  }
+
+  return false;
+}
+
+export function classifyProcess(process: ProcessRecord): ProcessRole {
   const argv = redactedArgv(process).join(" ").toLowerCase();
   const name = process.name.toLowerCase();
+
+  // Controller: Hermes native goal runner
   if (argv.includes("bridge/escalate.py") && argv.includes(" run ")) return "controller";
   if (argv.includes("hermes_native_goal_runner.py") || process.service_unit === "hermes-native-goal-runner.service") return "controller";
+
+  // Wrapper: FastMCP or MCP server owned by a goal
   if (argv.includes("fastmcp") || argv.includes("mcp-server")) return process.owner_goal_id ? "wrapper" : "wrapper";
+
+  // Model server: Ollama, vLLM, or llama-server
   if (name.includes("ollama") || name.includes("vllm") || argv.includes("llama-server")) return "model_server";
+
+  // Child: Process owned by a goal and has a parent PID > 1
   if (process.owner_goal_id && process.ppid > 1) return "child";
+
+  // Systemd service: Any process with a systemd unit (we track all systemd services)
+  // The filtering of which ones count as "agents" happens in agent-capacity endpoint
   if (process.service_unit) return "systemd_service";
+
+  // Unrelated: No proven Hermes identity and no systemd ownership
   return "unrelated";
 }
 

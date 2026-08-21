@@ -1,212 +1,125 @@
-/**
- * S2 — System Health Live Evidence
- *
- * Probes all 9 operational systems with real health checks.
- * Returns status (healthy/warning/critical/pending), metric, and evidence timestamp.
- * A critical dependency makes global health critical.
- */
-
+import { readFile } from "node:fs/promises";
 import { NextResponse } from "next/server";
 
+export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 30;
+export const maxDuration = 5;
 
-export async function GET(): Promise<NextResponse> {
-  return NextResponse.json(await fetchSystemHealth());
-}
+type Status = "healthy" | "warning" | "critical" | "pending";
+type SystemResult = { name: string; status: Status; metric: string | null; last_checked: string };
 
-/**
- * Core health check logic.
- */
-async function fetchSystemHealth() {
-  const now = new Date().toISOString();
+const CHECK_TIMEOUT_MS = 2_500;
+const OVERALL_TIMEOUT_MS = 3_500;
 
-  const results = await Promise.allSettled([
-    safeCheck(checkGB10(1), "GB10 #1", 5000),
-    safeCheck(checkGB10(2), "GB10 #2", 5000),
-    safeCheck(checkHermes(), "Hermes", 5000),
-    safeCheck(checkQdrant(), "Qdrant", 5000),
-    safeCheck(checkRailway(), "Railway", 8000),
-    safeCheck(checkVercel(), "Vercel", 8000),
-    safeCheck(checkGitHub(), "GitHub", 8000),
-    safeCheck(checkServiceTitan(), "ServiceTitan", 8000),
-    safeCheck(checkXero(), "Xero", 8000),
-  ]);
+export async function GET() {
+  const timestamp = new Date().toISOString();
+  const checks: Array<[string, Promise<SystemResult>]> = [
+    ["GB10 #1", checkModelSeat("GB10 #1", "gb10-box-1")],
+    ["GB10 #2", checkModelSeat("GB10 #2", "gb10-box-2")],
+    ["Hermes admission", checkJsonEndpoint("Hermes admission", "http://127.0.0.1:19875/healthz")],
+    ["Qdrant", checkJsonEndpoint("Qdrant", "http://127.0.0.1:6333/collections")],
+    ["Goal Conveyor", checkGoalConveyor()],
+    ["Vercel", checkReachability("Vercel", "https://vercel.com/docs/rest-api", "HEAD")],
+    ["GitHub", checkGitHub()],
+    ["ServiceTitan", checkReachability("ServiceTitan", "https://auth.servicetitan.com/oauth2/token", "HEAD")],
+    ["Xero", checkReachability("Xero", "https://api.xero.com/timezones", "GET")],
+  ];
 
-  const systems = results.map((r, i) => {
-    if (r.status === "fulfilled" && r.value) {
-      return {
-        name: r.value.name,
-        status: r.value.status,
-        metric: r.value.metric ?? null,
-        last_checked: r.value.last_checked || now,
-      };
-    }
-    return {
-      name: r.status === "fulfilled" && r.value ? r.value.name : `System ${i + 1}`,
-      status: "pending",
-      metric: null,
-      last_checked: now,
-    };
-  });
-
+  const systems = await Promise.all(checks.map(([name, check]) => bounded(check, name)));
   const globalStatus = determineGlobal(systems);
-
-  return {
-    timestamp: now,
+  return NextResponse.json({
+    timestamp,
     global_status: globalStatus,
     systems,
     total: systems.length,
-    healthy: systems.filter((s) => s.status === "healthy").length,
-    warning: systems.filter((s) => s.status === "warning").length,
-    critical: systems.filter((s) => s.status === "critical").length,
-    pending: systems.filter((s) => s.status === "pending").length,
-  };
+    healthy: systems.filter((system) => system.status === "healthy").length,
+    warning: systems.filter((system) => system.status === "warning").length,
+    critical: systems.filter((system) => system.status === "critical").length,
+    pending: systems.filter((system) => system.status === "pending").length,
+  });
 }
 
-/* ── Health check functions ────────────────────────────────────── */
-
-async function checkGB10(num: number) {
-  const host = num === 1 ? "gb10-1.local" : "gb10-2.local";
+async function checkModelSeat(name: string, host: string): Promise<SystemResult> {
   try {
-    const res = await fetch(`http://${host}/health`, {
-      signal: AbortSignal.timeout(3000),
-    });
-    if (res.ok) {
-      return { name: `GB10 #${num}`, status: "healthy", metric: `${res.status} OK`, last_checked: new Date().toISOString() };
-    }
-    return { name: `GB10 #${num}`, status: "warning", metric: `${res.status}`, last_checked: new Date().toISOString() };
+    const response = await fetch(`http://${host}:1234/v1/models`, { signal: AbortSignal.timeout(CHECK_TIMEOUT_MS) });
+    if (!response.ok) return result(name, "warning", `HTTP ${response.status}`);
+    const body = await response.json() as { data?: Array<{ id?: string }> };
+    return result(name, "healthy", `${body.data?.length ?? 0} model IDs observed`);
   } catch {
-    return { name: `GB10 #${num}`, status: "pending", metric: null, last_checked: new Date().toISOString() };
+    return result(name, "pending", "model endpoint unreachable");
   }
 }
 
-async function checkHermes() {
+async function checkJsonEndpoint(name: string, url: string): Promise<SystemResult> {
   try {
-    const res = await fetch("http://localhost:1234/v1/models", {
-      signal: AbortSignal.timeout(3000),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      return { name: "Hermes", status: "healthy", metric: `${data.data?.length ?? 0} models loaded`, last_checked: new Date().toISOString() };
-    }
-    return { name: "Hermes", status: "warning", metric: `${res.status}`, last_checked: new Date().toISOString() };
+    const response = await fetch(url, { signal: AbortSignal.timeout(CHECK_TIMEOUT_MS) });
+    if (!response.ok) return result(name, "warning", `HTTP ${response.status}`);
+    await response.json();
+    return result(name, "healthy", `HTTP ${response.status}`);
   } catch {
-    return { name: "Hermes", status: "pending", metric: null, last_checked: new Date().toISOString() };
+    return result(name, "pending", "endpoint unreachable");
   }
 }
 
-async function checkQdrant() {
+async function checkGoalConveyor(): Promise<SystemResult> {
+  const source = "/home/phillip_downs/ChatDev/goals/state/queue-runner-status.json";
   try {
-    const res = await fetch("http://localhost:6333/health", {
-      signal: AbortSignal.timeout(3000),
-    });
-    if (res.ok) {
-      const text = await res.text();
-      return { name: "Qdrant", status: "healthy", metric: text || "healthy", last_checked: new Date().toISOString() };
-    }
-    return { name: "Qdrant", status: "warning", metric: `${res.status}`, last_checked: new Date().toISOString() };
+    const body = JSON.parse(await readFile(source, "utf8")) as {
+      conveyor_on?: boolean;
+      active?: unknown[];
+      counts?: Record<string, number>;
+    };
+    const blocked = ["held", "blocked", "hard_stop", "invalid"]
+      .reduce((sum, key) => sum + (Number(body.counts?.[key]) || 0), 0);
+    const active = Array.isArray(body.active) ? body.active.length : 0;
+    return result("Goal Conveyor", body.conveyor_on ? "healthy" : "warning", `${active} active; ${blocked} held/blocked`);
   } catch {
-    return { name: "Qdrant", status: "pending", metric: null, last_checked: new Date().toISOString() };
+    return result("Goal Conveyor", "pending", "queue status unreadable");
   }
 }
 
-async function checkRailway() {
+async function checkReachability(name: string, url: string, method: "GET" | "HEAD"): Promise<SystemResult> {
   try {
-    const res = await fetch("https://railway.app/health", {
-      signal: AbortSignal.timeout(8000),
-    });
-    return { name: "Railway", status: res.ok ? "healthy" : "warning", metric: `${res.status}`, last_checked: new Date().toISOString() };
+    const response = await fetch(url, { method, signal: AbortSignal.timeout(CHECK_TIMEOUT_MS) });
+    const reachable = response.status > 0 && response.status < 500;
+    return result(name, "pending", reachable ? `HTTP ${response.status}; integration unverified` : `HTTP ${response.status}`);
   } catch {
-    return { name: "Railway", status: "pending", metric: null, last_checked: new Date().toISOString() };
+    return result(name, "pending", "endpoint unreachable; integration unverified");
   }
 }
 
-async function checkVercel() {
+async function checkGitHub(): Promise<SystemResult> {
   try {
-    const res = await fetch("https://vercel.com/docs/rest-api", {
-      method: "HEAD",
-      signal: AbortSignal.timeout(8000),
-    });
-    return { name: "Vercel", status: res.ok || res.status === 401 || res.status === 403 ? "healthy" : "warning", metric: `${res.status}`, last_checked: new Date().toISOString() };
+    const response = await fetch("https://www.githubstatus.com/api/v2/status.json", { signal: AbortSignal.timeout(CHECK_TIMEOUT_MS) });
+    if (!response.ok) return result("GitHub", "pending", `HTTP ${response.status}`);
+    const body = await response.json() as { status?: { indicator?: string; description?: string } };
+    const indicator = body.status?.indicator ?? "unknown";
+    return result("GitHub", indicator === "none" ? "healthy" : "warning", body.status?.description ?? indicator);
   } catch {
-    return { name: "Vercel", status: "pending", metric: null, last_checked: new Date().toISOString() };
+    return result("GitHub", "pending", "status endpoint unreachable");
   }
 }
 
-async function checkGitHub() {
-  try {
-    const res = await fetch("https://api.github.com/status", {
-      signal: AbortSignal.timeout(8000),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      return { name: "GitHub", status: data.status === "major" ? "warning" : "healthy", metric: data.status || "operational", last_checked: new Date().toISOString() };
-    }
-    return { name: "GitHub", status: "warning", metric: `${res.status}`, last_checked: new Date().toISOString() };
-  } catch {
-    return { name: "GitHub", status: "pending", metric: null, last_checked: new Date().toISOString() };
-  }
-}
-
-async function checkServiceTitan() {
-  try {
-    const res = await fetch("https://auth.servicetitan.com/oauth2/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        grant_type: "client_credentials",
-        client_id: process.env.ST_CLIENT_ID || "",
-        client_secret: process.env.ST_CLIENT_SECRET || "",
-      }),
-      signal: AbortSignal.timeout(8000),
-    });
-    if (res.status === 401 || res.status === 400 || res.status === 403) {
-      return { name: "ServiceTitan", status: "healthy", metric: `${res.status} (auth endpoint reachable)`, last_checked: new Date().toISOString() };
-    }
-    return { name: "ServiceTitan", status: "warning", metric: `${res.status}`, last_checked: new Date().toISOString() };
-  } catch {
-    return { name: "ServiceTitan", status: "pending", metric: null, last_checked: new Date().toISOString() };
-  }
-}
-
-async function checkXero() {
-  try {
-    const res = await fetch("https://api.xero.com/timezones", {
-      headers: { "Accept": "application/json" },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (res.status === 401 || res.status === 403) {
-      return { name: "Xero", status: "healthy", metric: `${res.status} (auth required)`, last_checked: new Date().toISOString() };
-    }
-    if (res.ok) return { name: "Xero", status: "healthy", metric: `${res.status}`, last_checked: new Date().toISOString() };
-    return { name: "Xero", status: "warning", metric: `${res.status}`, last_checked: new Date().toISOString() };
-  } catch {
-    return { name: "Xero", status: "pending", metric: null, last_checked: new Date().toISOString() };
-  }
-}
-
-/* ── Helper: wrap a check with timeout, never throw ────────────── */
-
-async function safeCheck<T extends Promise<any>>(promise: T, name: string, timeoutMs: number): Promise<{ name: string; status: string; metric: string | null; last_checked: string } | null> {
+async function bounded(check: Promise<SystemResult>, name: string): Promise<SystemResult> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      promise,
-      new Promise<null>((_, reject) => {
-        setTimeout(() => reject(new Error(`Timeout after ${timeoutMs}ms`)), timeoutMs);
+      check,
+      new Promise<SystemResult>((resolve) => {
+        timer = setTimeout(() => resolve(result(name, "pending", "check timed out")), OVERALL_TIMEOUT_MS);
       }),
     ]);
-  } catch {
-    return { name, status: "pending", metric: null, last_checked: new Date().toISOString() };
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
-function determineGlobal(systems: Array<{ status: string }>): string {
-  const hasCritical = systems.some((s) => s.status === "critical");
-  if (hasCritical) return "critical";
-  const hasWarning = systems.some((s) => s.status === "warning");
-  if (hasWarning) return "warning";
-  const allPending = systems.every((s) => s.status === "pending");
-  if (allPending) return "pending";
+function result(name: string, status: Status, metric: string | null): SystemResult {
+  return { name, status, metric, last_checked: new Date().toISOString() };
+}
+
+function determineGlobal(systems: SystemResult[]): Status {
+  if (systems.some((system) => system.status === "critical")) return "critical";
+  if (systems.some((system) => system.status === "warning" || system.status === "pending")) return "warning";
   return "healthy";
 }

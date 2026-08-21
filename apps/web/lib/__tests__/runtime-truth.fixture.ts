@@ -3,6 +3,7 @@ import path from "node:path";
 import { test } from "node:test";
 import {
   buildRuntimeSnapshot,
+  isProvenHermesAgent,
   parseProcStat,
   readWorktree,
   redactArgv,
@@ -46,7 +47,7 @@ test("stale running goal and stale controller lock stay warning evidence", async
   assert.equal(goal?.sources.some((source) => source.status === "warning"), true);
 });
 
-test("orphan wrapper is detected when no goal or systemd owner exists", async () => {
+test("unowned wrapper is observed without false agent-orphan classification", async () => {
   const snapshot = await buildRuntimeSnapshot(roots, adapters({
     files: {
       "/fixture/proc/222/status": status("fastmcp", 1, 64),
@@ -56,7 +57,7 @@ test("orphan wrapper is detected when no goal or systemd owner exists", async ()
     },
   }));
   assert.equal(snapshot.processes[0]?.role, "wrapper");
-  assert.equal(snapshot.processes[0]?.orphan, true);
+  assert.equal(snapshot.processes[0]?.orphan, false);
 });
 
 test("manual native goal runner process is controller evidence", async () => {
@@ -499,6 +500,14 @@ function commandAdapter({
       if (file === "systemctl" && args[1] === "show") {
         const unit = args[2];
         const isHermesNative = unit === "hermes-native-goal-runner.service";
+        // Return MainPID based on the process PID that's being tested
+        // For generic services, use a deterministic mapping: pid 503 -> main_pid 503
+        let mainPid = 0;
+        if (unit === "generic-service.service") {
+          mainPid = 503;
+        } else if (isHermesNative) {
+          mainPid = 502;
+        }
         return {
           ok: true,
           stdout: [
@@ -506,12 +515,14 @@ function commandAdapter({
             "ActiveState=active",
             "SubState=running",
             `Description=${unit}`,
-            isHermesNative ? "MainPID=502" : "MainPID=0",
+            mainPid ? `MainPID=${mainPid}` : "MainPID=0",
             unit === "custom-worker.service"
               ? "ControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/custom-worker.service"
               : isHermesNative
                 ? "ControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/hermes-native-goal-runner.service"
-                : "ControlGroup=",
+                : unit === "generic-service.service"
+                  ? "ControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/generic-service.service"
+                  : "ControlGroup=",
           ].join("\n"),
           stderr: "",
           code: 0,
@@ -554,3 +565,146 @@ echo test
 \`\`\`
 `;
 }
+
+// isProvenHermesAgent tests
+test("isProvenHermesAgent returns false for generic systemd_service", async () => {
+  const snapshot = await buildRuntimeSnapshot(roots, adapters({
+    files: {
+      "/fixture/proc/503/status": status("generic-service", 1, 100),
+      "/fixture/proc/503/stat": stat(503, "generic-service", 1),
+      "/fixture/proc/503/cmdline": cmd("generic-service"),
+      "/fixture/proc/503/cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/generic-service.service/runtime\n",
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    },
+    systemctlUnits: ["generic-service.service"],
+  }));
+
+  const process = snapshot.processes.find((p) => p.pid === 503);
+  assert.ok(process, "process should exist");
+  // generic systemd_service without hermes-specific unit should have service_unit set but not be a proven agent
+  assert.equal(process.role, "systemd_service", "process role should be systemd_service");
+  assert.equal(isProvenHermesAgent(process), false, "generic systemd_service should not be a proven Hermes agent");
+});
+
+test("isProvenHermesAgent returns true for hermes-native-goal-runner.service", async () => {
+  const snapshot = await buildRuntimeSnapshot(roots, adapters({
+    files: {
+      "/fixture/proc/504/status": status("python3", 1, 1200),
+      "/fixture/proc/504/stat": stat(504, "python3", 1),
+      "/fixture/proc/504/cmdline": cmd("/usr/bin/env", "python3", "/home/phillip_downs/Documents/GitHub/hermes-mission-control/scripts/hermes_native_goal_runner.py"),
+      "/fixture/proc/504/cgroup": "0::/user.slice/user-1000.slice/user@1000.service/app.slice/hermes-native-goal-runner.service/runtime\n",
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    },
+    systemctlUnits: ["hermes-native-goal-runner.service"],
+  }));
+
+  const process = snapshot.processes.find((p) => p.pid === 504);
+  assert.ok(process, "process should exist");
+  assert.equal(process.role, "controller", "hermes native goal runner should be controller role");
+  assert.equal(process.service_unit, "hermes-native-goal-runner.service", "should have correct service unit");
+  assert.equal(isProvenHermesAgent(process), true, "hermes-native-goal-runner.service should be a proven Hermes agent");
+});
+
+test("isProvenHermesAgent returns true for controller processes", async () => {
+  const snapshot = await buildRuntimeSnapshot(roots, adapters({
+    files: {
+      "/fixture/proc/505/status": status("python3", 1, 1200),
+      "/fixture/proc/505/stat": stat(505, "python3", 1),
+      "/fixture/proc/505/cmdline": cmd("python3", "bridge/escalate.py", "run", "goal-ctrl"),
+      "/fixture/LegacyRuntime/goals/state/goal-ctrl.json": JSON.stringify({ id: "goal-ctrl", status: "running", controller_pid: 505 }),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    },
+  }));
+
+  const process = snapshot.processes.find((p) => p.pid === 505);
+  assert.ok(process, "process should exist");
+  assert.equal(process.role, "controller", "should be controller role");
+  assert.equal(isProvenHermesAgent(process), true, "controller should be a proven Hermes agent");
+});
+
+test("isProvenHermesAgent includes goal-owned wrapper processes", async () => {
+  const snapshot = await buildRuntimeSnapshot(roots, adapters({
+    files: {
+      "/fixture/proc/506/status": status("fastmcp", 1, 64),
+      "/fixture/proc/506/stat": stat(506, "fastmcp", 1),
+      "/fixture/proc/506/cmdline": cmd("fastmcp"),
+      "/fixture/LegacyRuntime/goals/state/goal-wrap.json": JSON.stringify({ id: "goal-wrap", status: "running", controller_pid: 506 }),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    },
+  }));
+
+  const process = snapshot.processes.find((p) => p.pid === 506);
+  assert.ok(process, "process should exist");
+  assert.equal(process.role, "wrapper", "should be wrapper role");
+  assert.equal(isProvenHermesAgent(process), true, "goal-owned wrapper is a proven Hermes agent");
+});
+
+test("isProvenHermesAgent excludes unowned wrapper processes", async () => {
+  const snapshot = await buildRuntimeSnapshot(roots, adapters({
+    files: {
+      "/fixture/proc/510/status": status("fastmcp", 1, 64),
+      "/fixture/proc/510/stat": stat(510, "fastmcp", 1),
+      "/fixture/proc/510/cmdline": cmd("fastmcp"),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    },
+  }));
+
+  const process = snapshot.processes.find((p) => p.pid === 510);
+  assert.ok(process, "process should exist");
+  assert.equal(process.role, "wrapper", "should be wrapper role");
+  assert.equal(isProvenHermesAgent(process), false, "unowned wrapper is not a proven Hermes agent");
+  assert.equal(process.orphan, false, "unowned wrapper must not create an agent orphan alert");
+});
+
+test("isProvenHermesAgent returns false for unrelated processes", async () => {
+  const snapshot = await buildRuntimeSnapshot(roots, adapters({
+    files: {
+      "/fixture/proc/507/status": status("unknown-app", 1, 64),
+      "/fixture/proc/507/stat": stat(507, "unknown-app", 1),
+      "/fixture/proc/507/cmdline": cmd("unknown-app"),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    },
+  }));
+
+  const process = snapshot.processes.find((p) => p.pid === 507);
+  assert.ok(process, "process should exist");
+  assert.equal(process.role, "unrelated", "should be unrelated role");
+  assert.equal(isProvenHermesAgent(process), false, "unrelated should not be a proven Hermes agent");
+});
+
+test("isProvenHermesAgent excludes unowned model server processes", async () => {
+  const snapshot = await buildRuntimeSnapshot(roots, adapters({
+    files: {
+      "/fixture/proc/508/status": status("ollama", 1, 64),
+      "/fixture/proc/508/stat": stat(508, "ollama", 1),
+      "/fixture/proc/508/cmdline": cmd("ollama"),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    },
+  }));
+
+  const process = snapshot.processes.find((p) => p.pid === 508);
+  assert.ok(process, "process should exist");
+  assert.equal(process.role, "model_server", "should be model_server role");
+  assert.equal(isProvenHermesAgent(process), false, "unowned model server is a seat, not a proven agent");
+  assert.equal(process.orphan, false, "unowned model seat must not create an agent orphan alert");
+});
+
+test("isProvenHermesAgent returns true for child processes", async () => {
+  const snapshot = await buildRuntimeSnapshot(roots, adapters({
+    files: {
+      "/fixture/proc/509/status": status("node", 100, 64),
+      "/fixture/proc/509/stat": stat(509, "node", 100),
+      "/fixture/proc/509/cmdline": cmd("node", "worker.js"),
+      "/fixture/LegacyRuntime/goals/state/goal-child.json": JSON.stringify({ id: "goal-child", status: "running", controller_pid: 100 }),
+      "/fixture/proc/100/status": status("python3", 1, 1200),
+      "/fixture/proc/100/stat": stat(100, "python3", 1),
+      "/fixture/proc/100/cmdline": cmd("python3", "bridge/escalate.py", "run", "goal-child"),
+      "/fixture/LegacyRuntime/goals/state/queue-runner-status.json": "{}",
+    },
+  }));
+
+  const process = snapshot.processes.find((p) => p.pid === 509);
+  assert.ok(process, "process should exist");
+  assert.equal(process.role, "child", "should be child role");
+  assert.equal(isProvenHermesAgent(process), true, "child should be a proven Hermes agent");
+});

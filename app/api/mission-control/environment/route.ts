@@ -1,49 +1,69 @@
-/**
- * S0 — Repo and Environment Guardrail
- *
- * Reads git metadata from the working directory and validates against the
- * allowlist. Returns the result so the UI can show the environment banner.
- */
-
+import { execFileSync } from "node:child_process";
 import { NextResponse } from "next/server";
 
+export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET() {
+  const timestamp = new Date().toISOString();
+  const environment = process.env.NODE_ENV ?? "development";
+  const explicitTarget = process.env.MC_DEPLOYMENT_TARGET;
+  const isVercel = Boolean(process.env.VERCEL) || Boolean(process.env.VERCEL_ENV);
+  const deploymentTarget = explicitTarget ?? (isVercel ? "vercel" : "local/standalone");
+
+  if (isVercel) {
+    const owner = process.env.VERCEL_GIT_REPO_OWNER ?? null;
+    const slug = process.env.VERCEL_GIT_REPO_SLUG ?? null;
+    const expectedOwner = process.env.MC_EXPECTED_REPO_OWNER ?? "director-phil";
+    const expectedSlug = process.env.MC_EXPECTED_REPO_SLUG ?? "hermes-mission-control";
+    const repoObserved = Boolean(owner && slug);
+    const repoAllowlisted = repoObserved && owner === expectedOwner && slug === expectedSlug;
+    return NextResponse.json({
+      repo_path: slug ? `vercel://${owner ?? "unknown"}/${slug}` : "vercel://unknown",
+      branch: process.env.VERCEL_GIT_COMMIT_REF ?? null,
+      remote: owner && slug ? `https://github.com/${owner}/${slug}.git` : null,
+      commit_sha: process.env.VERCEL_GIT_COMMIT_SHA ?? null,
+      environment,
+      deployment_target: deploymentTarget,
+      allowlist_status: repoAllowlisted ? "allowlisted" : "blocked",
+      source: "vercel-git-metadata",
+      error: repoObserved ? undefined : "Vercel Git metadata unavailable",
+      timestamp,
+    });
+  }
+
+  const cwd = process.cwd();
+  const allowedRepo = process.env.MC_ALLOWED_REPO ?? "";
   try {
-    const { execSync } = require("child_process");
-    const cwd = process.cwd();
-    
-    const branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd }).toString().trim();
-    const remote = execSync("git remote get-url origin", { cwd }).toString().trim();
-    const sha = execSync("git rev-parse HEAD", { cwd }).toString().trim();
-    const env = process.env.NODE_ENV ?? "development";
-    const allowedRepo = process.env.MC_ALLOWED_REPO ?? "";
-
-    const isAllowlisted =
-      allowedRepo && cwd === allowedRepo ? "allowlisted" : "blocked";
-
+    const git = (...args: string[]) => execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      timeout: 2_000,
+      windowsHide: true,
+    }).trim();
     return NextResponse.json({
       repo_path: cwd,
-      branch,
-      remote,
-      commit_sha: sha,
-      environment: env,
-      deployment_target: "railway",
-      allowlist_status: isAllowlisted,
-      timestamp: new Date().toISOString(),
+      branch: git("rev-parse", "--abbrev-ref", "HEAD"),
+      remote: git("remote", "get-url", "origin"),
+      commit_sha: git("rev-parse", "HEAD"),
+      environment,
+      deployment_target: deploymentTarget,
+      allowlist_status: allowedRepo && cwd === allowedRepo ? "allowlisted" : "blocked",
+      source: "local-git",
+      timestamp,
     });
-  } catch (err: any) {
+  } catch {
     return NextResponse.json({
-      repo_path: process.cwd(),
+      repo_path: cwd,
       branch: null,
       remote: null,
       commit_sha: null,
-      environment: process.env.NODE_ENV ?? "development",
-      deployment_target: "railway",
+      environment,
+      deployment_target: deploymentTarget,
       allowlist_status: "blocked",
+      source: "local-git",
       error: "Git metadata unavailable",
-      timestamp: new Date().toISOString(),
-    }, { status: 500 });
+      timestamp,
+    });
   }
 }
