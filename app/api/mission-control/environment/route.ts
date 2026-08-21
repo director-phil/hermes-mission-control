@@ -14,8 +14,10 @@ export async function GET() {
   if (isVercel) {
     const owner = process.env.VERCEL_GIT_REPO_OWNER ?? null;
     const slug = process.env.VERCEL_GIT_REPO_SLUG ?? null;
+    const expectedOwner = process.env.MC_EXPECTED_REPO_OWNER ?? "director-phil";
     const expectedSlug = process.env.MC_EXPECTED_REPO_SLUG ?? "hermes-mission-control";
-    const repoObserved = Boolean(slug);
+    const repoObserved = Boolean(owner && slug);
+    const repoAllowlisted = repoObserved && owner === expectedOwner && slug === expectedSlug;
     return NextResponse.json({
       repo_path: slug ? `vercel://${owner ?? "unknown"}/${slug}` : "vercel://unknown",
       branch: process.env.VERCEL_GIT_COMMIT_REF ?? null,
@@ -23,7 +25,7 @@ export async function GET() {
       commit_sha: process.env.VERCEL_GIT_COMMIT_SHA ?? null,
       environment,
       deployment_target: deploymentTarget,
-      allowlist_status: repoObserved && slug === expectedSlug ? "allowlisted" : "blocked",
+      allowlist_status: repoAllowlisted ? "allowlisted" : "blocked",
       source: "vercel-git-metadata",
       error: repoObserved ? undefined : "Vercel Git metadata unavailable",
       timestamp,
