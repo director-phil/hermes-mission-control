@@ -13,13 +13,26 @@ export async function GET() {
   try {
     const { execSync } = require("child_process");
     const cwd = process.cwd();
-    
+
     const branch = execSync("git rev-parse --abbrev-ref HEAD", { cwd }).toString().trim();
     const remote = execSync("git remote get-url origin", { cwd }).toString().trim();
     const sha = execSync("git rev-parse HEAD", { cwd }).toString().trim();
     const env = process.env.NODE_ENV ?? "development";
-    const allowedRepo = process.env.MC_ALLOWED_REPO ?? "";
 
+    // Derive deployment target from explicit environment variable, then Vercel detection
+    const explicitTarget = process.env.MC_DEPLOYMENT_TARGET;
+    const isVercel = Boolean(process.env.VERCEL) || Boolean(process.env.VERCEL_ENV);
+
+    let deploymentTarget: string;
+    if (explicitTarget) {
+      deploymentTarget = explicitTarget; // Explicit override via MC_DEPLOYMENT_TARGET
+    } else if (isVercel) {
+      deploymentTarget = "vercel";
+    } else {
+      deploymentTarget = "local/standalone"; // Default for Mission Control's canonical repo
+    }
+
+    const allowedRepo = process.env.MC_ALLOWED_REPO ?? "";
     const isAllowlisted =
       allowedRepo && cwd === allowedRepo ? "allowlisted" : "blocked";
 
@@ -29,21 +42,36 @@ export async function GET() {
       remote,
       commit_sha: sha,
       environment: env,
-      deployment_target: "railway",
+      deployment_target: deploymentTarget,
       allowlist_status: isAllowlisted,
       timestamp: new Date().toISOString(),
     });
   } catch (err: any) {
-    return NextResponse.json({
-      repo_path: process.cwd(),
-      branch: null,
-      remote: null,
-      commit_sha: null,
-      environment: process.env.NODE_ENV ?? "development",
-      deployment_target: "railway",
-      allowlist_status: "blocked",
-      error: "Git metadata unavailable",
-      timestamp: new Date().toISOString(),
-    }, { status: 500 });
+    const explicitTarget = process.env.MC_DEPLOYMENT_TARGET;
+    const isVercel = Boolean(process.env.VERCEL) || Boolean(process.env.VERCEL_ENV);
+
+    let deploymentTarget: string;
+    if (explicitTarget) {
+      deploymentTarget = explicitTarget;
+    } else if (isVercel) {
+      deploymentTarget = "vercel";
+    } else {
+      deploymentTarget = "local/standalone";
+    }
+
+    return NextResponse.json(
+      {
+        repo_path: process.cwd(),
+        branch: null,
+        remote: null,
+        commit_sha: null,
+        environment: process.env.NODE_ENV ?? "development",
+        deployment_target: deploymentTarget,
+        allowlist_status: "blocked",
+        error: "Git metadata unavailable",
+        timestamp: new Date().toISOString(),
+      },
+      { status: 500 }
+    );
   }
 }
