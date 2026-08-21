@@ -7,7 +7,7 @@
 
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 interface EnvData {
   repo_path: string | null;
@@ -24,33 +24,55 @@ interface EnvData {
 export default function EnvironmentBanner() {
   const [env, setEnv] = useState<EnvData | null>(null);
   const [loading, setLoading] = useState(true);
+  const inFlight = useRef(false);
 
   useEffect(() => {
-    fetch("/api/mission-control/environment")
-      .then((r) => r.json())
-      .then((data) => {
-        setEnv(data);
-        setLoading(false);
-      })
-      .catch(() => {
-        setEnv({
-          repo_path: null,
-          branch: null,
-          remote: null,
-          commit_sha: null,
-          environment: "unknown",
-          deployment_target: "unknown",
-          allowlist_status: "blocked",
-          error: "Failed to read environment",
-          timestamp: new Date().toISOString(),
+    let cancelled = false;
+
+    async function loadEnvironment() {
+      if (inFlight.current) return;
+      inFlight.current = true;
+      try {
+        const response = await fetch("/api/mission-control/environment", {
+          cache: "no-store",
         });
-        setLoading(false);
-      });
+        if (!response.ok) throw new Error(`Environment API ${response.status}`);
+        const data = (await response.json()) as EnvData;
+        if (!cancelled) {
+          setEnv(data);
+          setLoading(false);
+        }
+      } catch {
+        if (!cancelled) {
+          setEnv({
+            repo_path: null,
+            branch: null,
+            remote: null,
+            commit_sha: null,
+            environment: "unknown",
+            deployment_target: "unknown",
+            allowlist_status: "blocked",
+            error: "Failed to read environment",
+            timestamp: new Date().toISOString(),
+          });
+          setLoading(false);
+        }
+      } finally {
+        inFlight.current = false;
+      }
+    }
+
+    loadEnvironment();
+    const interval = window.setInterval(loadEnvironment, 10_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
   }, []);
 
   if (loading) {
     return (
-      <div className="bg-amber-950/50 border-b border-amber-800/30 px-4 py-2 text-xs text-amber-300 font-mono">
+      <div className="mc-env-banner">
         <span className="inline-block w-2 h-2 bg-amber-500 rounded-full animate-pulse mr-2" />
         Loading environment…
       </div>
@@ -60,15 +82,7 @@ export default function EnvironmentBanner() {
   const isBlocked = env?.allowlist_status === "blocked";
 
   return (
-    <div
-      className={`
-        border-b px-4 py-2 flex flex-col items-stretch gap-2 text-xs font-mono sm:flex-row sm:items-center sm:justify-between
-        ${isBlocked
-          ? "bg-red-950/60 border-red-800/40 text-red-300"
-          : "bg-slate-900/80 border-slate-800/40 text-slate-400"
-        }
-      `}
-    >
+    <div className={`mc-env-banner ${isBlocked ? "is-blocked" : ""}`}>
       <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1">
         {/* Status indicator */}
         <div className="flex items-center gap-2">
@@ -114,8 +128,9 @@ export default function EnvironmentBanner() {
       </div>
 
       {/* Deployment target */}
-      <div className="shrink-0 text-slate-600">
-        → {env?.deployment_target ?? "unknown"}
+      <div className="mc-env-target">
+        <span>target: {env?.deployment_target ?? "unknown"}</span>
+        <span>source: {env?.timestamp ?? "unknown timestamp"}</span>
       </div>
     </div>
   );

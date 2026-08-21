@@ -875,14 +875,49 @@ async function readQueueStatus(roots: RuntimeRoots, adapters: RuntimeAdapters): 
     const body = await adapters.fs.readFile(source);
     const data = JSON.parse(body) as Record<string, unknown>;
     const statusByGoal = new Map<string, GoalRecord["queue_state"]>();
+
+    // Legacy shape support: { goals: { <id>: <state> } }
     const goals = data.goals;
     if (goals && typeof goals === "object") {
       for (const [goalId, state] of Object.entries(goals as Record<string, unknown>)) {
         statusByGoal.set(goalId, normalizeQueueState(stringValue(state) ?? stringValue((state as Record<string, unknown>)?.status)));
       }
     }
+
+    // Current queue-runner shape support: active[], controller_pids[], up_next[], blocked[], counts{}
+    const active = Array.isArray(data.active) ? data.active : [];
+    for (const value of active) {
+      const goalId = stringValue(value);
+      if (goalId) statusByGoal.set(goalId, "running");
+    }
+
+    const controllerPids = Array.isArray(data.controller_pids) ? data.controller_pids : [];
+    const upNext = Array.isArray(data.up_next) ? data.up_next : [];
+
+    const counts = (data.counts && typeof data.counts === "object")
+      ? (data.counts as Record<string, unknown>)
+      : null;
+    const blockedCount = counts ? numberValue(counts.blocked) ?? 0 : 0;
+    const heldCount = counts ? numberValue(counts.held) ?? 0 : 0;
+    const hardStopCount = counts ? numberValue(counts.hard_stop) ?? 0 : 0;
+    const invalidCount = counts ? numberValue(counts.invalid) ?? 0 : 0;
+    const blockingTotal = numberValue(data.blocking_total) ?? (blockedCount + heldCount + hardStopCount + invalidCount);
+
+    const explicitStatus = normalizeQueueState(stringValue(data.status));
+    const global: GoalRecord["queue_state"] = data.paused === true
+      ? "paused"
+      : active.length > 0 || controllerPids.length > 0
+        ? "running"
+        : explicitStatus !== "unknown"
+          ? explicitStatus
+          : blockingTotal > 0
+            ? "blocked"
+            : upNext.length > 0
+              ? "ready"
+              : "unknown";
+
     return {
-      global: data.paused === true ? "paused" : normalizeQueueState(stringValue(data.status)),
+      global,
       focus_goal_id: stringValue(data.focus_goal_id) ?? stringValue(data.focus),
       statusByGoal,
       warning: null,

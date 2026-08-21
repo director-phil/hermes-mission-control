@@ -7,6 +7,8 @@ export interface ParsedNativeGoalMarkdown {
 
 type FrontmatterValue = string | string[];
 
+import { extractGoalContract } from "@/../../bridge/goal_contract";
+
 export function parseNativeGoalMarkdown(body: string): ParsedNativeGoalMarkdown | null {
   const lines = body.split("\n");
   if (lines[0]?.trim() !== "---") return null;
@@ -23,11 +25,16 @@ export function parseNativeGoalMarkdown(body: string): ParsedNativeGoalMarkdown 
   if (!closedFrontmatter) return null;
 
   const metadata = parseFrontmatter(fmLines);
+
+  // Use goal_contract module for comprehensive validation
+  const contract = extractGoalContract(body);
+  const hasAcceptance = Boolean(contract?.hasAcceptance);
+
   return {
     title: metadataString(metadata, "title"),
     repoWorktree: metadataString(metadata, "repo/workdir", "worktree", "repo"),
     dependencies: metadataList(metadata, "dependencies", "depends_on", "dependency_ids"),
-    hasAcceptance: body.includes("## Acceptance"),
+    hasAcceptance,
   };
 }
 
@@ -63,7 +70,7 @@ function parseFrontmatter(lines: string[]): Record<string, FrontmatterValue> {
 }
 
 function cleanYamlScalar(value: string): string {
-  if (value.length >= 2 && value[0] === value[value.length - 1] && (value[0] === "\"" || value[0] === "'")) {
+  if (value.length >= 2 && value[0] === value[value.length - 1] && (value[0] === '"' || value[0] === "'")) {
     return value.slice(1, -1);
   }
   return value;
