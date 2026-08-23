@@ -4133,7 +4133,17 @@ def run_shipping_gates(
 
     if not control_plane_gate("before_pr_checks"):
         return stages
-    checks = subprocess_adapter.run_command(["gh", "pr", "checks", str(pr_number), "--watch", "--interval", "10", "--fail-fast"], str(worktree), 900, _controller_git_env("0"), True)
+    # gh pr checks --watch exits 1 immediately when workflows have not
+    # registered any check run yet (a ~20s race after PR creation). Retry
+    # that specific transient before failing the goal.
+    checks = None
+    for attempt in range(8):
+        checks = subprocess_adapter.run_command(["gh", "pr", "checks", str(pr_number), "--watch", "--interval", "10", "--fail-fast"], str(worktree), 900, _controller_git_env("0"), True)
+        if checks.returncode != 0 and "no checks reported" in checks.stderr:
+            time.sleep(15)
+            continue
+        break
+    assert checks is not None
     stages["checks"] = {"exit_code": checks.returncode, "stdout_bytes": checks.stdout_bytes, "stderr_bytes": checks.stderr_bytes}
     if checks.returncode != 0 or output_has_forbidden_shipping_marker(checks.stdout, checks.stderr):
         stages["reason"] = "checks_failed"
