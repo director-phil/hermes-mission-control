@@ -2012,7 +2012,7 @@ def prepare_isolated_checkout(
     post_fetch_control = verify_git_control_plane(temp_dir, expected_origin, subprocess_adapter, pre_fetch_control, "fresh_checkout_after_fetch")
     if not post_fetch_control.get("passed"):
         return fail_after_temp({"reason": post_fetch_control.get("reason", "control plane changed")})
-    checkout = subprocess_adapter.run_command(controller_git_cmd(["checkout", "-B", branch, "origin/main"]), str(temp_dir), 120, _controller_git_env("0"), True)
+    checkout = subprocess_adapter.run_command(controller_git_cmd(["checkout", "--no-track", "-B", branch, "origin/main"]), str(temp_dir), 120, _controller_git_env("0"), True)
     if checkout.returncode != 0:
         return fail_after_temp({"reason": "branch checkout failed", "exit_code": checkout.returncode})
     post_checkout_control = verify_git_control_plane(temp_dir, expected_origin, subprocess_adapter, pre_fetch_control, "fresh_checkout_after_branch")
@@ -6810,7 +6810,7 @@ def self_test() -> tuple[bool, str]:
         checkout_cmds = [" ".join(normalized_git_cmd(call["cmd"])) for call in fake_checkout.calls]
         checkout_clone_calls = [normalized_git_cmd(call["cmd"]) for call in fake_checkout.calls if normalized_git_cmd(call["cmd"])[:2] == ["git", "clone"]]
         checkout_clone_has_reference_arg = any(arg.startswith("--reference") for call in checkout_clone_calls for arg in call)
-        check("fresh_checkout_uses_clone_fetch_branch", any("git clone" in cmd for cmd in checkout_cmds) and any("git remote set-url origin" in cmd for cmd in checkout_cmds) and any("git fetch" in cmd and "+refs/heads/main:refs/remotes/origin/main" in cmd for cmd in checkout_cmds) and any("git checkout -B feat/native-checkout-goal origin/main" in cmd for cmd in checkout_cmds))
+        check("fresh_checkout_uses_clone_fetch_branch", any("git clone" in cmd for cmd in checkout_cmds) and any("git remote set-url origin" in cmd for cmd in checkout_cmds) and any("git fetch" in cmd and "+refs/heads/main:refs/remotes/origin/main" in cmd for cmd in checkout_cmds) and any("git checkout --no-track -B feat/native-checkout-goal origin/main" in cmd for cmd in checkout_cmds))
         check("fresh_checkout_clone_argv_canonical_mirror_no_reference", checkout_clone_calls and checkout_clone_calls[0][2:5] == ["--origin", "origin", os.fspath(worktree_dir)] and not checkout_clone_has_reference_arg)
         check("fresh_checkout_origin_remains_expected_github", any(normalized_git_cmd(call["cmd"]) == ["git", "remote", "get-url", "origin"] for call in fake_checkout.calls))
         check("fresh_checkout_neutral_branch", checkout_meta.get("branch") == "feat/native-checkout-goal")
