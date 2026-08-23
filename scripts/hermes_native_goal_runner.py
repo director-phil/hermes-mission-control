@@ -1969,7 +1969,7 @@ def prepare_isolated_checkout(
         return fail_after_temp({"reason": str(exc)})
 
     clone = subprocess_adapter.run_command(
-        controller_git_cmd(["clone", "--origin", "origin", expected_origin, str(temp_dir)]),
+        controller_git_cmd(["clone", "--origin", "origin", str(canonical_resolved), str(temp_dir)]),
         cwd=str(resolved_root),
         timeout=600,
         env=_controller_git_env("0"),
@@ -1977,6 +1977,15 @@ def prepare_isolated_checkout(
     )
     if clone.returncode != 0:
         return fail_after_temp({"reason": "clone failed", "exit_code": clone.returncode})
+    set_url = subprocess_adapter.run_command(
+        controller_git_cmd(["remote", "set-url", "origin", expected_origin]),
+        str(temp_dir),
+        60,
+        _git_read_env(),
+        True,
+    )
+    if set_url.returncode != 0:
+        return fail_after_temp({"reason": "origin set-url failed", "exit_code": set_url.returncode})
     try:
         validate_checkout_path_after_create(resolved_root, temp_dir)
         validate_checkout_path_candidate(resolved_root, dest, must_not_exist=True)
@@ -1993,7 +2002,10 @@ def prepare_isolated_checkout(
     pre_fetch_control = collect_git_control_plane(temp_dir, expected_origin, subprocess_adapter)
     if not pre_fetch_control.get("passed"):
         return fail_after_temp({"reason": pre_fetch_control.get("reason", "control plane invalid")})
-    fetch = subprocess_adapter.run_command(controller_git_cmd(["fetch", "origin", "main"]), str(temp_dir), 300, _controller_git_env("0"), True)
+    fetch = subprocess_adapter.run_command(
+        controller_git_cmd(["fetch", str(canonical_resolved), "+refs/heads/main:refs/remotes/origin/main"]),
+        str(temp_dir), 300, _controller_git_env("0"), True,
+    )
     if fetch.returncode != 0:
         return fail_after_temp({"reason": "origin main fetch failed", "exit_code": fetch.returncode})
     branch = neutral_branch_name(goal_id, branch_kind)
@@ -4194,14 +4206,19 @@ def run_shipping_gates(
         stages["reason"] = "pr_not_merged"
         return stages
 
-    if not control_plane_gate("before_origin_main_fetch"):
+    if not control_plane_gate("before_origin_main_verification"):
         return stages
-    fetch_main = subprocess_adapter.run_command(controller_git_cmd(["fetch", "origin", "main"]), str(worktree), 300, _controller_git_env("0"), True)
-    if not control_plane_gate("before_origin_main_ancestor_check"):
+    origin_parts = re.match(r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?$", expected_origin)
+    if origin_parts is None:
+        stages["reason"] = "origin_url_unparseable"
         return stages
-    ancestor = subprocess_adapter.run_command(controller_git_cmd(["merge-base", "--is-ancestor", merge_sha, "origin/main"]), str(worktree), 60, _git_read_env(), True)
-    stages["origin_main"] = {"fetch_exit_code": fetch_main.returncode, "ancestor_exit_code": ancestor.returncode, "verified_sha": merge_sha}
-    if fetch_main.returncode != 0 or ancestor.returncode != 0:
+    compare = subprocess_adapter.run_command(
+        ["gh", "api", f"repos/{origin_parts.group(1)}/{origin_parts.group(2)}/compare/main...{merge_sha}", "--jq", ".ahead_by"],
+        str(worktree), 120, _controller_git_env("0"), True,
+    )
+    ahead_by = compare.stdout.strip()
+    stages["origin_main"] = {"compare_exit_code": compare.returncode, "ahead_by_raw": ahead_by, "verified_sha": merge_sha}
+    if compare.returncode != 0 or not ahead_by.isdigit() or int(ahead_by) != 0:
         stages["reason"] = "origin_main_missing_merge_commit"
         return stages
 
@@ -4709,6 +4726,8 @@ class FakeSubprocess:
             return CmdResult(returncode=0, stdout="", stderr="", stdout_bytes=0, stderr_bytes=0)
         if command_name == "gh" and cmd[1:5] == ["auth", "status", "-h", "github.com"]:
             return CmdResult(returncode=0, stdout="", stderr="", stdout_bytes=0, stderr_bytes=0)
+        if command_name == "gh" and "compare/main" in " ".join(cmd):
+            return CmdResult(returncode=0, stdout="0\n", stderr="", stdout_bytes=2, stderr_bytes=0)
         if cmd[:3] == ["gh", "pr", "create"]:
             return CmdResult(returncode=0, stdout="https://github.com/director-phil/hermes-mission-control/pull/1\n", stderr="", stdout_bytes=62, stderr_bytes=0)
         if cmd[:3] == ["gh", "pr", "view"] and any("mergedAt" in arg for arg in cmd):
@@ -6653,7 +6672,7 @@ def self_test() -> tuple[bool, str]:
         check("promotion_hard_stop_remains_staged", (promote_root / "goals" / "staged" / "aaa-hard-stop.md").exists())
         check("promotion_blocked_remains_staged", (promote_root / "goals" / "staged" / "bbb-blocked.md").exists())
         check("promotion_rewrites_checkout_path", "mission-control-worktrees" in ready_text or "worktrees" in ready_text)
-        check("promotion_clones_expected_origin_without_reference", promote_clone_calls and promote_clone_calls[0][2:5] == ["--origin", "origin", EXPECTED_CANONICAL_REPO_URL] and not promote_clone_has_reference_arg)
+        check("promotion_clones_canonical_mirror_without_reference", promote_clone_calls and promote_clone_calls[0][2:5] == ["--origin", "origin", os.fspath(worktree_dir)] and not promote_clone_has_reference_arg)
         promoted_again, promoted_again_goal = promote_one_staged_goal(
             promote_root,
             worktree_dir,
@@ -6791,8 +6810,8 @@ def self_test() -> tuple[bool, str]:
         checkout_cmds = [" ".join(normalized_git_cmd(call["cmd"])) for call in fake_checkout.calls]
         checkout_clone_calls = [normalized_git_cmd(call["cmd"]) for call in fake_checkout.calls if normalized_git_cmd(call["cmd"])[:2] == ["git", "clone"]]
         checkout_clone_has_reference_arg = any(arg.startswith("--reference") for call in checkout_clone_calls for arg in call)
-        check("fresh_checkout_uses_clone_fetch_branch", any("git clone" in cmd for cmd in checkout_cmds) and any("git fetch origin main" in cmd for cmd in checkout_cmds) and any("git checkout -B feat/native-checkout-goal origin/main" in cmd for cmd in checkout_cmds))
-        check("fresh_checkout_clone_argv_exact_origin_no_reference", checkout_clone_calls and checkout_clone_calls[0][2:5] == ["--origin", "origin", EXPECTED_CANONICAL_REPO_URL] and not checkout_clone_has_reference_arg)
+        check("fresh_checkout_uses_clone_fetch_branch", any("git clone" in cmd for cmd in checkout_cmds) and any("git remote set-url origin" in cmd for cmd in checkout_cmds) and any("git fetch" in cmd and "+refs/heads/main:refs/remotes/origin/main" in cmd for cmd in checkout_cmds) and any("git checkout -B feat/native-checkout-goal origin/main" in cmd for cmd in checkout_cmds))
+        check("fresh_checkout_clone_argv_canonical_mirror_no_reference", checkout_clone_calls and checkout_clone_calls[0][2:5] == ["--origin", "origin", os.fspath(worktree_dir)] and not checkout_clone_has_reference_arg)
         check("fresh_checkout_origin_remains_expected_github", any(normalized_git_cmd(call["cmd"]) == ["git", "remote", "get-url", "origin"] for call in fake_checkout.calls))
         check("fresh_checkout_neutral_branch", checkout_meta.get("branch") == "feat/native-checkout-goal")
         check("fresh_checkout_status_checks_untracked_and_ignored", any(normalized_git_cmd(call["cmd"]) == ["git", "status", "--porcelain=v1", "--untracked-files=all"] for call in fake_checkout.calls) and any(normalized_git_cmd(call["cmd"]) == ["git", "status", "--ignored", "--porcelain=v1"] for call in fake_checkout.calls))
@@ -7049,7 +7068,7 @@ def self_test() -> tuple[bool, str]:
 
         fetch_retry_root = Path(tmpdir) / "checkout-fetch-retry"
         fetch_retry_fake = FakeSubprocess()
-        fetch_retry_fake.set_responses("git fetch origin main", [
+        fetch_retry_fake.set_responses("+refs/heads/main:refs/remotes/origin/main", [
             CmdResult(1, "", "forced fetch failure", 0, 20),
             CmdResult(0, "", "", 0, 0),
         ])
@@ -7248,7 +7267,7 @@ def self_test() -> tuple[bool, str]:
         ship_result = run_shipping_gates(worktree_dir, "ship-goal", "ship-goal", ship_goal, ship_goal["acceptance_body"], ship_reviewed, fake_ship)
         check("shipping_success_passes", ship_result.get("passed") is True and ship_result.get("terminal_state") == SHIPPING_SUCCESS_STATE)
         check("shipping_records_squash_sha_difference", ship_result.get("pull_request", {}).get("head_sha") == "0123456789abcdef0123456789abcdef01234567" and ship_result.get("merge", {}).get("merge_sha") == "abcdefabcdefabcdefabcdefabcdefabcdefabcd")
-        check("shipping_verifies_origin_main_merge_sha", any(normalized_git_cmd(call["cmd"]) == ["git", "merge-base", "--is-ancestor", "abcdefabcdefabcdefabcdefabcdefabcdefabcd", "origin/main"] for call in fake_ship.calls))
+        check("shipping_verifies_origin_main_merge_sha", any(call["cmd"] and call["cmd"][0] == "gh" and "api" in call["cmd"] and "compare/main...abcdefabcdefabcdefabcdefabcdefabcdefabcd" in " ".join(call["cmd"]) for call in fake_ship.calls))
         push_argvs = [normalized_git_cmd(call["cmd"]) for call in fake_ship.calls if normalized_git_cmd(call["cmd"])[:2] == ["git", "push"]]
         check("shipping_push_avoids_tracking_mutation", push_argvs == [["git", "push", "origin", "feat/native-fixture"]] and all("-u" not in argv and "--set-upstream" not in argv for argv in push_argvs))
         auth_status_calls = [call for call in fake_ship.calls if call["cmd"] and Path(call["cmd"][0]).name == "gh" and call["cmd"][1:5] == ["auth", "status", "-h", "github.com"]]
@@ -7559,12 +7578,11 @@ def self_test() -> tuple[bool, str]:
 
         fake_preview_contains = FakeSubprocess()
         prime_allowed_shipping_scope(fake_preview_contains)
-        fake_preview_contains.set_response("git merge-base --is-ancestor", CmdResult(1, "", "", 0, 0))
-        fake_preview_contains.set_response("git branch -r --contains", CmdResult(0, "  origin/main-preview\n  origin/main-old\n", "", 35, 0))
+        fake_preview_contains.set_response("compare/main", CmdResult(1, "", "forced compare failure", 0, 20))
         preview_result = run_shipping_gates(worktree_dir, "ship-preview", "ship-preview", ship_goal, ship_goal["acceptance_body"], reviewed_fixture_fingerprint(worktree_dir, fake_preview_contains), fake_preview_contains)
         check("origin_main_preview_old_cannot_satisfy", preview_result.get("passed") is False and preview_result.get("reason") == "origin_main_missing_merge_commit")
         check("origin_main_preview_old_branch_contains_unused", not any(normalized_git_cmd(call["cmd"])[:4] == ["git", "branch", "-r", "--contains"] for call in fake_preview_contains.calls))
-        check("origin_main_actual_ancestor_passes", ship_result.get("origin_main", {}).get("ancestor_exit_code") == 0 and ship_result.get("passed") is True)
+        check("origin_main_actual_ancestor_passes", ship_result.get("origin_main", {}).get("compare_exit_code") == 0 and ship_result.get("origin_main", {}).get("ahead_by_raw") == "0" and ship_result.get("passed") is True)
 
         if old_allowed_roots is None:
             os.environ.pop("HERMES_NATIVE_ALLOWED_WORKTREE_ROOTS", None)
