@@ -96,7 +96,11 @@ SHIPPING_FORBIDDEN_MARKERS = ("FAILED", "NOT verified", "NOT VERIFIED")
 DEPLOYMENT_FORBIDDEN_MARKERS = ("FAILED", "ERROR", "Error:", "Command failed", "NOT verified", "NOT VERIFIED")
 CONTROLLER_GIT_DIR = DEFAULT_NATIVE_ROOT / "controller-git"
 CONTROL_PLANE_ALLOWED_REMOTE_FETCH = "+refs/heads/*:refs/remotes/origin/*"
-TRUSTED_CHILD_PATH = "/usr/bin:/bin:/usr/local/bin"
+TRUSTED_CHILD_PATH = (
+    f"{Path(HOME) / '.hermes' / 'node' / 'bin'}:"
+    f"{Path(HOME) / '.local' / 'bin'}:"
+    "/usr/bin:/bin:/usr/local/bin"
+)
 TRUSTED_HERMES_NODE_BIN = Path(HOME) / ".hermes" / "node" / "bin" / "node"
 TRUSTED_VERCEL_VC_JS = Path(HOME) / ".hermes" / "node" / "lib" / "node_modules" / "vercel" / "dist" / "vc.js"
 TRUSTED_VERCEL_WRAPPERS = (
@@ -3700,6 +3704,48 @@ def semantic_vercel_cmd(cmd: list[str]) -> list[str]:
 # Acceptance execution
 # ---------------------------------------------------------------------------
 
+def _ensure_worktree_node_modules(
+    worktree: Path,
+    goal_id: str,
+    run_id: str,
+    subprocess_adapter: SubprocessAdapter,
+) -> None:
+    """Install node deps in the isolated worktree when missing or stale.
+
+    Mirrors the ChatDev conveyor's ``_ensure_node_modules``: a fresh checkout has
+    no ``node_modules``, so a TypeScript acceptance gate (``corepack pnpm --dir
+    apps/web exec tsc --noEmit``) fails with "command not found" unless deps are
+    present. The install runs via ``/usr/bin/bash -c`` (bash is the allowlisted
+    executor) with the node toolchain on the trusted child PATH. Failure is
+    non-fatal here — the acceptance gate itself will fail closed if tsc is still
+    unavailable, so this must never mask a real dependency problem.
+    """
+    nm = worktree / "node_modules"
+    lock = worktree / "pnpm-lock.yaml"
+    # Not a Node/TypeScript repo — nothing to install (e.g. Python or synthetic
+    # self-test worktrees). Skip without touching the adapter.
+    if not lock.exists():
+        return
+    stale = (
+        nm.exists()
+        and lock.exists()
+        and lock.stat().st_mtime > nm.stat().st_mtime
+    )
+    if nm.exists() and not stale:
+        return
+    subprocess_adapter.run_command(
+        cmd=[
+            "/usr/bin/bash",
+            "-c",
+            "corepack pnpm install --frozen-lockfile --prefer-offline --ignore-scripts",
+        ],
+        cwd=str(worktree),
+        timeout=600,
+        env=_stage_env(goal_id, run_id, "acceptance-deps", "controller"),
+        capture=True,
+    )
+
+
 def run_acceptance(
     acceptance_body: str,
     worktree: Path,
@@ -3713,6 +3759,8 @@ def run_acceptance(
     """
     sha256 = hashlib.sha256(acceptance_body.encode("utf-8")).hexdigest()
     t0 = time.monotonic()
+
+    _ensure_worktree_node_modules(worktree, goal_id, run_id, subprocess_adapter)
 
     result = subprocess_adapter.run_command(
         cmd=["/usr/bin/bash", "-e", "-u", "-o", "pipefail", "-s"],
