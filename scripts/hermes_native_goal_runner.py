@@ -3018,6 +3018,10 @@ def _codex_transient_failure(result: Any) -> bool:
     """True when a Codex stage run failed with a known-transient upstream stall."""
     if result.returncode == 0:
         return False
+    # Empty-output timeout: Codex hung and produced nothing (no verdict, no
+    # error text). This is transient — retry rather than failing the goal.
+    if result.returncode in (-1, 124) and getattr(result, "stdout_bytes", 0) == 0:
+        return True
     out = (getattr(result, "stdout", "") or "") + "\n" + (getattr(result, "stderr", "") or "")
     return any(marker in out for marker in CODEX_TRANSIENT_MARKERS)
 
