@@ -3126,6 +3126,15 @@ def run_hermes_implementation(
         env=_stage_env(goal_id, run_id, "code", profile), capture=True,
         stdin_data=goal_prompt,
     )
+    attempts = 1
+    while attempts < MAX_TRANSIENT_STAGE_ATTEMPTS and _codex_transient_failure(result):
+        time.sleep(TRANSIENT_STAGE_RETRY_DELAY_SECONDS)
+        attempts += 1
+        result = subprocess_adapter.run_command(
+            cmd=cmd, cwd=str(worktree), timeout=600,
+            env=_stage_env(goal_id, run_id, "code", profile), capture=True,
+            stdin_data=goal_prompt,
+        )
     duration = time.monotonic() - t0
     return {
         "exit_code": result.returncode,
@@ -3137,6 +3146,7 @@ def run_hermes_implementation(
         "authority_provider": authority_provider,
         "source": source,
         "passed": result.returncode == 0,
+        "transient_retries": attempts - 1,
     }
 
 
@@ -3178,6 +3188,15 @@ def run_hermes_reviewer(
         env=_stage_env(goal_id, run_id, "review", profile), capture=True,
         stdin_data=review_prompt,
     )
+    attempts = 1
+    while attempts < MAX_TRANSIENT_STAGE_ATTEMPTS and _codex_transient_failure(result):
+        time.sleep(TRANSIENT_STAGE_RETRY_DELAY_SECONDS)
+        attempts += 1
+        result = subprocess_adapter.run_command(
+            cmd=cmd, cwd=str(worktree), timeout=300,
+            env=_stage_env(goal_id, run_id, "review", profile), capture=True,
+            stdin_data=review_prompt,
+        )
     duration = time.monotonic() - t0
     marker_found = verdict_stdout_marker(result.stdout, REVIEW_PASS_MARKER, result.stdout_bytes)
     return {
@@ -3190,6 +3209,7 @@ def run_hermes_reviewer(
         "authority_provider": authority_provider,
         "source": source,
         "passed": result.returncode == 0 and marker_found and result.stdout_bytes > 0,
+        "transient_retries": attempts - 1,
     }
 
 
