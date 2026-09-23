@@ -4551,6 +4551,11 @@ def run_goal(
 
     log_event(events_path, "agent.started", "Planner approved", {"profile": planner_result["profile"]})
 
+    # Pre-install node_modules before implementation so Codex edits (and any
+    # `pnpm remove`/add it performs) don't burn its 600s budget on a cold
+    # `pnpm install`. Acceptance re-runs this check and installs if stale.
+    _ensure_worktree_node_modules(worktree, goal_id, run_id, subprocess_adapter)
+
     # Step 2: Codex implementation
     log_event(events_path, "tool.started", "Running Codex implementation", {"source": STAGE_SOURCES["code"]})
     implementation_result = run_hermes_implementation(worktree, goal_id, run_id, code_prompt, subprocess_adapter)
