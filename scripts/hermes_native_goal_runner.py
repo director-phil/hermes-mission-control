@@ -102,6 +102,16 @@ TRUSTED_CHILD_PATH = (
     "/usr/bin:/bin:/usr/local/bin"
 )
 TRUSTED_HERMES_NODE_BIN = Path(HOME) / ".hermes" / "node" / "bin" / "node"
+# Codex (openai-codex) intermittently stalls upstream with "Codex stream produced
+# no SSE events for 12s". A single stall must not fail a whole goal stage, so
+# retry model stages a bounded number of times before giving up.
+MAX_TRANSIENT_STAGE_ATTEMPTS = 4
+TRANSIENT_STAGE_RETRY_DELAY_SECONDS = 20
+CODEX_TRANSIENT_MARKERS = (
+    "no SSE events",
+    "didn't respond in time",
+    "temporarily unavailable",
+)
 TRUSTED_VERCEL_VC_JS = Path(HOME) / ".hermes" / "node" / "lib" / "node_modules" / "vercel" / "dist" / "vc.js"
 TRUSTED_VERCEL_WRAPPERS = (
     Path(HOME) / ".local" / "bin" / "vercel",
@@ -3004,6 +3014,14 @@ def verify_codex_stage_authority(
     return True, provider, ""
 
 
+def _codex_transient_failure(result: Any) -> bool:
+    """True when a Codex stage run failed with a known-transient upstream stall."""
+    if result.returncode == 0:
+        return False
+    out = (getattr(result, "stdout", "") or "") + "\n" + (getattr(result, "stderr", "") or "")
+    return any(marker in out for marker in CODEX_TRANSIENT_MARKERS)
+
+
 def run_hermes_planner(
     worktree: Path,
     goal_id: str,
@@ -3042,6 +3060,17 @@ def run_hermes_planner(
         env=_stage_env(goal_id, run_id, "plan", profile), capture=True,
         stdin_data=goal_prompt,
     )
+    # Codex intermittently stalls upstream ("no SSE events for 12s"). One stall
+    # must not fail the whole goal — retry a bounded number of times.
+    attempts = 1
+    while attempts < MAX_TRANSIENT_STAGE_ATTEMPTS and _codex_transient_failure(result):
+        time.sleep(TRANSIENT_STAGE_RETRY_DELAY_SECONDS)
+        attempts += 1
+        result = subprocess_adapter.run_command(
+            cmd=cmd, cwd=str(worktree), timeout=300,
+            env=_stage_env(goal_id, run_id, "plan", profile), capture=True,
+            stdin_data=goal_prompt,
+        )
     duration = time.monotonic() - t0
     marker_found = verdict_stdout_marker(result.stdout, PLAN_APPROVED_MARKER, result.stdout_bytes)
     return {
@@ -3054,6 +3083,7 @@ def run_hermes_planner(
         "authority_provider": authority_provider,
         "source": source,
         "passed": result.returncode == 0 and marker_found and result.stdout_bytes > 0,
+        "transient_retries": attempts - 1,
     }
 
 
