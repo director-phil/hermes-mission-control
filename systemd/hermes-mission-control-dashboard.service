@@ -1,0 +1,20 @@
+[Unit]
+Description=Hermes Mission Control — Dashboard
+Documentation=https://github.com/director-phil/hermes-mission-control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/GitHub/hermes-mission-control
+ExecStart=%h/Documents/GitHub/hermes-mission-control/node_modules/.bin/next start -H 127.0.0.1 -p 3031
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=PORT=3031
+
+NoNewPrivileges=true
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
