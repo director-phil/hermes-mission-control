@@ -1,0 +1,30 @@
+[Unit]
+Description=Hermes Mission Control — Monitoring probe engine
+Documentation=https://github.com/director-phil/hermes-mission-control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/GitHub/hermes-mission-control
+ExecStart=%h/Documents/GitHub/hermes-mission-control/node_modules/.bin/tsx apps/web/lib/monitoring/engine.ts
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=MONITORING_DB_PATH=%h/.hermes/mission-control/monitoring.db
+# tsx/esbuild needs a writable cache dir; point it at a private tmp.
+Environment=XDG_CACHE_HOME=/tmp/tsx-cache
+# Reuse the RT dashboard Slack app for alerts. Set these to enable Slack posting:
+# Environment=SLACK_BOT_TOKEN=
+# Environment=SLACK_CHANNEL=#monitoring
+
+# Security hardening (mirrors the goal-runner unit). The DB dir is the only
+# writable path; home is otherwise read-only.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.hermes/mission-control
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
