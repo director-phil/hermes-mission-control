@@ -4,11 +4,19 @@
  */
 
 import { readFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { execSync } from "node:child_process";
+import os from "node:os";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { connect as tlsConnect } from "node:tls";
 import { connect as netConnect } from "node:net";
 import { resolve as dnsResolve } from "node:dns/promises";
 import { InsertResultInput } from "./store";
 import { ProbeDefinition, ProbeStatus } from "./types";
+
+const VERCEL_PROJECT_ID = "prj_lACCcoDN44Doh8pC6X3XY7E3lm2w";
+const VERCEL_TEAM_ID = "reliabletradies";
 
 const DEFAULT_TIMEOUT_MS = 5000;
 
@@ -35,6 +43,10 @@ export async function runProbe(def: ProbeDefinition): Promise<ProbeOutcome> {
         return await sslProbe(def.target, timeoutMs);
       case "local-file":
         return await localFileProbe(def.target);
+      case "server":
+        return await serverProbe();
+      case "vercel-deploy":
+        return await vercelDeployProbe();
       default:
         return { status: "down", latency_ms: null, http_status: null, metric: null, error: `unknown kind ${def.kind}` };
     }
@@ -148,6 +160,114 @@ async function localFileProbe(path: string): Promise<ProbeOutcome> {
         : { status: "degraded", latency_ms, http_status: null, metric: "conveyor off", error: "conveyor disabled" };
     }
     return { status: "up", latency_ms, http_status: null, metric: "readable", error: null };
+  } catch (err) {
+    return { status: "down", latency_ms: Date.now() - start, http_status: null, metric: null, error: String(err) };
+  }
+}
+
+/**
+ * Host metrics probe (CheckCle "server monitoring" equivalent) — reads the local
+ * box's CPU load, RAM, disk and cumulative network counters. Emits a JSON `metric`
+ * that the UI parses into a metrics panel.
+ */
+function serverProbe(): Promise<ProbeOutcome> {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    try {
+      const load = os.loadavg(); // [1m, 5m, 15m]
+      const totalMem = os.totalmem();
+      const freeMem = os.freemem();
+      const ramPct = Math.round(((totalMem - freeMem) / totalMem) * 1000) / 10;
+
+      let diskPct: number | null = null;
+      try {
+        const out = execSync("df -P /", { encoding: "utf8" });
+        const parts = out.trim().split("\n")[1]?.split(/\s+/);
+        if (parts && parts.length >= 5) diskPct = Number.parseFloat(parts[4]);
+      } catch {
+        diskPct = null;
+      }
+
+      let netRx = 0;
+      let netTx = 0;
+      try {
+        const net = readFileSync("/proc/net/dev", "utf8");
+        for (const line of net.split("\n").slice(2)) {
+          const m = line.trim().split(/\s+/);
+          if (m.length < 10) continue;
+          const iface = m[0].replace(":", "");
+          if (iface === "lo" || iface.startsWith("br-") || iface.startsWith("docker") || iface.startsWith("veth")) continue;
+          netRx += Number.parseInt(m[1], 10) || 0;
+          netTx += Number.parseInt(m[9], 10) || 0;
+        }
+      } catch {
+        /* ignore */
+      }
+
+      const metric = JSON.stringify({
+        cpu_load1: load[0],
+        cpu_load5: load[1],
+        cpu_load15: load[2],
+        ram_pct: ramPct,
+        disk_pct: diskPct,
+        net_rx_mb: Math.round(netRx / 1024 / 1024),
+        net_tx_mb: Math.round(netTx / 1024 / 1024),
+      });
+
+      let status: ProbeStatus = "up";
+      if (ramPct >= 95 || (diskPct != null && diskPct >= 90)) status = "degraded";
+
+      resolve({ status, latency_ms: Date.now() - start, http_status: null, metric, error: null });
+    } catch (err) {
+      resolve({ status: "down", latency_ms: Date.now() - start, http_status: null, metric: null, error: String(err) });
+    }
+  });
+}
+
+/**
+ * Vercel deployment probe — reads the Vercel CLI token and queries the latest
+ * deployment state for the RT V2 project, so the board shows whether the newest
+ * deploy is READY / BUILDING / ERROR.
+ */
+async function vercelDeployProbe(): Promise<ProbeOutcome> {
+  const start = Date.now();
+  try {
+    const authPath = join(homedir(), ".local", "share", "com.vercel.cli", "auth.json");
+    const raw = await readFile(authPath, "utf8");
+    const auth = JSON.parse(raw) as { token?: string };
+    const token = auth.token;
+    if (!token) throw new Error("no vercel token");
+
+    const url = `https://api.vercel.com/v6/deployments?projectId=${VERCEL_PROJECT_ID}&teamId=${VERCEL_TEAM_ID}&limit=1`;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(10000),
+    });
+    const latency_ms = Date.now() - start;
+    if (!res.ok) {
+      return { status: "down", latency_ms, http_status: res.status, metric: null, error: `vercel api ${res.status}` };
+    }
+    const json = (await res.json()) as { deployments?: Array<Record<string, unknown>> };
+    const dep = json.deployments?.[0];
+    if (!dep) {
+      return { status: "down", latency_ms, http_status: res.status, metric: null, error: "no deployments" };
+    }
+    const state = String(dep.state ?? "UNKNOWN");
+    const readyState = String(dep.readyState ?? "UNKNOWN");
+    const meta = (dep.meta ?? {}) as Record<string, unknown>;
+    const branch = String(meta.githubCommitRef ?? dep.target ?? "—");
+
+    let status: ProbeStatus = "up";
+    if (state === "ERROR" || readyState === "ERROR") status = "down";
+    else if (state === "CANCELED") status = "degraded";
+
+    return {
+      status,
+      latency_ms,
+      http_status: res.status,
+      metric: `deploy ${state} · ${branch}`,
+      error: status === "down" ? `deploy ${state}` : null,
+    };
   } catch (err) {
     return { status: "down", latency_ms: Date.now() - start, http_status: null, metric: null, error: String(err) };
   }

@@ -91,4 +91,75 @@ export const probes: ProbeDefinition[] = [
     group: "external",
     degradeTo: "degraded",
   },
+  {
+    id: "rt-login-ssl",
+    name: "RT login SSL",
+    kind: "ssl",
+    target: "login.reliabletradies.app",
+    cadenceSeconds: 21600,
+    group: "external",
+    degradeTo: "degraded",
+  },
+
+  // ── RT app services (reachability) ────────────────────────────────────
+  {
+    id: "rt-api-health",
+    name: "RT API health",
+    kind: "http",
+    target: "https://dashboards.reliabletradies.app/api/health",
+    cadenceSeconds: 60,
+    group: "external",
+  },
+  {
+    id: "supabase-auth",
+    name: "Supabase auth",
+    kind: "http",
+    target: `https://${SUPABASE_REF}.supabase.co/auth/v1/health`,
+    cadenceSeconds: 60,
+    group: "external",
+  },
+  {
+    id: "servicetitan-api",
+    name: "ServiceTitan API",
+    kind: "http",
+    target: "https://api.servicetitan.io/",
+    cadenceSeconds: 300,
+    group: "external",
+  },
+  {
+    id: "xero-api",
+    name: "Xero API",
+    kind: "http",
+    target: "https://api.xero.com/",
+    cadenceSeconds: 300,
+    group: "external",
+  },
+
+  // ── Vercel ────────────────────────────────────────────────────────────
+  {
+    id: "vercel-platform",
+    name: "Vercel platform",
+    kind: "http",
+    target: "https://www.vercel-status.com/api/v2/status.json",
+    cadenceSeconds: 300,
+    group: "external",
+  },
+  {
+    id: "vercel-deploy",
+    name: "Vercel latest deploy",
+    kind: "vercel-deploy",
+    target: "reliable-tradies-ops-v2",
+    cadenceSeconds: 300,
+    group: "external",
+  },
+
+  // ── host metrics ──────────────────────────────────────────────────────
+  {
+    id: "hermes-host",
+    name: "Hermes host",
+    kind: "server",
+    target: "local",
+    cadenceSeconds: 60,
+    group: "internal",
+  },
 ];

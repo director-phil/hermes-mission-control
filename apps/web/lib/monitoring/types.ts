@@ -11,7 +11,9 @@ export type ProbeKind =
   | "dns" // DNS resolve
   | "ssl" // TLS cert issuer/expiry
   | "local-file" // read a local status file
-  | "loopback-http"; // HTTP against a loopback/localhost endpoint
+  | "loopback-http" // HTTP against a loopback/localhost endpoint
+  | "server" // host metrics: CPU load, RAM, disk, network (local box)
+  | "vercel-deploy"; // Vercel latest-deployment state (token-authenticated)
 
 export type ProbeGroup = "internal" | "external";
 
