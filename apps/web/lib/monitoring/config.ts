@@ -56,6 +56,14 @@ export const probes: ProbeDefinition[] = [
     group: "internal",
     degradeTo: "degraded",
   },
+  {
+    id: "checkcle",
+    name: "CheckCle monitor",
+    kind: "loopback-http",
+    target: "http://127.0.0.1:8091/",
+    cadenceSeconds: 60,
+    group: "internal",
+  },
 
   // ── external ──────────────────────────────────────────────────────────
   {
