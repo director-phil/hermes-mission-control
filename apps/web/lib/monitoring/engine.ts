@@ -12,6 +12,7 @@ import {
   getLatest,
   getOpenIncident,
   insertResult,
+  isInMaintenance,
   openDb,
   openIncident,
   prune,
@@ -33,6 +34,12 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function processProbe(db: DatabaseSync, probe: ProbeDefinition): Promise<void> {
+  // Paused (maintenance): skip probing, and clear any stale open incident.
+  if (isInMaintenance(db, probe.id)) {
+    if (getOpenIncident(db, probe.id)) resolveIncident(db, probe.id);
+    return;
+  }
+
   const previous = getLatest(db, probe.id);
   const outcome = await runProbe(probe);
   insertResult(db, probe.id, outcome);

@@ -10,6 +10,7 @@ import { DatabaseSync } from "node:sqlite";
 import {
   GlobalStatus,
   IncidentRow,
+  MaintenanceRow,
   MonitoringSnapshot,
   ProbeDefinition,
   ProbeResultRow,
@@ -52,6 +53,15 @@ function createSchema(db: DatabaseSync): void {
       last_error TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_incidents_probe_state ON incidents (probe_id, state);
+
+    CREATE TABLE IF NOT EXISTS maintenance (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      probe_id TEXT NOT NULL,
+      note TEXT,
+      created_ts TEXT NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE INDEX IF NOT EXISTS idx_maintenance_probe ON maintenance (probe_id, active);
   `);
 }
 
@@ -152,6 +162,30 @@ export function listOpenIncidents(db: DatabaseSync): IncidentRow[] {
     .all() as IncidentRow[];
 }
 
+/* ── maintenance (pause/resume) ──────────────────────────────────────── */
+
+export function isInMaintenance(db: DatabaseSync, probeId: string): boolean {
+  return db.prepare(`SELECT 1 FROM maintenance WHERE probe_id = ? AND active = 1 LIMIT 1`).get(probeId) !== undefined;
+}
+
+export function getMaintenance(db: DatabaseSync, probeId: string): MaintenanceRow | null {
+  const row = db
+    .prepare(
+      `SELECT id, probe_id, note, created_ts, active
+       FROM maintenance WHERE probe_id = ? AND active = 1 ORDER BY id DESC LIMIT 1`,
+    )
+    .get(probeId) as MaintenanceRow | undefined;
+  return row ?? null;
+}
+
+export function setMaintenance(db: DatabaseSync, probeId: string, active: boolean, note: string | null): void {
+  const ts = new Date().toISOString();
+  db.prepare(`UPDATE maintenance SET active = 0 WHERE probe_id = ? AND active = 1`).run(probeId);
+  if (active) {
+    db.prepare(`INSERT INTO maintenance (probe_id, note, created_ts, active) VALUES (?, ?, ?, 1)`).run(probeId, note, ts);
+  }
+}
+
 export function buildSnapshot(
   probeList: ProbeDefinition[] = defaultProbes,
   dbPath: string = MONITORING_DB_PATH,
@@ -165,17 +199,19 @@ export function buildSnapshot(
         latest,
         uptimePct24h: uptimePct(db, probe.id, 24 * 60 * 60 * 1000),
         incident: getOpenIncident(db, probe.id),
+        maintenance: getMaintenance(db, probe.id),
       };
     });
 
     const openIncidents = listOpenIncidents(db);
-    const up = services.filter((s) => s.latest?.status === "up").length;
-    const degraded = services.filter((s) => s.latest?.status === "degraded").length;
-    const down = services.filter((s) => s.latest?.status === "down").length;
+    const active = services.filter((s) => !s.maintenance);
+    const up = active.filter((s) => s.latest?.status === "up").length;
+    const degraded = active.filter((s) => s.latest?.status === "degraded").length;
+    const down = active.filter((s) => s.latest?.status === "down").length;
 
     let globalStatus: GlobalStatus = "healthy";
     if (down > 0) globalStatus = "critical";
-    else if (degraded > 0 || services.some((s) => !s.latest)) globalStatus = "warning";
+    else if (degraded > 0 || active.some((s) => !s.latest)) globalStatus = "warning";
 
     return {
       generated_ts: new Date().toISOString(),

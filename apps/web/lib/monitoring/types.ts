@@ -53,11 +53,20 @@ export interface IncidentRow {
   last_error: string | null;
 }
 
+export interface MaintenanceRow {
+  id: number;
+  probe_id: string;
+  note: string | null;
+  created_ts: string;
+  active: number;
+}
+
 export interface ServiceStatus {
   probe: ProbeDefinition;
   latest: ProbeResultRow | null;
   uptimePct24h: number | null;
   incident: IncidentRow | null;
+  maintenance: MaintenanceRow | null;
 }
 
 export type GlobalStatus = "healthy" | "warning" | "critical";
