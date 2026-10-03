@@ -1,0 +1,27 @@
+[Unit]
+Description=Langfuse webhook -> Slack forwarder
+Documentation=https://github.com/director-phil/hermes-mission-control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/GitHub/hermes-mission-control
+ExecStart=%h/Documents/GitHub/hermes-mission-control/node_modules/.bin/tsx apps/web/lib/monitoring/webhook-server.ts
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=LANG_FUSE_WEBHOOK_HOST=0.0.0.0
+Environment=LANG_FUSE_WEBHOOK_PORT=3931
+# Slack token + channel from the shared private env file (never commit the token).
+EnvironmentFile=-%h/.hermes/mission-control/slack.env
+
+# Security hardening (mirrors the probe-engine unit). 0.0.0.0 bind is required
+# so the Langfuse container can reach the host over the docker bridge.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
