@@ -61,6 +61,7 @@ export const probes: ProbeDefinition[] = [
     name: "CheckCle monitor",
     kind: "loopback-http",
     target: "http://127.0.0.1:8091/",
+    url: "https://gb10-coder.taile151d3.ts.net:8091",
     cadenceSeconds: 60,
     group: "internal",
   },
