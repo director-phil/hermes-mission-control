@@ -13,6 +13,12 @@ export const missionControlRoutes = [
     description: "Reference shell landing surface.",
   },
   {
+    label: "Monitoring",
+    href: "/mission-control/monitoring",
+    segment: "monitoring",
+    description: "Live service board — probes, uptime, incidents.",
+  },
+  {
     label: "Agents",
     href: "/mission-control/agents",
     segment: "agents",
