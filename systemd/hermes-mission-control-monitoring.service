@@ -14,9 +14,10 @@ Environment=NODE_ENV=production
 Environment=MONITORING_DB_PATH=%h/.hermes/mission-control/monitoring.db
 # tsx/esbuild needs a writable cache dir; point it at a private tmp.
 Environment=XDG_CACHE_HOME=/tmp/tsx-cache
-# Reuse the RT dashboard Slack app for alerts. Set these to enable Slack posting:
-# Environment=SLACK_BOT_TOKEN=
-# Environment=SLACK_CHANNEL=#monitoring
+# Reuse the RT dashboard Slack app for alerts (token + channel from a private env file).
+# Create ~/.hermes/mission-control/slack.env with SLACK_BOT_TOKEN + SLACK_CHANNEL (chmod 600);
+# never commit the token itself.
+EnvironmentFile=-%h/.hermes/mission-control/slack.env
 
 # Security hardening (mirrors the goal-runner unit). The DB dir is the only
 # writable path; home is otherwise read-only.
