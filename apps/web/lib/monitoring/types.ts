@@ -22,6 +22,8 @@ export interface ProbeDefinition {
   name: string; // human label
   kind: ProbeKind;
   target: string; // URL / host:port / hostname / absolute path
+  /** Optional user-facing URL (e.g. Tailscale hostname) for click-through from the board. */
+  url?: string;
   cadenceSeconds: number;
   timeoutMs?: number;
   group: ProbeGroup;
