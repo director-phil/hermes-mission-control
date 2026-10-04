@@ -49,6 +49,8 @@ export async function runProbe(def: ProbeDefinition): Promise<ProbeOutcome> {
         return await pageSweepProbe(def, timeoutMs);
       case "vercel-deploy":
         return await vercelDeployProbe();
+      case "vercel-metrics":
+        return await vercelMetricsProbe();
       default:
         return { status: "down", latency_ms: null, http_status: null, metric: null, error: `unknown kind ${def.kind}` };
     }
@@ -326,6 +328,48 @@ async function vercelDeployProbe(): Promise<ProbeOutcome> {
       http_status: res.status,
       metric: `deploy ${state} · ${branch}`,
       error: status === "down" ? `deploy ${state}` : null,
+    };
+  } catch (err) {
+    return { status: "down", latency_ms: Date.now() - start, http_status: null, metric: null, error: String(err) };
+  }
+}
+
+/**
+ * Vercel Speed Insights probe — queries real-user Core Web Vitals (LCP p75) per
+ * route via the Vercel CLI and surfaces the slowest pages. This is the only
+ * signal that captures the *authenticated* post-login load the anonymous page
+ * sweep can't see (the sweep only measures the login redirect). Emits a JSON
+ * `metric` with a per-route breakdown the UI renders, ordered slowest-first.
+ */
+async function vercelMetricsProbe(): Promise<ProbeOutcome> {
+  const start = Date.now();
+  const GOOD_MS = 2500; // Google CWV "good" LCP threshold
+  const POOR_MS = 4000; // "poor" threshold
+  try {
+    const bin = join(homedir(), ".local", "bin", "vercel");
+    // Static arg list only — no user input, so string interpolation is safe here.
+    const cmd =
+      `${bin} metrics vercel.speed_insights.lcp_ms` +
+      ` --aggregation p75 --group-by route --since 7d` +
+      ` --project reliable-tradies-ops-v2 --scope ${VERCEL_TEAM_ID} --prod --limit 30 --json`;
+    const out = execSync(cmd, { encoding: "utf8", timeout: 60000, env: { ...process.env, HOME: homedir() } });
+    const json = JSON.parse(out) as { summary?: Array<Record<string, unknown>> };
+    const routes = (json.summary ?? [])
+      .map((r) => ({
+        route: String(r.route ?? ""),
+        lcp_ms: Number(r.vercel_speed_insights_lcp_ms_p75 ?? 0),
+      }))
+      .filter((r) => r.route !== "" && Number.isFinite(r.lcp_ms) && r.lcp_ms > 0)
+      .sort((a, b) => b.lcp_ms - a.lcp_ms);
+
+    const slow = routes.filter((r) => r.lcp_ms >= GOOD_MS).length;
+    const poor = routes.filter((r) => r.lcp_ms >= POOR_MS).length;
+    return {
+      status: "up",
+      latency_ms: Date.now() - start,
+      http_status: null,
+      metric: JSON.stringify({ total: routes.length, slow, poor, good_ms: GOOD_MS, poor_ms: POOR_MS, routes }),
+      error: null,
     };
   } catch (err) {
     return { status: "down", latency_ms: Date.now() - start, http_status: null, metric: null, error: String(err) };

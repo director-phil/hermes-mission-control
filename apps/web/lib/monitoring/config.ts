@@ -172,6 +172,14 @@ export const probes: ProbeDefinition[] = [
     cadenceSeconds: 300,
     group: "external",
   },
+  {
+    id: "vercel-metrics",
+    name: "Vercel Speed Insights (slow pages)",
+    kind: "vercel-metrics",
+    target: "reliable-tradies-ops-v2",
+    cadenceSeconds: 1800,
+    group: "external",
+  },
 
   // ── host metrics ──────────────────────────────────────────────────────
   {

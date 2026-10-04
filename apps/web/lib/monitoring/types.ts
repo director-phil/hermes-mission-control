@@ -14,6 +14,7 @@ export type ProbeKind =
   | "loopback-http" // HTTP against a loopback/localhost endpoint
   | "server" // host metrics: CPU load, RAM, disk, network (local box)
   | "page-sweep" // sweep a list of relative paths under a base URL
+  | "vercel-metrics" // Vercel Speed Insights (real-user LCP per route)
   | "vercel-deploy"; // Vercel latest-deployment state (token-authenticated)
 
 export type ProbeGroup = "internal" | "external";
