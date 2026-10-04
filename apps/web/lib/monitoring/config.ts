@@ -1,4 +1,5 @@
 import { ProbeDefinition } from "./types";
+import { RT_PAGE_ROUTES } from "./rt-routes";
 
 /**
  * Declarative probe registry. Adding a monitor is a config edit, not code.
@@ -117,6 +118,16 @@ export const probes: ProbeDefinition[] = [
     kind: "http",
     target: "https://dashboards.reliabletradies.app/api/health",
     cadenceSeconds: 60,
+    group: "external",
+  },
+  {
+    id: "rt-page-sweep",
+    name: "RT pages (all routes)",
+    kind: "page-sweep",
+    target: "https://dashboards.reliabletradies.app",
+    targets: RT_PAGE_ROUTES,
+    cadenceSeconds: 300,
+    timeoutMs: 8000,
     group: "external",
   },
   {
