@@ -45,6 +45,8 @@ export async function runProbe(def: ProbeDefinition): Promise<ProbeOutcome> {
         return await localFileProbe(def.target);
       case "server":
         return await serverProbe();
+      case "page-sweep":
+        return await pageSweepProbe(def, timeoutMs);
       case "vercel-deploy":
         return await vercelDeployProbe();
       default:
@@ -163,6 +165,59 @@ async function localFileProbe(path: string): Promise<ProbeOutcome> {
   } catch (err) {
     return { status: "down", latency_ms: Date.now() - start, http_status: null, metric: null, error: String(err) };
   }
+}
+
+/**
+ * Page sweep probe — probes a list of relative paths under a base URL and
+ * reports per-route status. Catches server/edge 5xx failures and slow public
+ * responses (load issues) across the whole surface. Emits a JSON `metric` with
+ * a per-route breakdown that the UI renders. Sweeps with bounded concurrency so
+ * a large route set doesn't stall the engine loop.
+ */
+async function pageSweepProbe(def: ProbeDefinition, timeoutMs: number): Promise<ProbeOutcome> {
+  const paths = def.targets ?? [];
+  const base = def.target.replace(/\/+$/, "");
+  const WARN_MS = 1000;
+  const CONCURRENCY = 15;
+  type RouteResult = { path: string; http: number | null; ms: number; status: ProbeStatus };
+  const routes: (RouteResult | undefined)[] = new Array(paths.length);
+
+  for (let start = 0; start < paths.length; start += CONCURRENCY) {
+    const chunk = paths.slice(start, start + CONCURRENCY);
+    await Promise.all(
+      chunk.map(async (path, k) => {
+        const idx = start + k;
+        const url = base + (path.startsWith("/") ? path : `/${path}`);
+        const t0 = Date.now();
+        try {
+          const res = await fetch(url, {
+            method: "GET",
+            redirect: "manual",
+            signal: AbortSignal.timeout(timeoutMs),
+          });
+          const ms = Date.now() - t0;
+          const status: ProbeStatus = res.status >= 500 ? "down" : ms > WARN_MS ? "degraded" : "up";
+          routes[idx] = { path, http: res.status, ms, status };
+        } catch {
+          routes[idx] = { path, http: null, ms: Date.now() - t0, status: "down" };
+        }
+      }),
+    );
+  }
+
+  const results = routes.filter((r): r is RouteResult => r !== undefined);
+  const down = results.filter((r) => r.status === "down").length;
+  const degraded = results.filter((r) => r.status === "degraded").length;
+  const up = results.length - down - degraded;
+  const overall: ProbeStatus = down > 0 ? "down" : degraded > 0 ? "degraded" : "up";
+
+  return {
+    status: overall,
+    latency_ms: null,
+    http_status: null,
+    metric: JSON.stringify({ total: results.length, up, degraded, down, routes: results }),
+    error: overall === "down" ? `${down}/${results.length} route(s) down` : null,
+  };
 }
 
 /**

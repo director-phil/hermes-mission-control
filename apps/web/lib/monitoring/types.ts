@@ -13,6 +13,7 @@ export type ProbeKind =
   | "local-file" // read a local status file
   | "loopback-http" // HTTP against a loopback/localhost endpoint
   | "server" // host metrics: CPU load, RAM, disk, network (local box)
+  | "page-sweep" // sweep a list of relative paths under a base URL
   | "vercel-deploy"; // Vercel latest-deployment state (token-authenticated)
 
 export type ProbeGroup = "internal" | "external";
@@ -24,6 +25,8 @@ export interface ProbeDefinition {
   target: string; // URL / host:port / hostname / absolute path
   /** Optional user-facing URL (e.g. Tailscale hostname) for click-through from the board. */
   url?: string;
+  /** For `page-sweep`: relative paths to probe under `target` (base URL). */
+  targets?: string[];
   cadenceSeconds: number;
   timeoutMs?: number;
   group: ProbeGroup;
