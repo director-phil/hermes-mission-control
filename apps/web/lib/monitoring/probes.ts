@@ -209,7 +209,11 @@ async function pageSweepProbe(def: ProbeDefinition, timeoutMs: number): Promise<
   const down = results.filter((r) => r.status === "down").length;
   const degraded = results.filter((r) => r.status === "degraded").length;
   const up = results.length - down - degraded;
-  const overall: ProbeStatus = down > 0 ? "down" : degraded > 0 ? "degraded" : "up";
+  // Aggregate status reflects failures (5xx) only. Slow routes (degraded) are
+  // informational and surfaced via the metric, not as an incident/health signal
+  // — otherwise Vercel cold starts would keep the board in a permanent "warning"
+  // and fire spurious Slack alerts.
+  const overall: ProbeStatus = down > 0 ? "down" : "up";
 
   return {
     status: overall,
