@@ -17,18 +17,25 @@ function str(v: unknown): string {
 }
 
 function formatAlert(body: Record<string, unknown>): string {
+  const isCheckCle =
+    "service_name" in body || "serviceName" in body || "service" in body ||
+    "host" in body || "service_type" in body;
   const monitor =
-    body.monitorName ?? body.monitor ?? body.monitor_name ?? body.name ?? "Langfuse alert";
-  const type = body.alertType ?? body.type ?? body.event ?? "";
-  const message = body.message ?? body.text ?? body.alert ?? "";
+    body.monitorName ?? body.monitor ?? body.monitor_name ?? body.name ??
+    body.service_name ?? body.serviceName ?? body.service ?? "Alert";
+  const status = body.status ?? "";
+  const type = body.alertType ?? body.type ?? body.event ?? body.service_type ?? "";
+  const message = body.message ?? body.text ?? body.alert ?? body.error_message ?? "";
   const project = body.projectName ?? body.project ?? body.projectId ?? "";
-  const url = body.url ?? body.link ?? body.alertUrl ?? "";
+  const url = body.url ?? body.link ?? body.alertUrl ?? body.host ?? "";
 
-  const parts: string[] = [`🚨 *Langfuse: ${str(monitor)}*`];
+  const head = isCheckCle ? `🔔 *${str(monitor)}*` : `🚨 *Langfuse: ${str(monitor)}*`;
+  const parts: string[] = [head];
+  if (status) parts.push(`*Status:* ${str(status)}`);
   if (type) parts.push(`*Type:* ${str(type)}`);
   if (project) parts.push(`*Project:* ${str(project)}`);
   if (message) parts.push(str(message));
-  if (url) parts.push(`<${str(url)}|Open in Langfuse>`);
+  if (url) parts.push(str(url));
 
   // If nothing recognizable was extracted, fall back to a raw dump so alerts
   // are never silently empty.
