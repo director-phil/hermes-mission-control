@@ -178,6 +178,49 @@ def test_review_skip_reflection_single_call(monkeypatch):
     assert len(result.findings) == 2  # both findings kept (no reflection)
 
 
+def test_deterministic_detects_destructive_ddl():
+    diff = "+++ b/migrations/1.sql\n+DROP TABLE raw_servicetitan_jobs;\n+TRUNCATE raw_servicetitan_jobs;"
+    findings = rg.deterministic_findings(diff)
+    assert len(findings) == 2
+    assert all(f["severity"] == "BLOCKER" for f in findings)
+
+
+def test_deterministic_detects_forbidden_read():
+    diff = "+++ b/app/page.tsx\n+const d = await query('SELECT * FROM fact_job_economics');"
+    findings = rg.deterministic_findings(diff)
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "BLOCKER"
+
+
+def test_deterministic_detects_delete_on_raw():
+    diff = "+++ b/x.ts\n+DELETE FROM raw_servicetitan_jobs WHERE id=1;"
+    findings = rg.deterministic_findings(diff)
+    assert len(findings) == 1
+    assert findings[0]["severity"] == "BLOCKER"
+
+
+def test_deterministic_ignores_comments():
+    diff = "+++ b/app/route.ts\n+ * Must NOT use DATABASE_URL.\n+// do not read fact_ tables\n+export const x = 1;"
+    findings = rg.deterministic_findings(diff)
+    assert findings == []
+
+
+def test_strip_comments_trailing():
+    assert rg._strip_comments("const x = 1; // uses DATABASE_URL") == "const x = 1; "
+    assert rg._strip_comments("  * doc line") == ""
+    assert rg._strip_comments("-- DROP TABLE raw_x") == ""
+
+
+def test_deterministic_only_no_model_calls(monkeypatch):
+    fake = _FakeModel()
+    monkeypatch.setattr(rg, "call_model", fake)
+    diff = "+++ b/migrations/1.sql\n+DROP TABLE raw_x;"
+    result = rg.review(diff, deterministic_only=True)
+    assert fake.calls == 0
+    assert result.verdict == "FAIL"
+    assert result.rules_applied == ["deterministic-lint"]
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))

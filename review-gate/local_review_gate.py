@@ -152,6 +152,86 @@ def dispatch_rules(changed_paths: list[str]) -> list[Rule]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Deterministic V2-LAW lint — pure regex, zero tokens, cannot hallucinate
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DESTRUCTIVE_DDL = re.compile(
+    r"\b(?:DROP\s+(?:TABLE|COLUMN|INDEX|TRIGGER|POLICY|FUNCTION|SCHEMA|TYPE|VIEW|CONSTRAINT)|TRUNCATE)\b",
+    re.IGNORECASE,
+)
+_DESTRUCTIVE_RAW = re.compile(r"\b(?:DELETE\s+FROM|UPDATE)\b[^\n]*\braw_", re.IGNORECASE)
+_FORBIDDEN_READ = re.compile(
+    r"\b(?:mart_\w+|fact_\w+|dim_\w+|DATABASE_URL|railway)\b", re.IGNORECASE
+)
+_SPLIT_MASK = re.compile(r"\$\{['\"`]|['\"`]\s*\+\s*['\"`]")
+
+
+def _strip_comments(code: str) -> str:
+    """Return the code with trailing comments removed, or '' if comment-only.
+
+    Covers the comment syntax of the surfaces V2 touches (TS/TSX: //, /* */;
+    SQL: --). A JSDoc continuation line (leading '*') is comment-only. This
+    keeps the deterministic lint from flagging a *documentation* mention of a
+    forbidden token (e.g. a comment that says "do NOT use DATABASE_URL").
+    """
+    s = code.lstrip()
+    if (
+        s.startswith("*")
+        or s.startswith("//")
+        or s.startswith("/*")
+        or s.startswith("--")
+        or s.startswith("#")
+    ):
+        return ""
+    # strip trailing // or -- comments
+    stripped = re.sub(r"//.*$", "", code)
+    stripped = re.sub(r"--\s.*$", "", stripped)
+    # strip trailing /* ... */
+    stripped = re.sub(r"/\*.*?\*/", "", stripped)
+    return stripped
+
+
+def deterministic_findings(diff_text: str) -> list[dict[str, Any]]:
+    """Deterministic, zero-token V2-LAW violations (no model call).
+
+    These are always true positives because they match literal added source
+    text — `DROP TABLE`, `fact_`, `DATABASE_URL`, a split-literal mask — which
+    is unconditionally a V2-LAW violation regardless of context. Runs instantly
+    and free before the LLM review, so obvious blockers never reach the model.
+    """
+    findings: list[dict[str, Any]] = []
+    current_file: str | None = None
+    for raw_line in diff_text.splitlines():
+        if raw_line.startswith("+++ b/"):
+            current_file = raw_line[6:]
+            continue
+        if not raw_line.startswith("+"):
+            continue
+        code = _strip_comments(raw_line[1:])
+        if not code.strip():
+            continue
+        hit: str | None = None
+        sev: str = ""
+        if _DESTRUCTIVE_DDL.search(code):
+            hit = f"destructive DDL: {code.strip()[:110]}"
+            sev = "BLOCKER"
+        elif _DESTRUCTIVE_RAW.search(code):
+            hit = f"destructive DELETE/UPDATE against raw_*: {code.strip()[:110]}"
+            sev = "BLOCKER"
+        elif _FORBIDDEN_READ.search(code):
+            hit = f"forbidden read (mart_/fact_/dim_/DATABASE_URL/railway): {code.strip()[:110]}"
+            sev = "BLOCKER"
+        elif _SPLIT_MASK.search(code):
+            hit = f"split-literal masking of a forbidden identifier: {code.strip()[:110]}"
+            sev = "MAJOR"
+        if hit:
+            findings.append(
+                {"severity": sev, "file": current_file, "line": None, "finding": hit}
+            )
+    return findings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Diff parsing
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -339,9 +419,23 @@ def review(
     max_tokens: int = 24000,
     timeout: int = 600,
     skip_reflection: bool = False,
+    deterministic_only: bool = False,
 ) -> ReviewResult:
     t0 = time.time()
+    det = deterministic_findings(diff_text)
     paths = parse_diff_paths(diff_text)
+    if deterministic_only:
+        verdict = "FAIL" if any(f["severity"] in ("BLOCKER", "MAJOR") for f in det) else "PASS"
+        return ReviewResult(
+            verdict=verdict,
+            findings=det,
+            removed=[],
+            rules_applied=["deterministic-lint"],
+            changed_files=paths,
+            reviewer_raw="",
+            reflection_raw="",
+            elapsed_s=round(time.time() - t0, 3),
+        )
     rules = dispatch_rules(paths)
     if not rules:
         # always apply scope discipline even if no path matched
@@ -364,11 +458,16 @@ def review(
     else:
         reflection_raw = ""
 
+    final_findings = det + reviewed.get("findings", [])
+    verdict = reviewed.get("verdict", "UNKNOWN")
+    if any(f["severity"] == "BLOCKER" for f in det):
+        verdict = "FAIL"
+
     return ReviewResult(
-        verdict=reviewed.get("verdict", "UNKNOWN"),
-        findings=reviewed.get("findings", []),
+        verdict=verdict,
+        findings=final_findings,
         removed=removed,
-        rules_applied=[r.id for r in rules],
+        rules_applied=["deterministic-lint"] + [r.id for r in rules],
         changed_files=paths,
         reviewer_raw=reviewer_raw,
         reflection_raw=reflection_raw,
@@ -389,6 +488,8 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=24000)
     ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("--skip-reflection", action="store_true")
+    ap.add_argument("--deterministic-only", action="store_true",
+                    help="run only the zero-token deterministic lint (no model call)")
     ap.add_argument("--json", action="store_true", help="emit machine-readable JSON only")
     args = ap.parse_args()
 
@@ -402,6 +503,7 @@ def main() -> int:
         max_tokens=args.max_tokens,
         timeout=args.timeout,
         skip_reflection=args.skip_reflection,
+        deterministic_only=args.deterministic_only,
     )
 
     if args.json:
