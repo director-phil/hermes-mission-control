@@ -8,7 +8,7 @@ import { parseNativeGoalMarkdown } from "./native-goal-markdown";
 const execFileAsync = promisify(nodeExecFile);
 
 export type EvidenceStatus = "ok" | "unknown" | "warning";
-export type GoalStatus = "unknown" | "staged" | "ready" | "running" | "completed" | "failed" | "changed_pending_surface_verification" | "paused" | "blocked" | "conflicted";
+export type GoalStatus = "unknown" | "staged" | "ready" | "running" | "shipping" | "completed" | "failed" | "changed_pending_surface_verification" | "paused" | "blocked" | "conflicted";
 export type ProcessRole = "controller" | "wrapper" | "child" | "model_server" | "systemd_service" | "unrelated";
 
 export interface FsAdapter {
@@ -343,8 +343,8 @@ async function readNativeGoals(roots: RuntimeRoots, adapters: RuntimeAdapters, w
   const nativeRoot = roots.nativeRuntimeRoot;
   if (!nativeRoot) return [];
   const goals: Array<GoalRecord & { native_state_dir: string }> = [];
-  const statusDirs = ["staged", "ready", "running", "done", "failed", "changed_pending_surface_verification"] as const;
-  const queueMap: Record<string, GoalRecord["queue_state"]> = { staged: "staged", ready: "ready", running: "running", done: "unknown", failed: "unknown", changed_pending_surface_verification: "unknown" };
+  const statusDirs = ["staged", "ready", "running", "shipping", "done", "failed", "changed_pending_surface_verification"] as const;
+  const queueMap: Record<string, GoalRecord["queue_state"]> = { staged: "staged", ready: "ready", running: "running", shipping: "running", done: "unknown", failed: "unknown", changed_pending_surface_verification: "unknown" };
   for (const dir of statusDirs) {
     let entries: string[];
     try {
@@ -386,7 +386,7 @@ async function readNativeGoals(roots: RuntimeRoots, adapters: RuntimeAdapters, w
         : [];
       const terminal: NativeTerminalEvidence = dir === "done" || dir === "failed" || dir === "changed_pending_surface_verification"
         ? await readNativeTerminalResult(nativeRoot, goalId, adapters.fs, dir)
-        : { status: dir === "staged" ? "staged" : dir === "ready" ? "ready" : "running", sourceStatus: "ok", source: goalPath, timestamp: null, note: null };
+        : { status: dir === "staged" ? "staged" : dir === "ready" ? "ready" : dir === "shipping" ? "shipping" : "running", sourceStatus: "ok", source: goalPath, timestamp: null, note: null };
       if (terminal.warning) warnings.push({ source: terminal.source, status: "warning", message: terminal.warning });
       goals.push({
         goal_id: goalId,

@@ -31,7 +31,7 @@ export async function readNativeGoalState(
   const warnings: { source: string; message: string }[] = [];
   const goals: NativeGoalRecord[] = [];
 
-  const statusDirs = ["staged", "ready", "running", "done", "failed", "changed_pending_surface_verification"] as const;
+  const statusDirs = ["staged", "ready", "running", "shipping", "done", "failed", "changed_pending_surface_verification"] as const;
   for (const dir of statusDirs) {
     try {
       const entries = await adapters.fs.readdir(path.join(resolvedRoot, "goals", dir));
@@ -70,7 +70,7 @@ export async function readNativeGoalState(
         const terminalEvidence = dir === "done" || dir === "failed" || dir === "changed_pending_surface_verification"
           ? await readTerminalEvidence(resolvedRoot, goalId, dir, adapters.fs)
           : null;
-        const terminalStatus = terminalEvidence?.status ?? (dir === "staged" ? "staged" : dir === "ready" ? "ready" : "running");
+        const terminalStatus = terminalEvidence?.status ?? (dir === "staged" ? "staged" : dir === "ready" ? "ready" : dir === "shipping" ? "shipping" : "running");
 
         goals.push({
           goal_id: goalId,
@@ -78,7 +78,7 @@ export async function readNativeGoalState(
           status: terminalStatus,
           controller_pid: null,
           controller_lock: null,
-          queue_state: dir === "staged" ? "staged" : dir === "ready" ? "ready" : dir === "running" ? "running" : "unknown",
+          queue_state: dir === "staged" ? "staged" : dir === "ready" ? "ready" : dir === "running" || dir === "shipping" ? "running" : "unknown",
           stage: hasAcceptanceBlock ? "acceptance" : null,
           last_event_timestamp: null,
           stall_age_ms: null,
