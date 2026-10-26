@@ -190,4 +190,14 @@ export const probes: ProbeDefinition[] = [
     cadenceSeconds: 60,
     group: "internal",
   },
+
+  // ── Supabase Postgres connection ceiling (57P03 prevention) ───────────
+  {
+    id: "supabase-pg-connections",
+    name: "Supabase Postgres connections",
+    kind: "pg-connections",
+    target: "supabase",
+    cadenceSeconds: 120,
+    group: "external",
+  },
 ];

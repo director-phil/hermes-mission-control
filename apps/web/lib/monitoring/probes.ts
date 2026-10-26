@@ -51,6 +51,8 @@ export async function runProbe(def: ProbeDefinition): Promise<ProbeOutcome> {
         return await vercelDeployProbe();
       case "vercel-metrics":
         return await vercelMetricsProbe();
+      case "pg-connections":
+        return await pgConnectionsProbe();
       default:
         return { status: "down", latency_ms: null, http_status: null, metric: null, error: `unknown kind ${def.kind}` };
     }
@@ -328,6 +330,53 @@ async function vercelDeployProbe(): Promise<ProbeOutcome> {
       http_status: res.status,
       metric: `deploy ${state} · ${branch}`,
       error: status === "down" ? `deploy ${state}` : null,
+    };
+  } catch (err) {
+    return { status: "down", latency_ms: Date.now() - start, http_status: null, metric: null, error: String(err) };
+  }
+}
+
+/**
+ * Supabase Postgres connection-count probe — the 57P03 "database system is not
+ * accepting connections" login-outage class. Reads SUPABASE_DB_URL from
+ * ~/.hermes/.env (never printed), shells to psql, and reports the live count
+ * vs max_connections. Degraded past 70%, down past 90% — so the ceiling is
+ * flagged BEFORE it exhausts and takes login down (2026-10-26 outage: 923×
+ * 57P03 refusals at max_connections=160 from 18 conns/instance × fan-out).
+ */
+async function pgConnectionsProbe(): Promise<ProbeOutcome> {
+  const start = Date.now();
+  try {
+    const envPath = join(homedir(), ".hermes", ".env");
+    const raw = await readFile(envPath, "utf8");
+    const m = /^SUPABASE_DB_URL=['"]?([^'"\n]+)['"]?$/m.exec(raw);
+    if (!m) throw new Error("no SUPABASE_DB_URL in ~/.hermes/.env");
+    const dbUrl = m[1].split("?")[0];
+    const sql =
+      "select (select count(*) from pg_stat_activity), " +
+      "(select setting::int from pg_settings where name='max_connections');";
+    const out = execSync(`psql "${dbUrl}" -tA -c "${sql}"`, {
+      encoding: "utf8",
+      timeout: 15000,
+      env: { ...process.env, HOME: homedir() },
+    });
+    const latency_ms = Date.now() - start;
+    const [countStr, maxStr] = out.trim().split(/\s*\|\s*|\s+/);
+    const count = Number.parseInt(countStr, 10);
+    const max = Number.parseInt(maxStr, 10);
+    if (!Number.isFinite(count) || !Number.isFinite(max) || max <= 0) {
+      return { status: "down", latency_ms, http_status: null, metric: null, error: `unparseable pg output: ${out.trim()}` };
+    }
+    const pct = Math.round((count / max) * 1000) / 10;
+    let status: ProbeStatus = "up";
+    if (pct >= 90) status = "down";
+    else if (pct >= 70) status = "degraded";
+    return {
+      status,
+      latency_ms,
+      http_status: null,
+      metric: `${count}/${max} conns (${pct}%)`,
+      error: status === "up" ? null : `connection ceiling approaching: ${pct}% of ${max}`,
     };
   } catch (err) {
     return { status: "down", latency_ms: Date.now() - start, http_status: null, metric: null, error: String(err) };
