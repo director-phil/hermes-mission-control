@@ -1,0 +1,43 @@
+{
+  "policy": {
+    "primary_cloud_orchestrator": "default",
+    "always_on_workers": false,
+    "model_loads_permitted_by_roster": false,
+    "langfuse_mode": "metadata-only"
+  },
+  "profiles": [
+    {
+      "profile": "default",
+      "role": "Cloud orchestrator (fallback for hard gates and cloud-model work)",
+      "model_class": "cloud",
+      "model": "codex",
+      "provider": "openai",
+      "capabilities": ["hard gates", "cloud implementation", "final review"],
+      "forbidden_actions": ["none"],
+      "cloud_orchestrator_call_when": "Use when local lanes are exhausted or a goal requires cloud authority.",
+      "status_note": "running"
+    },
+    {
+      "profile": "coder",
+      "role": "Local implementer",
+      "model_class": "local",
+      "model": "qwen3-coder-next",
+      "provider": "coder",
+      "capabilities": ["repository edits", "implementation"],
+      "forbidden_actions": ["secret disclosure"],
+      "cloud_orchestrator_call_when": "Use for local implementation work.",
+      "status_note": "on-demand specialist"
+    },
+    {
+      "profile": "reviewer",
+      "role": "Local planner and reviewer",
+      "model_class": "local",
+      "model": "qwen3.8-27b",
+      "provider": "reviewer",
+      "capabilities": ["planning", "review", "convergence policy"],
+      "forbidden_actions": ["secret disclosure"],
+      "cloud_orchestrator_call_when": "Use for planning and reviewing local work.",
+      "status_note": "on-demand specialist"
+    }
+  ]
+}

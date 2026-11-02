@@ -1,0 +1,20 @@
+[Unit]
+Description=Read-only mirror of ChatDev goals -> Mission Control native runtime
+Documentation=https://github.com/director-phil/hermes-mission-control
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.hermes/mission-control/bin/conveyor-goal-mirror.py --loop
+Restart=always
+RestartSec=2
+Environment=PATH=/usr/bin:/bin:/usr/local/bin
+
+# Read-only on ChatDev (source); writes only under the native runtime goals dir.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=%h/ChatDev/goals
+ReadWritePaths=%h/.hermes/mission-control/runtime
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
