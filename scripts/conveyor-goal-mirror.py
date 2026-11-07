@@ -158,9 +158,7 @@ def reconcile(desired: dict[str, tuple[str, Path]]) -> tuple[int, int]:
     moved = 0
     removed = 0
 
-    # Remove native files whose gid is no longer desired in that state, EXCEPT
-    # terminal dirs (done/failed/shipping) which the mirror never deletes once
-    # written (mirror must not delete goals the native runner owns).
+    # Remove native files whose gid is no longer desired in that state.
     MIRROR_MUTABLE = {"ready", "staged", "running", "stalled"}
     for state in MIRROR_MUTABLE:
         d = NATIVE_ROOT / state
@@ -169,6 +167,29 @@ def reconcile(desired: dict[str, tuple[str, Path]]) -> tuple[int, int]:
         for f in d.glob("*.md"):
             gid = f.stem
             if gid not in desired_states[state]:
+                try:
+                    f.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+
+    # Terminal dirs (done/failed/shipping): a goal may live in exactly ONE
+    # terminal state. When it moves (failed -> shipping -> done on recovery),
+    # the stale copy in the old dir must be removed or the dashboard sees the
+    # same gid in two states and raises "Duplicate native goal ID". We remove a
+    # terminal copy ONLY when that gid is still classified into a DIFFERENT
+    # state; a goal the mirror no longer sees at all is left untouched (the
+    # native-runner-owned record survives).
+    TERMINAL = {"done", "failed", "shipping"}
+    for state in TERMINAL:
+        d = NATIVE_ROOT / state
+        if not d.is_dir():
+            continue
+        for f in d.glob("*.md"):
+            gid = f.stem
+            if gid in desired_states[state]:
+                continue  # still belongs in this exact state
+            if any(gid in desired_states[s] for s in STATE_DIRS if s != state):
                 try:
                     f.unlink()
                     removed += 1
