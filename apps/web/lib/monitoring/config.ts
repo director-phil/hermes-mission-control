@@ -20,7 +20,7 @@ export const probes: ProbeDefinition[] = [
     id: "gb10-seat-1",
     name: "GB10 #1 model seat",
     kind: "loopback-http",
-    target: "http://gb10-box-1:1234/v1/models",
+    target: "http://127.0.0.1:1234/v1/models",
     cadenceSeconds: 30,
     group: "internal",
   },
@@ -28,7 +28,7 @@ export const probes: ProbeDefinition[] = [
     id: "gb10-seat-2",
     name: "GB10 #2 model seat",
     kind: "loopback-http",
-    target: "http://gb10-box-2:1234/v1/models",
+    target: "http://10.10.10.2:1234/v1/models",
     cadenceSeconds: 30,
     group: "internal",
   },
@@ -131,6 +131,28 @@ export const probes: ProbeDefinition[] = [
     group: "external",
   },
   {
+    id: "rt-api-sweep",
+    name: "RT API routes (error surface)",
+    kind: "page-sweep",
+    target: "https://dashboards.reliabletradies.app",
+    targets: [
+      "/api/health",
+      "/api/auth/me",
+      "/api/chat/unread-count",
+      "/api/calls",
+      "/api/communications/unified-feed",
+      "/api/communications/waiting-count",
+      "/api/communications/invoice-reminder-drafts",
+      "/api/communications/dispatch-drafts",
+      "/api/communications/voice-agent/live-calls",
+      "/api/customers/uncontacted-leads",
+      "/api/activity/page-view",
+    ],
+    cadenceSeconds: 60,
+    timeoutMs: 8000,
+    group: "external",
+  },
+  {
     id: "supabase-auth",
     name: "Supabase auth",
     kind: "http",
@@ -192,12 +214,14 @@ export const probes: ProbeDefinition[] = [
   },
 
   // ── Supabase Postgres connection ceiling (57P03 prevention) ───────────
-  {
-    id: "supabase-pg-connections",
-    name: "Supabase Postgres connections",
-    kind: "pg-connections",
-    target: "supabase",
-    cadenceSeconds: 120,
-    group: "external",
-  },
+  // DISABLED: requires SUPABASE_DB_URL in ~/.hermes/.env (Postgres password
+  // lost — role grant blocked). Re-enable once the DB URL is re-supplied.
+  // {
+  //   id: "supabase-pg-connections",
+  //   name: "Supabase Postgres connections",
+  //   kind: "pg-connections",
+  //   target: "supabase",
+  //   cadenceSeconds: 120,
+  //   group: "external",
+  // },
 ];
